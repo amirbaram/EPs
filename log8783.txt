@@ -1,0 +1,90 @@
+🚀 EP Live Follow-Through Tracker running at: http://127.0.0.1:8783
+ * Serving Flask app 'serve_ep_tracker'
+ * Debug mode: off
+[31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on http://127.0.0.1:8783
+[33mPress CTRL+C to quit[0m
+127.0.0.1 - - [07/Oct/2026 23:21:56] "GET / HTTP/1.1" 200 -
+127.0.0.1 - - [07/Oct/2026 23:21:56] "GET /api/emerging_board HTTP/1.1" 200 -
+127.0.0.1 - - [07/Oct/2026 23:21:56] "GET /api/emerging_board HTTP/1.1" 200 -
+127.0.0.1 - - [07/Oct/2026 23:21:57] "GET /api/portfolio HTTP/1.1" 200 -
+127.0.0.1 - - [07/Oct/2026 23:21:57] "GET /api/portfolio HTTP/1.1" 200 -
+127.0.0.1 - - [07/Oct/2026 23:21:57] "GET /api/emerging_board HTTP/1.1" 200 -
+127.0.0.1 - - [07/Oct/2026 23:21:57] "GET /api/portfolio HTTP/1.1" 200 -
+127.0.0.1 - - [07/Oct/2026 23:22:02] "GET /api/tracker_events HTTP/1.1" 200 -
+127.0.0.1 - - [07/Oct/2026 23:22:02] "GET /api/tracker_events HTTP/1.1" 200 -
+127.0.0.1 - - [07/Oct/2026 23:22:02] "GET /api/tracker_events HTTP/1.1" 200 -
+127.0.0.1 - - [07/Oct/2026 23:22:02] "GET /api/predict?sym=PTC&date=2026-10-05 HTTP/1.1" 200 -
+127.0.0.1 - - [07/Oct/2026 23:22:02] "GET /api/chart?symbol=PTC&event_date=2026-10-05 HTTP/1.1" 200 -
+$AXIA: possibly delisted; no price data found  (period=2d)
+$AXIA: possibly delisted; no price data found  (period=2d)
+$ATAI: possibly delisted; no price data found  (period=2d)
+$ATAI: possibly delisted; no price data found  (period=2d)
+$LEG: possibly delisted; no price data found  (period=2d)
+$LEG: possibly delisted; no price data found  (period=2d)
+
+3 Failed downloads:
+['AXIA', 'ATAI', 'LEG']: possibly delisted; no price data found  (period=2d)
+
+3 Failed downloads:
+['AXIA', 'ATAI', 'LEG']: possibly delisted; no price data found  (period=2d)
+$AXIA: possibly delisted; no price data found  (period=2d)
+$ATAI: possibly delisted; no price data found  (period=2d)
+127.0.0.1 - - [07/Oct/2026 23:22:10] "GET /api/premarket/data?force=0 HTTP/1.1" 200 -
+127.0.0.1 - - [07/Oct/2026 23:22:10] "GET /api/premarket/data?force=0 HTTP/1.1" 200 -
+$LEG: possibly delisted; no price data found  (period=2d)
+
+3 Failed downloads:
+['AXIA', 'ATAI', 'LEG']: possibly delisted; no price data found  (period=2d)
+127.0.0.1 - - [07/Oct/2026 23:22:12] "GET /api/premarket/data?force=0 HTTP/1.1" 200 -
+127.0.0.1 - - [07/Oct/2026 23:29:34] "GET / HTTP/1.1" 200 -
+127.0.0.1 - - [07/Oct/2026 23:29:34] "GET /api/emerging_board HTTP/1.1" 200 -
+127.0.0.1 - - [07/Oct/2026 23:29:34] "GET /api/emerging_board HTTP/1.1" 200 -
+127.0.0.1 - - [07/Oct/2026 23:29:35] "GET /api/portfolio HTTP/1.1" 200 -
+127.0.0.1 - - [07/Oct/2026 23:29:35] "GET /api/portfolio HTTP/1.1" 200 -
+127.0.0.1 - - [07/Oct/2026 23:29:35] "GET /api/emerging_board HTTP/1.1" 200 -
+127.0.0.1 - - [07/Oct/2026 23:29:36] "GET /api/portfolio HTTP/1.1" 200 -
+$AXIA: possibly delisted; no price data found  (period=2d)
+$AXIA: possibly delisted; no price data found  (period=2d)
+127.0.0.1 - - [07/Oct/2026 23:29:44] "GET /api/tracker_events HTTP/1.1" 200 -
+127.0.0.1 - - [07/Oct/2026 23:29:44] "GET /api/predict?sym=PTC&date=2026-10-05 HTTP/1.1" 200 -
+127.0.0.1 - - [07/Oct/2026 23:29:44] "GET /api/tracker_events HTTP/1.1" 200 -
+127.0.0.1 - - [07/Oct/2026 23:29:44] "GET /api/chart?symbol=PTC&event_date=2026-10-05 HTTP/1.1" 200 -
+127.0.0.1 - - [07/Oct/2026 23:29:44] "GET /api/tracker_events HTTP/1.1" 200 -
+$ATAI: possibly delisted; no price data found  (period=2d)
+$ATAI: possibly delisted; no price data found  (period=2d)
+$LEG: possibly delisted; no price data found  (period=2d)
+$LEG: possibly delisted; no price data found  (period=2d)
+
+3 Failed downloads:
+['AXIA', 'ATAI', 'LEG']: possibly delisted; no price data found  (period=2d)
+
+3 Failed downloads:
+['AXIA', 'ATAI', 'LEG']: possibly delisted; no price data found  (period=2d)
+$AXIA: possibly delisted; no price data found  (period=2d)
+127.0.0.1 - - [07/Oct/2026 23:29:50] "GET /api/premarket/data?force=0 HTTP/1.1" 200 -
+127.0.0.1 - - [07/Oct/2026 23:29:50] "GET /api/premarket/data?force=0 HTTP/1.1" 200 -
+$ATAI: possibly delisted; no price data found  (period=2d)
+$LEG: possibly delisted; no price data found  (period=2d)
+
+3 Failed downloads:
+['AXIA', 'ATAI', 'LEG']: possibly delisted; no price data found  (period=2d)
+127.0.0.1 - - [07/Oct/2026 23:29:52] "GET /api/premarket/data?force=0 HTTP/1.1" 200 -
+127.0.0.1 - - [07/Oct/2026 23:31:01] "GET / HTTP/1.1" 200 -
+127.0.0.1 - - [07/Oct/2026 23:31:02] "GET /api/emerging_board HTTP/1.1" 200 -
+127.0.0.1 - - [07/Oct/2026 23:31:02] "GET /api/premarket/data?force=0 HTTP/1.1" 200 -
+127.0.0.1 - - [07/Oct/2026 23:31:02] "GET /api/emerging_board HTTP/1.1" 200 -
+127.0.0.1 - - [07/Oct/2026 23:31:02] "GET /api/premarket/data?force=0 HTTP/1.1" 200 -
+127.0.0.1 - - [07/Oct/2026 23:31:02] "GET /api/emerging_board HTTP/1.1" 200 -
+127.0.0.1 - - [07/Oct/2026 23:31:03] "GET /api/portfolio HTTP/1.1" 200 -
+127.0.0.1 - - [07/Oct/2026 23:31:03] "GET /api/premarket/data?force=0 HTTP/1.1" 200 -
+127.0.0.1 - - [07/Oct/2026 23:31:03] "GET /api/portfolio HTTP/1.1" 200 -
+127.0.0.1 - - [07/Oct/2026 23:31:03] "GET /api/portfolio HTTP/1.1" 200 -
+127.0.0.1 - - [07/Oct/2026 23:31:08] "GET /api/tracker_events HTTP/1.1" 200 -
+127.0.0.1 - - [07/Oct/2026 23:31:08] "GET /api/tracker_events HTTP/1.1" 200 -
+127.0.0.1 - - [07/Oct/2026 23:31:08] "GET /api/tracker_events HTTP/1.1" 200 -
+127.0.0.1 - - [07/Oct/2026 23:31:08] "GET /api/predict?sym=PTC&date=2026-10-05 HTTP/1.1" 200 -
+127.0.0.1 - - [07/Oct/2026 23:31:08] "GET /api/chart?symbol=PTC&event_date=2026-10-05 HTTP/1.1" 200 -
+127.0.0.1 - - [07/Oct/2026 23:31:31] "GET /api/predict?sym=FLY&date=2026-09-18 HTTP/1.1" 200 -
+127.0.0.1 - - [07/Oct/2026 23:31:31] "GET /api/chart?symbol=FLY&event_date=2026-09-18 HTTP/1.1" 200 -
+127.0.0.1 - - [07/Oct/2026 23:37:46] "GET /api/tracker_events HTTP/1.1" 200 -

@@ -1,0 +1,39 @@
+Loading EP multi-quarter dataset from data/simulations/ep_combined_study_scored.parquet...
+Loaded 6501 EP events.
+=======================================================
+🚀 EP Review Server running at: http://127.0.0.1:8782
+=======================================================
+ * Serving Flask app 'serve_ep'
+ * Debug mode: off
+[31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on http://127.0.0.1:8782
+[33mPress CTRL+C to quit[0m
+127.0.0.1 - - [07/Oct/2026 23:21:54] "GET / HTTP/1.1" 200 -
+127.0.0.1 - - [07/Oct/2026 23:21:54] "GET /api/filters HTTP/1.1" 200 -
+127.0.0.1 - - [07/Oct/2026 23:21:54] "GET /api/events?preset=pinnacle&outcome=&milestone=&sector=&theme=&retrace=&cpos=&subtype=&year=&search=&cond_veto_headwind=0&cond_win_sectors=0&cond_tailwind=0&cond_48h=0&cond_elite_close=0&cond_held_5d=0 HTTP/1.1" 200 -
+127.0.0.1 - - [07/Oct/2026 23:21:54] "GET /api/predict_history?sym=SMMT&date=2026-09-03 HTTP/1.1" 200 -
+127.0.0.1 - - [07/Oct/2026 23:21:54] "GET /api/chart?symbol=SMMT&date=2026-09-03 HTTP/1.1" 200 -
+127.0.0.1 - - [07/Oct/2026 23:25:04] "GET /api/predict_history?sym=ALKS&date=2026-03-31 HTTP/1.1" 200 -
+127.0.0.1 - - [07/Oct/2026 23:25:04] "GET /api/chart?symbol=ALKS&date=2026-03-31 HTTP/1.1" 200 -
+127.0.0.1 - - [07/Oct/2026 23:25:08] "GET /api/group_stocks?group=Technology&kind=sector HTTP/1.1" 200 -
+127.0.0.1 - - [07/Oct/2026 23:25:23] "GET /api/predict_history?sym=FIX&date=2025-07-25 HTTP/1.1" 200 -
+127.0.0.1 - - [07/Oct/2026 23:25:23] "GET /api/chart?symbol=FIX&date=2025-07-25 HTTP/1.1" 200 -
+127.0.0.1 - - [07/Oct/2026 23:25:26] "GET /api/predict_history?sym=CRSP&date=2025-07-18 HTTP/1.1" 200 -
+127.0.0.1 - - [07/Oct/2026 23:25:26] "GET /api/chart?symbol=CRSP&date=2025-07-18 HTTP/1.1" 200 -
+127.0.0.1 - - [07/Oct/2026 23:25:32] "GET /api/predict_history?sym=GH&date=2025-01-21 HTTP/1.1" 200 -
+127.0.0.1 - - [07/Oct/2026 23:25:32] "GET /api/chart?symbol=GH&date=2025-01-21 HTTP/1.1" 200 -
+127.0.0.1 - - [07/Oct/2026 23:29:38] "GET / HTTP/1.1" 200 -
+127.0.0.1 - - [07/Oct/2026 23:29:38] "GET /api/filters HTTP/1.1" 200 -
+127.0.0.1 - - [07/Oct/2026 23:29:38] "GET /api/events?preset=pinnacle&outcome=&milestone=&sector=&theme=&retrace=&cpos=&subtype=&year=&search=&cond_veto_headwind=0&cond_win_sectors=0&cond_tailwind=0&cond_48h=0&cond_elite_close=0&cond_held_5d=0 HTTP/1.1" 200 -
+127.0.0.1 - - [07/Oct/2026 23:29:38] "GET /api/predict_history?sym=SMMT&date=2026-09-03 HTTP/1.1" 200 -
+127.0.0.1 - - [07/Oct/2026 23:29:38] "GET /api/chart?symbol=SMMT&date=2026-09-03 HTTP/1.1" 200 -
+127.0.0.1 - - [07/Oct/2026 23:30:12] "GET / HTTP/1.1" 200 -
+127.0.0.1 - - [07/Oct/2026 23:30:12] "GET /api/filters HTTP/1.1" 200 -
+127.0.0.1 - - [07/Oct/2026 23:30:12] "GET /api/events?preset=pinnacle&outcome=&milestone=&sector=&theme=&retrace=&cpos=&subtype=&year=&search=&cond_veto_headwind=0&cond_win_sectors=0&cond_tailwind=0&cond_48h=0&cond_elite_close=0&cond_held_5d=0 HTTP/1.1" 200 -
+127.0.0.1 - - [07/Oct/2026 23:30:12] "GET /api/predict_history?sym=SMMT&date=2026-09-03 HTTP/1.1" 200 -
+127.0.0.1 - - [07/Oct/2026 23:30:12] "GET /api/chart?symbol=SMMT&date=2026-09-03 HTTP/1.1" 200 -
+127.0.0.1 - - [07/Oct/2026 23:40:24] "GET / HTTP/1.1" 200 -
+127.0.0.1 - - [07/Oct/2026 23:40:24] "GET /api/filters HTTP/1.1" 200 -
+127.0.0.1 - - [07/Oct/2026 23:40:24] "GET /api/events?preset=pinnacle&outcome=&milestone=&sector=&theme=&retrace=&cpos=&subtype=&year=&search=&cond_veto_headwind=0&cond_win_sectors=0&cond_tailwind=0&cond_48h=0&cond_elite_close=0&cond_held_5d=0 HTTP/1.1" 200 -
+127.0.0.1 - - [07/Oct/2026 23:40:24] "GET /api/predict_history?sym=SMMT&date=2026-09-03 HTTP/1.1" 200 -
+127.0.0.1 - - [07/Oct/2026 23:40:24] "GET /api/chart?symbol=SMMT&date=2026-09-03 HTTP/1.1" 200 -

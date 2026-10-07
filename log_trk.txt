@@ -1,0 +1,62 @@
+🚀 EP Live Follow-Through Tracker running at: http://127.0.0.1:8783
+ * Serving Flask app 'serve_ep_tracker'
+ * Debug mode: off
+[31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on http://127.0.0.1:8783
+[33mPress CTRL+C to quit[0m
+127.0.0.1 - - [07/Oct/2026 23:40:35] "GET / HTTP/1.1" 200 -
+127.0.0.1 - - [07/Oct/2026 23:40:35] "GET /api/emerging_board HTTP/1.1" 200 -
+127.0.0.1 - - [07/Oct/2026 23:40:35] "GET /api/emerging_board HTTP/1.1" 200 -
+[2026-10-07 23:40:35,233] ERROR in app: Exception on /api/premarket/data [GET]
+Traceback (most recent call last):
+  File "/Users/amirbaram/Downloads/scan/.venv/lib/python3.13/site-packages/flask/app.py", line 1511, in wsgi_app
+    response = self.full_dispatch_request()
+  File "/Users/amirbaram/Downloads/scan/.venv/lib/python3.13/site-packages/flask/app.py", line 919, in full_dispatch_request
+    rv = self.handle_user_exception(e)
+  File "/Users/amirbaram/Downloads/scan/.venv/lib/python3.13/site-packages/flask/app.py", line 917, in full_dispatch_request
+    rv = self.dispatch_request()
+  File "/Users/amirbaram/Downloads/scan/.venv/lib/python3.13/site-packages/flask/app.py", line 902, in dispatch_request
+    return self.ensure_sync(self.view_functions[rule.endpoint])(**view_args)  # type: ignore[no-any-return]
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^
+  File "/Users/amirbaram/Documents/code/EPs/serve_ep_tracker.py", line 4158, in api_premarket_data
+    data = ep_premarket.get_premarket_data(force_refresh=force)
+  File "/Users/amirbaram/Documents/code/EPs/ep_premarket.py", line 257, in get_premarket_data
+    return scan_premarket(force_refresh=force_refresh)
+  File "/Users/amirbaram/Documents/code/EPs/ep_premarket.py", line 81, in scan_premarket
+    symbols = get_in_play_candidates()
+  File "/Users/amirbaram/Documents/code/EPs/ep_premarket.py", line 37, in get_in_play_candidates
+    stocks = engine.get_group_stocks(thm_name, "theme").get("stocks", [])
+             ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^
+  File "/Users/amirbaram/Documents/code/EPs/thematic_engine.py", line 286, in get_group_stocks
+    syms = list(labels.tickers_in_theme(name))
+                ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "/Users/amirbaram/Documents/code/EPs/labels.py", line 90, in tickers_in_theme
+    return set(_SYMS_BY_THEME.get(theme, set()))
+               ^^^^^^^^^^^^^^^^^^
+AttributeError: 'NoneType' object has no attribute 'get'
+127.0.0.1 - - [07/Oct/2026 23:40:35] "[35m[1mGET /api/premarket/data?force=0 HTTP/1.1[0m" 500 -
+127.0.0.1 - - [07/Oct/2026 23:40:35] "GET /api/portfolio HTTP/1.1" 200 -
+127.0.0.1 - - [07/Oct/2026 23:40:35] "GET /api/portfolio HTTP/1.1" 200 -
+127.0.0.1 - - [07/Oct/2026 23:40:35] "GET /api/emerging_board HTTP/1.1" 200 -
+127.0.0.1 - - [07/Oct/2026 23:40:36] "GET /api/portfolio HTTP/1.1" 200 -
+$BTSGU: possibly delisted; no price data found  (period=2d)
+$ATAI: possibly delisted; no price data found  (period=2d)
+$LEG: possibly delisted; no price data found  (period=2d)
+127.0.0.1 - - [07/Oct/2026 23:40:45] "GET /api/tracker_events HTTP/1.1" 200 -
+127.0.0.1 - - [07/Oct/2026 23:40:45] "GET /api/predict?sym=PTC&date=2026-10-05 HTTP/1.1" 200 -
+127.0.0.1 - - [07/Oct/2026 23:40:45] "GET /api/tracker_events HTTP/1.1" 200 -
+$BTSGU: possibly delisted; no price data found  (period=2d)
+127.0.0.1 - - [07/Oct/2026 23:40:46] "GET /api/chart?symbol=PTC&event_date=2026-10-05 HTTP/1.1" 200 -
+$ATAI: possibly delisted; no price data found  (period=2d)
+127.0.0.1 - - [07/Oct/2026 23:40:46] "GET /api/tracker_events HTTP/1.1" 200 -
+$LEG: possibly delisted; no price data found  (period=2d)
+$AXIA: possibly delisted; no price data found  (period=2d)
+$AXIA: possibly delisted; no price data found  (period=2d)
+
+4 Failed downloads:
+['BTSGU', 'ATAI', 'LEG', 'AXIA']: possibly delisted; no price data found  (period=2d)
+
+4 Failed downloads:
+['BTSGU', 'ATAI', 'LEG', 'AXIA']: possibly delisted; no price data found  (period=2d)
+127.0.0.1 - - [07/Oct/2026 23:40:48] "GET /api/premarket/data?force=0 HTTP/1.1" 200 -
+127.0.0.1 - - [07/Oct/2026 23:40:48] "GET /api/premarket/data?force=0 HTTP/1.1" 200 -
