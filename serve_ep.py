@@ -2254,6 +2254,8 @@ def api_ml_rolling():
     if bars is None or event_date not in bars.index: return jsonify({"error": "No bars"})
     d1_idx = bars.index.get_loc(event_date)
     t_idx = d1_idx + days_forward
+    if t_idx >= len(bars):
+        return jsonify({"error": "Future date not available yet"})
     features = engine.compute_rolling_features(sym, d1_idx, t_idx)
     if not features: return jsonify({"stopped_out": True})
     probs = engine.predict_rolling(features)
