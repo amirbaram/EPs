@@ -1,64 +1,61 @@
-import re
-
 with open("serve_ep_tracker.py", "r") as f:
-    code = f.read()
+    text = f.read()
 
-# Replace api_ai_top_picks loop
-search_str = """        pred = ep_predictor.get_predictions(features)
-        score = pred["prob_hit_100"] + pred["prob_clean_run"] - pred["prob_consolidation"]
-        
-        if pred["archetype"] == "Toxic Traps":
-            score -= 100
+old_html = """            <div>
+                <span class="text-gray-400">P(200%)</span>
+                <span style="color:#9C27B0;" id="ai_v2_200">--%</span>
+            </div>
+        </div>
+    </div>"""
+
+new_html = """            <div>
+                <span class="text-gray-400">P(200%)</span>
+                <span style="color:#9C27B0;" id="ai_v2_200">--%</span>
+            </div>
+        </div>
+        <div id="ai_adv_warnings_v2" style="margin-top: 15px; font-weight: bold; font-size: 0.9em; display: none;">
+            <div id="ai_toxic_warning_v2" style="color: #ff4444; padding: 4px; border: 1px solid #ff4444; border-radius: 4px; display: none; text-align: center; margin-bottom: 8px;">⚠️ TOXIC FLOW DETECTED</div>
+            <div id="ai_dynamic_stop_v2" style="color: #ff9800; padding: 4px; border: 1px solid #ff9800; border-radius: 4px; display: none; text-align: center;">DYNAMIC STOP: <span id="ai_stop_val_v2"></span></div>
+        </div>
+    </div>"""
+text = text.replace(old_html, new_html)
+
+old_js = """        if (data.probs) {
+            document.getElementById('ai_v2_50').textContent = (data.probs.prob_50 * 100).toFixed(1) + '%';
+            document.getElementById('ai_v2_100').textContent = (data.probs.prob_100 * 100).toFixed(1) + '%';
+            document.getElementById('ai_v2_150').textContent = (data.probs.prob_150 * 100).toFixed(1) + '%';
+            document.getElementById('ai_v2_200').textContent = (data.probs.prob_200 * 100).toFixed(1) + '%';
+        }"""
+
+new_js = """        if (data.probs) {
+            document.getElementById('ai_v2_50').textContent = (data.probs.prob_50 * 100).toFixed(1) + '%';
+            document.getElementById('ai_v2_100').textContent = (data.probs.prob_100 * 100).toFixed(1) + '%';
+            document.getElementById('ai_v2_150').textContent = (data.probs.prob_150 * 100).toFixed(1) + '%';
+            document.getElementById('ai_v2_200').textContent = (data.probs.prob_200 * 100).toFixed(1) + '%';
             
-        scored_events.append({
-            "symbol": features.get("symbol"),
-            "date": dt_str,
-            "days_old": features["days_since_ep"],
-            "archetype": pred["archetype"],
-            "score": round(score, 1),
-            "prob_100": pred["prob_hit_100"],
-            "prob_consol": pred["prob_consolidation"],"""
-
-replacement_str = """        import datastore
-        from ep_ml_engine import engine
-        
-        prob_100 = 0.0
-        prob_50 = 0.0
-        ml_150 = 0.0
-        
-        # ML Engine Inference
-        bars = datastore.load_bars(features.get("symbol"))
-        if bars is not None and dt_str in bars.index:
-            try:
-                d1_idx = bars.index.get_loc(dt_str)
-                ml_feats = engine.compute_features(features.get("symbol"), d1_idx)
-                if ml_feats:
-                    preds = engine.predict(ml_feats)
-                    prob_50 = preds["prob_50"]
-                    prob_100 = preds["prob_100"]
-                    ml_150 = preds["prob_150"]
-            except Exception:
-                pass
-                
-        pred = ep_predictor.get_predictions(features)
-        archetype = pred["archetype"]
-        
-        # Blend ML Score with archetype rules (ML takes precedence for score)
-        score = (prob_100 * 100) + (prob_50 * 50)
-        
-        if archetype == "Toxic Traps":
-            score -= 100
+            let adv_warnings = false;
+            if (data.probs.is_toxic) {
+                document.getElementById('ai_toxic_warning_v2').style.display = 'block';
+                adv_warnings = true;
+            } else {
+                document.getElementById('ai_toxic_warning_v2').style.display = 'none';
+            }
             
-        scored_events.append({
-            "symbol": features.get("symbol"),
-            "date": dt_str,
-            "days_old": features["days_since_ep"],
-            "archetype": f"{archetype} (AI: {int(prob_100*100)}%)",
-            "score": round(score, 1),
-            "prob_100": round(prob_100 * 100, 1),
-            "prob_consol": round(ml_150 * 100, 1),"""
+            if (data.probs.dynamic_stop_loss_pct != null) {
+                document.getElementById('ai_dynamic_stop_v2').style.display = 'block';
+                document.getElementById('ai_stop_val_v2').textContent = (data.probs.dynamic_stop_loss_pct * 100).toFixed(1) + '%';
+                adv_warnings = true;
+            } else {
+                document.getElementById('ai_dynamic_stop_v2').style.display = 'none';
+            }
+            
+            if (adv_warnings) {
+                document.getElementById('ai_adv_warnings_v2').style.display = 'block';
+            } else {
+                document.getElementById('ai_adv_warnings_v2').style.display = 'none';
+            }
+        }"""
+text = text.replace(old_js, new_js)
 
-code = code.replace(search_str, replacement_str)
 with open("serve_ep_tracker.py", "w") as f:
-    f.write(code)
-print("serve_ep_tracker.py patched!")
+    f.write(text)

@@ -53,7 +53,7 @@ def train_advanced_exits():
         
         # Quantile regression to predict the 10th percentile bound
         lgb_stop = lgb.LGBMRegressor(
-            objective='quantile', alpha=0.10, 
+            objective='quantile', alpha=0.50, 
             n_estimators=150, learning_rate=0.05, max_depth=4, random_state=42
         )
         lgb_stop.fit(X_stop_tf, y_stop)
