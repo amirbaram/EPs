@@ -21,21 +21,26 @@ def train_ordinal_model():
     print(f"[*] Total Rolling Daily Evaluation Vectors: {len(df)}")
     
     df["date_idx"] = pd.to_datetime(df["date"])
-    
     df = df.dropna(subset=["target_50"])
-    print(f"[*] Total Vectors after dropping right-censored paths: {len(df)}")
 
     # [FIX]: Eliminate panel-data Duration/Survivorship bias via inverse sample weighting
-    df["event_id"] = df["symbol"] + "_" + df["entry_date"]
-    event_counts = df.groupby("event_id").size()
-    df["sample_weight"] = df["event_id"].map(event_counts).apply(lambda x: 1.0 / x)
+    if "entry_date" in df.columns:
+        df["event_id"] = df["symbol"] + "_" + df["entry_date"]
+    else:
+        df["event_id"] = df["symbol"] + "_" + (df["date_idx"] - pd.to_timedelta(df["feature_days_since_ep"], unit='D')).dt.strftime("%Y-%m-%d")
+        
+    event_counts = df.groupby("event_id")["event_id"].transform("count")
+    df["sample_weight"] = 1.0 / event_counts
 
-    # Create Ordinal Class (Max Tier Reached)
+    # Create Ordinal Class
     df["ordinal_class"] = 0
     df.loc[df["target_50"] == 1, "ordinal_class"] = 1
     df.loc[df["target_100"] == 1, "ordinal_class"] = 2
     df.loc[df["target_150"] == 1, "ordinal_class"] = 3
     df.loc[df["target_200"] == 1, "ordinal_class"] = 4
+    
+    # Sort chronologically to guarantee no future leakage in calibration
+    df = df.sort_values("date_idx")
     
     train_df = df[df["date_idx"] < pd.Timestamp("2023-01-01")].copy()
     test_df = df[df["date_idx"] >= pd.Timestamp("2023-01-01")].copy()
@@ -50,30 +55,33 @@ def train_ordinal_model():
     ])
     
     y_train = train_df["ordinal_class"]
-    y_test = test_df["ordinal_class"]
     w_train = train_df["sample_weight"]
     
-    # [FIX]: Transform data FIRST so CalibratedClassifierCV can natively slice sample_weight
+    # [FIX]: Transform data FIRST, then Chronological Split for Leakage-Free Calibration
     X_train_tf = preprocessor.fit_transform(train_df[features])
-    if len(test_df) > 0:
-        X_test_tf = preprocessor.transform(test_df[features])
+    split_idx = int(len(train_df) * 0.8)
+    
+    X_base = X_train_tf[:split_idx]
+    y_base = y_train.iloc[:split_idx]
+    w_base = w_train.iloc[:split_idx]
+    
+    X_calib = X_train_tf[split_idx:]
+    y_calib = y_train.iloc[split_idx:]
+    w_calib = w_train.iloc[split_idx:]
     
     xgb_model = xgb.XGBClassifier(
         n_estimators=150, max_depth=5, learning_rate=0.05, 
         random_state=42, use_label_encoder=False,
-        objective="multi:softprob",
-        num_class=5
+        objective="multi:softprob", num_class=5
     )
     
-    calibrated_model = CalibratedClassifierCV(
-        estimator=xgb_model, 
-        method='isotonic', 
-        cv=5 
-    )
+    # Train base model with duration weighting
+    xgb_model.fit(X_base, y_base, sample_weight=w_base)
     
-    calibrated_model.fit(X_train_tf, y_train, sample_weight=w_train)
+    # Train calibrator strictly on unseen, chronologically future data using prefit
+    calibrated_model = CalibratedClassifierCV(estimator=xgb_model, method='isotonic', cv="prefit")
+    calibrated_model.fit(X_calib, y_calib, sample_weight=w_calib)
     
-    # Repackage into a seamless pipeline for inference
     from sklearn.pipeline import Pipeline
     serving_pipeline = Pipeline([
         ("preprocessor", preprocessor),
@@ -88,8 +96,6 @@ def train_ordinal_model():
         prob_100 = np.clip(probs[:, 2:].sum(axis=1), 0, 1)
         prob_150 = np.clip(probs[:, 3:].sum(axis=1), 0, 1)
         prob_200 = np.clip(probs[:, 4], 0, 1)
-        
-        # ... (Metrics printing remains identical) ...
         
     out_path = Path("data/models/amir_rolling_xgboost_ordinal.pkl")
     import joblib

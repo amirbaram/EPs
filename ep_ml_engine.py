@@ -180,19 +180,14 @@ class EPMLEngine:
         df_feat = pd.DataFrame([features])
         probs = model.predict_proba(df_feat)[0]
         
-        # [FIX]: Prevent the Catch-22 by overriding targets that are already achieved
-        curr_ret = features.get("feature_day5_ret_vs_day1", 0.0) if is_v1 else features.get("feature_ret_since_ep", 0.0)
-        
-        p50 = float(probs[1:].sum())
-        p100 = float(probs[2:].sum())
-        p150 = float(probs[3:].sum())
-        p200 = float(probs[4])
+        # [FIX]: The Target Catch-22 Override
+        curr_ret = features.get("feature_day5_ret_vs_day1", features.get("feature_ret_since_ep", 0.0))
         
         res = {
-            "prob_50": 1.0 if curr_ret >= 0.50 else min(1.0, p50),
-            "prob_100": 1.0 if curr_ret >= 1.00 else min(1.0, p100),
-            "prob_150": 1.0 if curr_ret >= 1.50 else min(1.0, p150),
-            "prob_200": 1.0 if curr_ret >= 2.00 else min(1.0, p200)
+            "prob_50": 1.0 if curr_ret >= 0.50 else min(1.0, float(probs[1:].sum())),
+            "prob_100": 1.0 if curr_ret >= 1.00 else min(1.0, float(probs[2:].sum())),
+            "prob_150": 1.0 if curr_ret >= 1.50 else min(1.0, float(probs[3:].sum())),
+            "prob_200": 1.0 if curr_ret >= 2.00 else min(1.0, float(probs[4]))
         }
         
         if self.toxicity_filter:

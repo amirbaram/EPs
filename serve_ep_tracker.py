@@ -2314,7 +2314,7 @@ function selectEvent(ev) {
 
   // [FIX]: Real-world day is 1-based (bars_since + 1). Rolling API offset is 0-based (bars_since).
   let display_day = ev.bars_since + 1;
-  let fetch_offset = ev.bars_since > 0 ? ev.bars_since : 1; 
+  let fetch_offset = ev.bars_since > 0 ? ev.bars_since : 0; 
   
   document.getElementById('ai_v2_day_badge').textContent = `Day ${display_day}`;
   document.getElementById('ai_v2_50').textContent = '...';
