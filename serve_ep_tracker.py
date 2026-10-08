@@ -1004,6 +1004,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <div id="ai_adv_warnings_v1" style="margin-top: 10px; font-weight: bold; font-size: 11px; display: none;">
              <div id="ai_toxic_warning_v1" style="color: #ef4444; padding: 4px; border: 1px solid #ef4444; border-radius: 4px; display: none; text-align: center; margin-bottom: 5px;">⚠️ TOXIC FLOW</div>
              <div id="ai_dynamic_stop_v1" style="color: #f59e0b; padding: 4px; border: 1px solid #f59e0b; border-radius: 4px; display: none; text-align: center;">DYN STOP: <span id="ai_stop_val_v1"></span></div>
+             <div id="ai_exhaustion_v1" style="color: #8b5cf6; padding: 4px; border: 1px solid #8b5cf6; border-radius: 4px; display: none; text-align: center; margin-top: 5px;">🔥 EXHAUSTION: <span id="ai_exh_val_v1"></span></div>
         </div>
 
         <!-- V2 Rolling -->
@@ -1032,6 +1033,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <div id="ai_adv_warnings_v2" style="margin-top: 10px; font-weight: bold; font-size: 11px; display: none;">
              <div id="ai_toxic_warning_v2" style="color: #ef4444; padding: 4px; border: 1px solid #ef4444; border-radius: 4px; display: none; text-align: center; margin-bottom: 5px;">⚠️ TOXIC FLOW</div>
              <div id="ai_dynamic_stop_v2" style="color: #f59e0b; padding: 4px; border: 1px solid #f59e0b; border-radius: 4px; display: none; text-align: center;">DYN STOP: <span id="ai_stop_val_v2"></span></div>
+             <div id="ai_exhaustion_v2" style="color: #8b5cf6; padding: 4px; border: 1px solid #8b5cf6; border-radius: 4px; display: none; text-align: center; margin-top: 5px;">🔥 EXHAUSTION: <span id="ai_exh_val_v2"></span></div>
         </div>
 
       </div>
@@ -2304,6 +2306,15 @@ function selectEvent(ev) {
       adv_warnings_v1 = true;
   } else {
       document.getElementById('ai_dynamic_stop_v1').style.display = 'none';
+  }
+  if (ev.prob_exhaustion != null) {
+      document.getElementById('ai_exhaustion_v1').style.display = 'block';
+      let exhProb = (ev.prob_exhaustion * 100).toFixed(1) + '%';
+      if (ev.prob_exhaustion > 0.80) { exhProb += ' (SELL 1/2)'; }
+      document.getElementById('ai_exh_val_v1').textContent = exhProb;
+      adv_warnings_v1 = true;
+  } else {
+      document.getElementById('ai_exhaustion_v1').style.display = 'none';
   }
   
   if (adv_warnings_v1) {
@@ -4185,6 +4196,7 @@ def api_tracker_events():
                     ev["ml_200"] = preds.get("prob_200")
                     ev["is_toxic"] = preds.get("is_toxic", False)
                     ev["dynamic_stop_loss_pct"] = preds.get("dynamic_stop_loss_pct", None)
+                    ev["prob_exhaustion"] = preds.get("prob_exhaustion", None)
             except Exception:
                 pass
 

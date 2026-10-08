@@ -607,6 +607,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
          <div id="ai_adv_warnings" style="margin-top: 10px; font-weight: bold; font-size: 11px; display: none;">
              <div id="ai_toxic_warning" style="color: #ef4444; padding: 4px; border: 1px solid #ef4444; border-radius: 4px; display: none; text-align: center; margin-bottom: 5px;">⚠️ TOXIC FLOW</div>
              <div id="ai_dynamic_stop" style="color: #f59e0b; padding: 4px; border: 1px solid #f59e0b; border-radius: 4px; display: none; text-align: center;">DYN STOP: <span id="ai_stop_val"></span></div>
+             <div id="ai_exhaustion" style="color: #8b5cf6; padding: 4px; border: 1px solid #8b5cf6; border-radius: 4px; display: none; text-align: center; margin-top: 5px;">🔥 EXHAUSTION: <span id="ai_exh_val"></span></div>
          </div>
          
          <!-- V2 Rolling -->

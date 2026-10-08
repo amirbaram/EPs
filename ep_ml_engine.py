@@ -25,8 +25,11 @@ class EPMLEngine:
         tox_path = base / "ep_toxicity_filter.pkl"
         self.toxicity_filter = joblib.load(tox_path) if tox_path.exists() else None
             
-        stop_path = base / "ep_dynamic_stoploss_q05.pkl"
+        stop_path = base / "ep_dynamic_trailer.pkl"
         self.dynamic_stop = joblib.load(stop_path) if stop_path.exists() else None
+        
+        exh_path = base / "ep_exhaustion_classifier.pkl"
+        self.exhaustion_classifier = joblib.load(exh_path) if exh_path.exists() else None
             
         self.spy_df = datastore.load_bars("SPY")
         
@@ -199,6 +202,15 @@ class EPMLEngine:
         if self.dynamic_stop:
             try:
                 res["dynamic_stop_loss_pct"] = float(self.dynamic_stop.predict(df_feat)[0])
+            except Exception:
+                pass
+                
+        if hasattr(self, 'exhaustion_classifier') and self.exhaustion_classifier:
+            try:
+                # Exhaustion is only meaningful if stock is up
+                if curr_ret >= 0.20:
+                    probs_exh = self.exhaustion_classifier.predict_proba(df_feat)[0]
+                    res["prob_exhaustion"] = float(probs_exh[1])
             except Exception:
                 pass
                 
