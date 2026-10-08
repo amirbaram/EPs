@@ -1001,6 +1001,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
               <span id="ai_v1_200" style="font-weight:700; color:#a855f7;">--%</span>
             </div>
         </div>
+        <div id="ai_adv_warnings_v1" style="margin-top: 10px; font-weight: bold; font-size: 11px; display: none;">
+             <div id="ai_toxic_warning_v1" style="color: #ef4444; padding: 4px; border: 1px solid #ef4444; border-radius: 4px; display: none; text-align: center; margin-bottom: 5px;">⚠️ TOXIC FLOW</div>
+             <div id="ai_dynamic_stop_v1" style="color: #f59e0b; padding: 4px; border: 1px solid #f59e0b; border-radius: 4px; display: none; text-align: center;">DYN STOP: <span id="ai_stop_val_v1"></span></div>
+        </div>
 
         <!-- V2 Rolling -->
         <div style="display:flex; flex-direction:column; background:#0f172a; padding:8px; border-radius:6px; border:1px solid #38bdf8;">
@@ -1024,6 +1028,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
               <span style="color:var(--muted);">+200% Target:</span>
               <span id="ai_v2_200" style="font-weight:700; color:#a855f7;">--%</span>
             </div>
+        </div>
+        <div id="ai_adv_warnings_v2" style="margin-top: 10px; font-weight: bold; font-size: 11px; display: none;">
+             <div id="ai_toxic_warning_v2" style="color: #ef4444; padding: 4px; border: 1px solid #ef4444; border-radius: 4px; display: none; text-align: center; margin-bottom: 5px;">⚠️ TOXIC FLOW</div>
+             <div id="ai_dynamic_stop_v2" style="color: #f59e0b; padding: 4px; border: 1px solid #f59e0b; border-radius: 4px; display: none; text-align: center;">DYN STOP: <span id="ai_stop_val_v2"></span></div>
         </div>
 
       </div>
@@ -2276,23 +2284,45 @@ function selectEvent(ev) {
   }
 
   // Update AI Predictions (V1 and V2)
-  const v1_50 = ev.ml_50 ? (ev.ml_50 * 100).toFixed(1) + '%' : '--%';
-  const v1_100 = ev.ml_100 ? (ev.ml_100 * 100).toFixed(1) + '%' : '--%';
-  const v1_150 = ev.ml_150 ? (ev.ml_150 * 100).toFixed(1) + '%' : '--%';
-  const v1_200 = ev.ml_200 ? (ev.ml_200 * 100).toFixed(1) + '%' : '--%';
-  document.getElementById('ai_v1_50').textContent = v1_50;
-  document.getElementById('ai_v1_100').textContent = v1_100;
-  document.getElementById('ai_v1_150').textContent = v1_150;
-  document.getElementById('ai_v1_200').textContent = v1_200;
+  // Update AI Predictions (V1 and V2)
+  const formatProb = (p) => p >= 1.0 ? '<span style="color:#10b981; font-weight:800;">MET ✓</span>' : (p * 100).toFixed(1) + '%';
+  document.getElementById('ai_v1_50').innerHTML = ev.ml_50 != null ? formatProb(ev.ml_50) : '--%';
+  document.getElementById('ai_v1_100').innerHTML = ev.ml_100 != null ? formatProb(ev.ml_100) : '--%';
+  document.getElementById('ai_v1_150').innerHTML = ev.ml_150 != null ? formatProb(ev.ml_150) : '--%';
+  document.getElementById('ai_v1_200').innerHTML = ev.ml_200 != null ? formatProb(ev.ml_200) : '--%';
   
-  let days_elapsed = ev.bars_since > 0 ? ev.bars_since : 1;
-  document.getElementById('ai_v2_day_badge').textContent = `Day ${days_elapsed}`;
+  let adv_warnings_v1 = false;
+  if (ev.is_toxic) {
+      document.getElementById('ai_toxic_warning_v1').style.display = 'block';
+      adv_warnings_v1 = true;
+  } else {
+      document.getElementById('ai_toxic_warning_v1').style.display = 'none';
+  }
+  if (ev.dynamic_stop_loss_pct != null) {
+      document.getElementById('ai_dynamic_stop_v1').style.display = 'block';
+      document.getElementById('ai_stop_val_v1').textContent = (ev.dynamic_stop_loss_pct * 100).toFixed(1) + '%';
+      adv_warnings_v1 = true;
+  } else {
+      document.getElementById('ai_dynamic_stop_v1').style.display = 'none';
+  }
+  
+  if (adv_warnings_v1) {
+      document.getElementById('ai_adv_warnings_v1').style.display = 'block';
+  } else {
+      document.getElementById('ai_adv_warnings_v1').style.display = 'none';
+  }
+
+  // [FIX]: Real-world day is 1-based (bars_since + 1). Rolling API offset is 0-based (bars_since).
+  let display_day = ev.bars_since + 1;
+  let fetch_offset = ev.bars_since > 0 ? ev.bars_since : 1; 
+  
+  document.getElementById('ai_v2_day_badge').textContent = `Day ${display_day}`;
   document.getElementById('ai_v2_50').textContent = '...';
   document.getElementById('ai_v2_100').textContent = '...';
   document.getElementById('ai_v2_150').textContent = '...';
   document.getElementById('ai_v2_200').textContent = '...';
   
-  fetch(`/api/ml_rolling?symbol=${ev.symbol}&event_date=${ev.event_date}&days_forward=${days_elapsed}`)
+  fetch(`/api/ml_rolling?symbol=${ev.symbol}&event_date=${ev.event_date}&days_forward=${fetch_offset}`)
     .then(res => res.json())
     .then(data => {
         if (data.stopped_out || data.error) {
@@ -2303,10 +2333,32 @@ function selectEvent(ev) {
             return;
         }
         if (data.probs) {
-            document.getElementById('ai_v2_50').textContent = (data.probs.prob_50 * 100).toFixed(1) + '%';
-            document.getElementById('ai_v2_100').textContent = (data.probs.prob_100 * 100).toFixed(1) + '%';
-            document.getElementById('ai_v2_150').textContent = (data.probs.prob_150 * 100).toFixed(1) + '%';
-            document.getElementById('ai_v2_200').textContent = (data.probs.prob_200 * 100).toFixed(1) + '%';
+            document.getElementById('ai_v2_50').innerHTML = formatProb(data.probs.prob_50);
+            document.getElementById('ai_v2_100').innerHTML = formatProb(data.probs.prob_100);
+            document.getElementById('ai_v2_150').innerHTML = formatProb(data.probs.prob_150);
+            document.getElementById('ai_v2_200').innerHTML = formatProb(data.probs.prob_200);
+            
+            let adv_warnings = false;
+            if (data.probs.is_toxic) {
+                document.getElementById('ai_toxic_warning_v2').style.display = 'block';
+                adv_warnings = true;
+            } else {
+                document.getElementById('ai_toxic_warning_v2').style.display = 'none';
+            }
+            
+            if (data.probs.dynamic_stop_loss_pct != null) {
+                document.getElementById('ai_dynamic_stop_v2').style.display = 'block';
+                document.getElementById('ai_stop_val_v2').textContent = (data.probs.dynamic_stop_loss_pct * 100).toFixed(1) + '%';
+                adv_warnings = true;
+            } else {
+                document.getElementById('ai_dynamic_stop_v2').style.display = 'none';
+            }
+            
+            if (adv_warnings) {
+                document.getElementById('ai_adv_warnings_v2').style.display = 'block';
+            } else {
+                document.getElementById('ai_adv_warnings_v2').style.display = 'none';
+            }
         }
     });
 
@@ -4051,7 +4103,7 @@ window.addEventListener('load', () => {
   }
 });
 function openAiTopPicksModal() {
-  document.getElementById('modal_ai_top_picks').style.display = 'flex';
+  document.getElementById('modal_ai_top_picks').classList.add('open');
   document.getElementById('ai_top_picks_content').innerHTML = '<div style="text-align:center; padding:40px; color:#94a3b8;">Processing Live ML Inference...</div>';
   
   fetch('/api/ai_top_picks')
@@ -4122,7 +4174,8 @@ def api_tracker_events():
             try:
                 d1_idx = bars.index.get_loc(dt_str)
                 bars_since = len(bars) - 1 - d1_idx
-                dfwd = max(1, min(5, bars_since))
+                # [FIX]: V1 expects a 1-based day count. Day 1 is bars_since=0 (so we add 1). 
+                dfwd = max(1, min(5, bars_since + 1))
                 ml_feats = engine.compute_features(sym, d1_idx, days_forward=dfwd)
                 if ml_feats:
                     preds = engine.predict(ml_feats)
@@ -4130,6 +4183,8 @@ def api_tracker_events():
                     ev["ml_100"] = preds.get("prob_100")
                     ev["ml_150"] = preds.get("prob_150")
                     ev["ml_200"] = preds.get("prob_200")
+                    ev["is_toxic"] = preds.get("is_toxic", False)
+                    ev["dynamic_stop_loss_pct"] = preds.get("dynamic_stop_loss_pct", None)
             except Exception:
                 pass
 
@@ -4451,6 +4506,8 @@ def api_ai_top_picks():
         prob_100 = 0.0
         prob_50 = 0.0
         ml_150 = 0.0
+        is_toxic = False
+        dyn_stop = None
         
         # ML Engine Inference
         bars = datastore.load_bars(features.get("symbol"))
@@ -4465,11 +4522,23 @@ def api_ai_top_picks():
                     prob_50 = preds["prob_50"]
                     prob_100 = preds["prob_100"]
                     ml_150 = preds["prob_150"]
+                    is_toxic = preds.get("is_toxic", False)
+                    dyn_stop = preds.get("dynamic_stop_loss_pct", None)
             except Exception:
                 pass
                 
         pred = ep_predictor.get_predictions(features)
         archetype = pred["archetype"]
+        alerts = pred["alerts"]
+        caution = pred["caution"]
+        
+        # Override with ML Toxicity
+        if is_toxic:
+            archetype = "Toxic Traps"
+            caution = "⚠️ ML: TOXIC FLOW DETECTED (High Dump Risk)"
+            
+        if dyn_stop is not None:
+            alerts.insert(0, f"🛑 ML Dynamic Stop: {(dyn_stop * 100):.1f}%")
         
         # Blend ML Score with archetype rules (ML takes precedence for score)
         score = (prob_100 * 100) + (prob_50 * 50)
@@ -4485,21 +4554,23 @@ def api_ai_top_picks():
             "score": round(score, 1),
             "prob_100": round(prob_100 * 100, 1),
             "prob_consol": round(ml_150 * 100, 1),
-            "alerts": pred["alerts"],
-            "caution": pred["caution"]
+            "alerts": alerts,
+            "caution": caution,
+            "is_toxic": is_toxic
         })
         
     scored_events.sort(key=lambda x: x["score"], reverse=True)
     
-    fresh = [e for e in scored_events if e["days_old"] <= 2 and e["archetype"] != "Toxic Traps"][:5]
-    mature = [e for e in scored_events if e["days_old"] > 2 and e["days_old"] <= 15 and e["archetype"] != "Toxic Traps"][:5]
-    traps = [e for e in scored_events if e["archetype"] == "Toxic Traps"][:5]
+    fresh = [e for e in scored_events if e["days_old"] <= 2 and not e["is_toxic"] and not "Toxic Traps" in e["archetype"]][:5]
+    mature = [e for e in scored_events if e["days_old"] > 2 and e["days_old"] <= 15 and not e["is_toxic"] and not "Toxic Traps" in e["archetype"]][:5]
+    traps = [e for e in scored_events if e["is_toxic"] or "Toxic Traps" in e["archetype"]][:5]
     
     return jsonify({
         "fresh": fresh,
         "mature": mature,
         "traps": traps
     })
+
 
 
 def main():

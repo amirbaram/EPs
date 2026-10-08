@@ -528,19 +528,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       <div id="dossier_hist_chips" style="display:flex; flex-wrap:wrap; gap:6px; margin-top:2px;"></div>
     </div>
 
-    <!-- Card 0.5: AI Predictive Timeline (Simulated) -->
-    <div class="panel-card" id="card_ai_historical" style="display:none; background:#064e3b; border:1px solid #10b981; margin-top:8px;">
-      <div class="panel-card-title" style="border-bottom:1px solid #047857; padding-bottom:6px;">
-        <span style="color:#34d399;">🤖 AI Probabilistic Evolution (First 20 Days)</span>
-        <span id="ai_hist_archetype" style="color:#a7f3d0; font-size:10px; font-weight:700;">Evaluating</span>
-      </div>
-      <div style="font-size:11px; color:#6ee7b7; line-height:1.4; padding-bottom:6px;">
-        Simulated daily probability updates based on Playbook Insights and live Expectancy Boosters (e.g., 5D Support).
-      </div>
-      <div id="ai_timeline_scroll" style="max-height: 180px; overflow-y: auto; display:flex; flex-direction:column; gap:4px; padding-right:4px;">
-         <!-- Timeline populated by JS -->
-      </div>
-    </div>
+    
 
     <!-- Card 1: Combined Multi-Leg Strategy Stats -->
     <div class="panel-card" id="card_portfolio_stats">
@@ -615,6 +603,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                  <span style="color:#94a3b8;">+200% Target:</span>
                  <span id="ai_v1_200" style="color:#a855f7; font-weight:700;">--%</span>
              </div>
+         </div>
+         <div id="ai_adv_warnings" style="margin-top: 10px; font-weight: bold; font-size: 11px; display: none;">
+             <div id="ai_toxic_warning" style="color: #ef4444; padding: 4px; border: 1px solid #ef4444; border-radius: 4px; display: none; text-align: center; margin-bottom: 5px;">⚠️ TOXIC FLOW</div>
+             <div id="ai_dynamic_stop" style="color: #f59e0b; padding: 4px; border: 1px solid #f59e0b; border-radius: 4px; display: none; text-align: center;">DYN STOP: <span id="ai_stop_val"></span></div>
          </div>
          
          <!-- V2 Rolling -->
@@ -825,7 +817,9 @@ function onSliderMove(days) {
     document.getElementById('ai_v2_150').textContent = '...';
     document.getElementById('ai_v2_200').textContent = '...';
     
-    fetch(`/api/ml_rolling?symbol=${selectedSym}&event_date=${selectedDate}&days_forward=${days}`)
+    const offset = parseInt(days) - 1;
+    
+    fetch(`/api/ml_rolling?symbol=${selectedSym}&event_date=${selectedDate}&days_forward=${offset}`)
     .then(r => r.json())
     .then(data => {
         if (data.stopped_out || data.error) {
@@ -836,10 +830,11 @@ function onSliderMove(days) {
             return;
         }
         if (data.probs) {
-            document.getElementById('ai_v2_50').textContent = (data.probs.prob_50 * 100).toFixed(1) + '%';
-            document.getElementById('ai_v2_100').textContent = (data.probs.prob_100 * 100).toFixed(1) + '%';
-            document.getElementById('ai_v2_150').textContent = (data.probs.prob_150 * 100).toFixed(1) + '%';
-            document.getElementById('ai_v2_200').textContent = (data.probs.prob_200 * 100).toFixed(1) + '%';
+            const formatProb = (p) => p >= 1.0 ? '<span style="color:#10b981; font-weight:800;">MET ✓</span>' : (p * 100).toFixed(1) + '%';
+            document.getElementById('ai_v2_50').innerHTML = formatProb(data.probs.prob_50);
+            document.getElementById('ai_v2_100').innerHTML = formatProb(data.probs.prob_100);
+            document.getElementById('ai_v2_150').innerHTML = formatProb(data.probs.prob_150);
+            document.getElementById('ai_v2_200').innerHTML = formatProb(data.probs.prob_200);
         }
     }).catch(e => console.error(e));
 }
@@ -1271,10 +1266,33 @@ function loadChart(ev) {
     const d = data.dossier;
     
     if (d && d.ai_scores && d.ai_scores.ml_50 != null) {
-        document.getElementById('ai_v1_50').textContent = (d.ai_scores.ml_50 * 100).toFixed(1) + '%';
-        document.getElementById('ai_v1_100').textContent = (d.ai_scores.ml_100 * 100).toFixed(1) + '%';
-        document.getElementById('ai_v1_150').textContent = (d.ai_scores.ml_150 * 100).toFixed(1) + '%';
-        document.getElementById('ai_v1_200').textContent = (d.ai_scores.ml_200 * 100).toFixed(1) + '%';
+        const formatProb = (p) => p >= 1.0 ? '<span style="color:#10b981; font-weight:800;">MET ✓</span>' : (p * 100).toFixed(1) + '%';
+        document.getElementById('ai_v1_50').innerHTML = formatProb(d.ai_scores.ml_50);
+        document.getElementById('ai_v1_100').innerHTML = formatProb(d.ai_scores.ml_100);
+        document.getElementById('ai_v1_150').innerHTML = formatProb(d.ai_scores.ml_150);
+        document.getElementById('ai_v1_200').innerHTML = formatProb(d.ai_scores.ml_200);
+        
+        let adv_warnings = false;
+        if (d.ai_scores.is_toxic) {
+            document.getElementById('ai_toxic_warning').style.display = 'block';
+            adv_warnings = true;
+        } else {
+            document.getElementById('ai_toxic_warning').style.display = 'none';
+        }
+        
+        if (d.ai_scores.dynamic_stop_loss_pct != null) {
+            document.getElementById('ai_dynamic_stop').style.display = 'block';
+            document.getElementById('ai_stop_val').textContent = (d.ai_scores.dynamic_stop_loss_pct * 100).toFixed(1) + '%';
+            adv_warnings = true;
+        } else {
+            document.getElementById('ai_dynamic_stop').style.display = 'none';
+        }
+        
+        if (adv_warnings) {
+            document.getElementById('ai_adv_warnings').style.display = 'block';
+        } else {
+            document.getElementById('ai_adv_warnings').style.display = 'none';
+        }
     } else {
         document.getElementById('ai_v1_50').textContent = '--%';
         document.getElementById('ai_v1_100').textContent = '--%';
@@ -1546,38 +1564,6 @@ function loadChart(ev) {
     }
   });
 
-  // Fetch AI Historical Prediction Evolution
-  document.getElementById('ai_hist_archetype').textContent = 'Loading...';
-  fetch(`/api/predict_history?sym=${ev.symbol}&date=${ev.date}`).then(r => r.json()).then(p => {
-    if (p.error || !p.history) {
-      document.getElementById('card_ai_historical').style.display = 'none';
-      return;
-    }
-    
-    document.getElementById('card_ai_historical').style.display = 'flex';
-    document.getElementById('ai_hist_archetype').textContent = p.history[0].archetype;
-    
-    const tlHtml = p.history.map(day => {
-       const isUpgrade = day.alerts.some(a => a.includes('Upgrading'));
-       const isCaution = day.alerts.some(a => a.includes('Caution') || a.includes('TRAP'));
-       const borderCol = isCaution ? '#ef4444' : (isUpgrade ? '#10b981' : '#1e293b');
-       const textCol = isCaution ? '#fca5a5' : (isUpgrade ? '#6ee7b7' : '#94a3b8');
-       
-       let alHtml = day.alerts.length ? `<div style="font-size:9.5px; color:${textCol}; margin-top:2px;">${day.alerts[0]}</div>` : '';
-       
-       return `
-         <div style="background:#131a28; border-left:3px solid ${borderCol}; padding:5px 8px; border-radius:4px; font-size:10.5px;">
-           <div style="display:flex; justify-content:space-between; color:#cbd5e1;">
-             <span style="font-weight:700;">${day.day}</span>
-             <span>+100% Target: <b style="color:var(--green);">${day.prob_100}%</b> | Consol: <b style="color:var(--red);">${day.prob_consol}%</b></span>
-           </div>
-           ${alHtml}
-         </div>
-       `;
-    }).join('');
-    
-    document.getElementById('ai_timeline_scroll').innerHTML = tlHtml;
-  }).catch(err => console.error("Predict history err", err));
 }
 
 function onHistChipClick(sym, dt, sub) {
@@ -2193,6 +2179,8 @@ def compute_dossier(sym: str, date_str: str, d: pd.DataFrame, pos: int, ev_row: 
         ai_scores["ml_100"] = float(ev_row.get("ml_100", 0)) if pd.notna(ev_row.get("ml_100")) else None
         ai_scores["ml_150"] = float(ev_row.get("ml_150", 0)) if pd.notna(ev_row.get("ml_150")) else None
         ai_scores["ml_200"] = float(ev_row.get("ml_200", 0)) if pd.notna(ev_row.get("ml_200")) else None
+        ai_scores["is_toxic"] = bool(ev_row.get("is_toxic", False))
+        ai_scores["dynamic_stop_loss_pct"] = float(ev_row.get("dynamic_stop_loss_pct", 0.0)) if pd.notna(ev_row.get("dynamic_stop_loss_pct")) else None
 
     return {
         "ai_scores": ai_scores,
