@@ -79,7 +79,8 @@ def train_ordinal_model():
     xgb_model.fit(X_base, y_base, sample_weight=w_base)
     
     # Train calibrator strictly on unseen, chronologically future data using prefit
-    calibrated_model = CalibratedClassifierCV(estimator=xgb_model, method='isotonic', cv="prefit")
+    from sklearn.frozen import FrozenEstimator
+    calibrated_model = CalibratedClassifierCV(estimator=FrozenEstimator(xgb_model), method='isotonic')
     calibrated_model.fit(X_calib, y_calib, sample_weight=w_calib)
     
     from sklearn.pipeline import Pipeline
