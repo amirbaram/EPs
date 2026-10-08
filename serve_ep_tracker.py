@@ -970,30 +970,65 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       </div>
     </div>
 
+    
     <!-- Card 1.2: AI Prediction & Alerts -->
     <div class="card" id="card_ai_prediction" style="border-color:#10b981;">
       <div class="card-title">
-        <span style="color:#34d399;">🤖 AI Prediction &amp; Targets</span>
-        <span id="ai_archetype_badge" class="badge-fresh" style="background:#064e3b; color:#34d399;">Evaluating</span>
+        <span style="color:#34d399;">🤖 AI Probabilities</span>
       </div>
       <div style="font-size:11.5px; display:flex; flex-direction:column; gap:8px;">
-        <div style="display:flex; justify-content:space-between; border-bottom:1px solid #1e293b; padding-bottom:4px;">
-          <span style="color:var(--muted);">Probability of +50% Target:</span>
-          <span id="ai_prob_50" style="font-weight:700; color:#cbd5e1;">--%</span>
+        
+        <!-- V1 Snapshot -->
+        <div style="display:flex; flex-direction:column; background:rgba(0,0,0,0.3); padding:8px; border-radius:6px; border:1px solid #1e293b;">
+            <div style="display:flex; justify-content:space-between; margin-bottom:4px;">
+                <span style="color:#94a3b8; font-weight:bold;">V1 Day-5 Snapshot</span>
+                <span style="color:#64748b; font-weight:bold;">Fixed</span>
+            </div>
+            <div style="display:flex; justify-content:space-between; padding-bottom:2px;">
+              <span style="color:var(--muted);">+50% Target:</span>
+              <span id="ai_v1_50" style="font-weight:700; color:#cbd5e1;">--%</span>
+            </div>
+            <div style="display:flex; justify-content:space-between; padding-bottom:2px;">
+              <span style="color:var(--muted);">+100% Target:</span>
+              <span id="ai_v1_100" style="font-weight:700; color:var(--green);">--%</span>
+            </div>
+            <div style="display:flex; justify-content:space-between; padding-bottom:2px;">
+              <span style="color:var(--muted);">+150% Target:</span>
+              <span id="ai_v1_150" style="font-weight:700; color:var(--cyan);">--%</span>
+            </div>
+            <div style="display:flex; justify-content:space-between; padding-bottom:2px;">
+              <span style="color:var(--muted);">+200% Target:</span>
+              <span id="ai_v1_200" style="font-weight:700; color:#a855f7;">--%</span>
+            </div>
         </div>
-        <div style="display:flex; justify-content:space-between; border-bottom:1px solid #1e293b; padding-bottom:4px;">
-          <span style="color:var(--muted);">Probability of +100% Target:</span>
-          <span id="ai_prob_100" style="font-weight:700; color:var(--green);">--%</span>
+
+        <!-- V2 Rolling -->
+        <div style="display:flex; flex-direction:column; background:#0f172a; padding:8px; border-radius:6px; border:1px solid #38bdf8;">
+            <div style="display:flex; justify-content:space-between; margin-bottom:4px;">
+                <span style="color:#38bdf8; font-weight:bold;">V2 Rolling Timeline</span>
+                <span style="color:#e2e8f0; font-weight:bold; background:#0369a1; padding:2px 6px; border-radius:10px; font-size:10px;" id="ai_v2_day_badge">Day X</span>
+            </div>
+            <div style="display:flex; justify-content:space-between; padding-bottom:2px;">
+              <span style="color:var(--muted);">+50% Target:</span>
+              <span id="ai_v2_50" style="font-weight:700; color:#cbd5e1;">--%</span>
+            </div>
+            <div style="display:flex; justify-content:space-between; padding-bottom:2px;">
+              <span style="color:var(--muted);">+100% Target:</span>
+              <span id="ai_v2_100" style="font-weight:700; color:var(--green);">--%</span>
+            </div>
+            <div style="display:flex; justify-content:space-between; padding-bottom:2px;">
+              <span style="color:var(--muted);">+150% Target:</span>
+              <span id="ai_v2_150" style="font-weight:700; color:var(--cyan);">--%</span>
+            </div>
+            <div style="display:flex; justify-content:space-between; padding-bottom:2px;">
+              <span style="color:var(--muted);">+200% Target:</span>
+              <span id="ai_v2_200" style="font-weight:700; color:#a855f7;">--%</span>
+            </div>
         </div>
-        <div style="display:flex; justify-content:space-between; border-bottom:1px solid #1e293b; padding-bottom:4px;">
-          <span style="color:var(--muted);">Deep Consolidation Risk:</span>
-          <span id="ai_prob_consol" style="font-weight:700; color:var(--red);">--%</span>
-        </div>
-        <div id="ai_alerts_container" style="display:flex; flex-direction:column; gap:4px; margin-top:4px;">
-          <!-- Alerts injected here via JS -->
-        </div>
+
       </div>
     </div>
+
 
     <!-- Card 1.3: Strategy Quality & Expectancy Audit -->
     <div class="card" id="card_quality_audit">
@@ -2240,33 +2275,40 @@ function selectEvent(ev) {
     w4.style.color = 'var(--muted)';
   }
 
-  // Update AI Predictions
-  document.getElementById('ai_archetype_badge').textContent = 'Loading...';
-  fetch(`/api/predict?sym=${ev.symbol}&date=${ev.event_date}`)
-    .then(r => r.json())
-    .then(p => {
-      if (p.error) {
-        document.getElementById('ai_archetype_badge').textContent = 'Data missing';
-        return;
-      }
-      document.getElementById('ai_archetype_badge').textContent = p.archetype;
-      document.getElementById('ai_prob_50').textContent = p.prob_hit_50 + '%';
-      document.getElementById('ai_prob_100').textContent = p.prob_hit_100 + '%';
-      document.getElementById('ai_prob_consol').textContent = p.prob_consolidation + '%';
-      
-      let alertsHtml = '';
-      if (p.caution) {
-         alertsHtml += `<div style="background:rgba(239,68,68,0.2); border-left:3px solid #ef4444; padding:6px; color:#fca5a5;">${p.caution}</div>`;
-      }
-      p.alerts.forEach(a => {
-         alertsHtml += `<div style="background:rgba(16,185,129,0.2); border-left:3px solid #10b981; padding:6px; color:#6ee7b7;">${a}</div>`;
-      });
-      if (!alertsHtml) {
-         alertsHtml = `<div style="color:var(--muted); font-style:italic;">No immediate action required.</div>`;
-      }
-      document.getElementById('ai_alerts_container').innerHTML = alertsHtml;
-    })
-    .catch(err => console.error("AI Predict err", err));
+  // Update AI Predictions (V1 and V2)
+  const v1_50 = ev.ml_50 ? (ev.ml_50 * 100).toFixed(1) + '%' : '--%';
+  const v1_100 = ev.ml_100 ? (ev.ml_100 * 100).toFixed(1) + '%' : '--%';
+  const v1_150 = ev.ml_150 ? (ev.ml_150 * 100).toFixed(1) + '%' : '--%';
+  const v1_200 = ev.ml_200 ? (ev.ml_200 * 100).toFixed(1) + '%' : '--%';
+  document.getElementById('ai_v1_50').textContent = v1_50;
+  document.getElementById('ai_v1_100').textContent = v1_100;
+  document.getElementById('ai_v1_150').textContent = v1_150;
+  document.getElementById('ai_v1_200').textContent = v1_200;
+  
+  let days_elapsed = ev.bars_since > 0 ? ev.bars_since : 1;
+  document.getElementById('ai_v2_day_badge').textContent = `Day ${days_elapsed}`;
+  document.getElementById('ai_v2_50').textContent = '...';
+  document.getElementById('ai_v2_100').textContent = '...';
+  document.getElementById('ai_v2_150').textContent = '...';
+  document.getElementById('ai_v2_200').textContent = '...';
+  
+  fetch(`/api/ml_rolling?symbol=${ev.symbol}&event_date=${ev.event_date}&days_forward=${days_elapsed}`)
+    .then(res => res.json())
+    .then(data => {
+        if (data.stopped_out || data.error) {
+            document.getElementById('ai_v2_50').textContent = 'STOP';
+            document.getElementById('ai_v2_100').textContent = 'STOP';
+            document.getElementById('ai_v2_150').textContent = 'STOP';
+            document.getElementById('ai_v2_200').textContent = 'STOP';
+            return;
+        }
+        if (data.probs) {
+            document.getElementById('ai_v2_50').textContent = (data.probs.prob_50 * 100).toFixed(1) + '%';
+            document.getElementById('ai_v2_100').textContent = (data.probs.prob_100 * 100).toFixed(1) + '%';
+            document.getElementById('ai_v2_150').textContent = (data.probs.prob_150 * 100).toFixed(1) + '%';
+            document.getElementById('ai_v2_200').textContent = (data.probs.prob_200 * 100).toFixed(1) + '%';
+        }
+    });
 
   // Load Chart
   loadChartData(ev);
@@ -4073,7 +4115,9 @@ def api_tracker_events():
         dt_str = ev.get("date") or ev.get("event_date")
         bars = datastore.load_bars(sym)
         ev["ml_50"] = None
+        ev["ml_100"] = None
         ev["ml_150"] = None
+        ev["ml_200"] = None
         if bars is not None and dt_str in bars.index:
             try:
                 d1_idx = bars.index.get_loc(dt_str)
@@ -4082,8 +4126,10 @@ def api_tracker_events():
                 ml_feats = engine.compute_features(sym, d1_idx, days_forward=dfwd)
                 if ml_feats:
                     preds = engine.predict(ml_feats)
-                    ev["ml_50"] = preds["prob_50"]
-                    ev["ml_150"] = preds["prob_150"]
+                    ev["ml_50"] = preds.get("prob_50")
+                    ev["ml_100"] = preds.get("prob_100")
+                    ev["ml_150"] = preds.get("prob_150")
+                    ev["ml_200"] = preds.get("prob_200")
             except Exception:
                 pass
 
@@ -4168,7 +4214,25 @@ def api_export_premarket_json():
     data = ep_premarket.get_premarket_data(force_refresh=False)
     return jsonify(data)
 
+
+@app.route("/api/ml_rolling")
+def api_ml_rolling():
+    sym = request.args.get("symbol")
+    event_date = request.args.get("event_date")
+    days_forward = int(request.args.get("days_forward", "5"))
+    from ep_ml_engine import engine
+    import datastore
+    bars = datastore.load_bars(sym)
+    if bars is None or event_date not in bars.index: return jsonify({"error": "No bars"})
+    d1_idx = bars.index.get_loc(event_date)
+    t_idx = d1_idx + days_forward
+    features = engine.compute_rolling_features(sym, d1_idx, t_idx)
+    if not features: return jsonify({"stopped_out": True})
+    probs = engine.predict_rolling(features)
+    return jsonify({"probs": probs})
+
 @app.route("/api/chart")
+
 def api_chart():
     sym = request.args.get("symbol", "").upper()
     ev_dt = request.args.get("event_date", "")

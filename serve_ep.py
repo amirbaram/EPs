@@ -585,15 +585,71 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       </div>
     </div>
 
+    
     <!-- AI Scores -->
     <div style="padding:10px 14px; border-bottom:1px solid #1c2538;">
       <div style="font-weight:700; color:#cbd5e1; margin-bottom:5px; display:flex; justify-content:space-between; align-items:center;">
-        <span>🤖 AI Confidence & Alpha Rank (Day 5)</span>
+        <span>🤖 AI Architecture Comparison</span>
       </div>
-      <div style="display:grid; grid-template-columns: 1fr 1fr; gap:6px;" id="ai_grid">
-         <!-- Populated by JS -->
+      <div style="display:flex; flex-direction:column; gap:10px;" id="ai_grid">
+         
+         <!-- V1 Day 5 -->
+         <div style="background:rgba(0,0,0,0.3); padding:8px; border-radius:6px; border:1px solid #1e293b;">
+             <div style="font-size:11px; color:#94a3b8; font-weight:bold; margin-bottom:6px; display:flex; justify-content:space-between;">
+                 <span>V1 Day-5 Snapshot</span>
+                 <span>Fixed</span>
+             </div>
+             <div style="display:flex; justify-content:space-between; font-size:11.5px; margin-bottom:2px;">
+                 <span style="color:#94a3b8;">+50% Target:</span>
+                 <span id="ai_v1_50" style="color:#cbd5e1; font-weight:700;">--%</span>
+             </div>
+             <div style="display:flex; justify-content:space-between; font-size:11.5px;">
+                 <span style="color:#94a3b8;">+100% Target:</span>
+                 <span id="ai_v1_100" style="color:var(--green); font-weight:700;">--%</span>
+             </div>
+             <div style="display:flex; justify-content:space-between; font-size:11.5px; margin-top:2px;">
+                 <span style="color:#94a3b8;">+150% Target:</span>
+                 <span id="ai_v1_150" style="color:var(--cyan); font-weight:700;">--%</span>
+             </div>
+             <div style="display:flex; justify-content:space-between; font-size:11.5px; margin-top:2px;">
+                 <span style="color:#94a3b8;">+200% Target:</span>
+                 <span id="ai_v1_200" style="color:#a855f7; font-weight:700;">--%</span>
+             </div>
+         </div>
+         
+         <!-- V2 Rolling -->
+         <div style="background:#0f172a; padding:8px; border-radius:6px; border:1px solid #38bdf8;">
+             <div style="font-size:11px; color:#38bdf8; font-weight:bold; margin-bottom:6px; display:flex; justify-content:space-between; align-items:center;">
+                 <span>V2 Rolling ML</span>
+                 <span style="color:#e2e8f0; font-weight:bold; background:#0369a1; padding:2px 6px; border-radius:10px; font-size:10px;" id="epDaysValBadge">Day 5</span>
+             </div>
+             
+             <!-- THE SLIDER -->
+             <div style="display:flex; align-items:center; gap:8px; margin-bottom:8px;">
+                 <input type="range" id="epSlider" min="1" max="20" value="5" style="flex:1; cursor:pointer;" oninput="onSliderMove(this.value)">
+             </div>
+             
+             <div style="display:flex; justify-content:space-between; font-size:11.5px; margin-bottom:2px;">
+                 <span style="color:#94a3b8;">+50% Target:</span>
+                 <span id="ai_v2_50" style="color:#cbd5e1; font-weight:700;">--%</span>
+             </div>
+             <div style="display:flex; justify-content:space-between; font-size:11.5px;">
+                 <span style="color:#94a3b8;">+100% Target:</span>
+                 <span id="ai_v2_100" style="color:var(--green); font-weight:700;">--%</span>
+             </div>
+             <div style="display:flex; justify-content:space-between; font-size:11.5px; margin-top:2px;">
+                 <span style="color:#94a3b8;">+150% Target:</span>
+                 <span id="ai_v2_150" style="color:var(--cyan); font-weight:700;">--%</span>
+             </div>
+             <div style="display:flex; justify-content:space-between; font-size:11.5px; margin-top:2px;">
+                 <span style="color:#94a3b8;">+200% Target:</span>
+                 <span id="ai_v2_200" style="color:#a855f7; font-weight:700;">--%</span>
+             </div>
+         </div>
+
       </div>
     </div>
+
     <!-- Card 2: Sector & Theme Momentum Backdrop -->
     <div class="panel-card" id="card_sec_thm" style="display:none;">
       <div class="panel-card-title">
@@ -757,7 +813,37 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 let allEvents = [];
 let filteredEvents = [];
 let sortCol = 'date', sortAsc = false;
+
 let selectedSym = null, selectedDate = null;
+
+function onSliderMove(days) {
+    document.getElementById('epDaysValBadge').textContent = 'Day ' + days;
+    if (!selectedSym || !selectedDate) return;
+    
+    document.getElementById('ai_v2_50').textContent = '...';
+    document.getElementById('ai_v2_100').textContent = '...';
+    document.getElementById('ai_v2_150').textContent = '...';
+    document.getElementById('ai_v2_200').textContent = '...';
+    
+    fetch(`/api/ml_rolling?symbol=${selectedSym}&event_date=${selectedDate}&days_forward=${days}`)
+    .then(r => r.json())
+    .then(data => {
+        if (data.stopped_out || data.error) {
+            document.getElementById('ai_v2_50').textContent = 'STOP';
+            document.getElementById('ai_v2_100').textContent = 'STOP';
+            document.getElementById('ai_v2_150').textContent = 'STOP';
+            document.getElementById('ai_v2_200').textContent = 'STOP';
+            return;
+        }
+        if (data.probs) {
+            document.getElementById('ai_v2_50').textContent = (data.probs.prob_50 * 100).toFixed(1) + '%';
+            document.getElementById('ai_v2_100').textContent = (data.probs.prob_100 * 100).toFixed(1) + '%';
+            document.getElementById('ai_v2_150').textContent = (data.probs.prob_150 * 100).toFixed(1) + '%';
+            document.getElementById('ai_v2_200').textContent = (data.probs.prob_200 * 100).toFixed(1) + '%';
+        }
+    }).catch(e => console.error(e));
+}
+
 let chart = null, candleSeries = null, volSeries = null, ema20Series = null, sma50Series = null;
 let currentPreset = 'pinnacle';
 let activePriceLines = [];
@@ -1184,26 +1270,22 @@ function loadChart(ev) {
     // 1. Sector / Theme Context (Right Pane)
     const d = data.dossier;
     
-    if (d && d.ai_scores) {
-        let aiHtml = '';
-        const targets = { '50': '+50%', '100': '+100%', '150': '+150%', '200': '+200%' };
-        for (const [k, title] of Object.entries(targets)) {
-            const prob = d.ai_scores[`ml_${k}`];
-            if (prob == null) continue;
-            const pct = (prob * 100).toFixed(1) + '%';
-            let color = 'var(--muted)';
-            if (prob > 0.4 && k === '50') color = 'var(--green)';
-            if (prob > 0.15 && k !== '50') color = 'var(--green)';
-            if (prob > 0.5) color = 'var(--gold)';
-            aiHtml += `<div style="background:#131a26; padding:6px; border-radius:4px; border:1px solid #1e293b; text-align:center;">
-              <div style="font-size:10px; color:#94a3b8; margin-bottom:3px;">${title} Target</div>
-              <div style="font-size:14px; font-weight:bold; color:${color};">${pct}</div>
-            </div>`;
-        }
-        document.getElementById('ai_grid').innerHTML = aiHtml;
+    if (d && d.ai_scores && d.ai_scores.ml_50 != null) {
+        document.getElementById('ai_v1_50').textContent = (d.ai_scores.ml_50 * 100).toFixed(1) + '%';
+        document.getElementById('ai_v1_100').textContent = (d.ai_scores.ml_100 * 100).toFixed(1) + '%';
+        document.getElementById('ai_v1_150').textContent = (d.ai_scores.ml_150 * 100).toFixed(1) + '%';
+        document.getElementById('ai_v1_200').textContent = (d.ai_scores.ml_200 * 100).toFixed(1) + '%';
     } else {
-        document.getElementById('ai_grid').innerHTML = '<div style="color:var(--muted); font-size:11px;">AI Scores not available</div>';
+        document.getElementById('ai_v1_50').textContent = '--%';
+        document.getElementById('ai_v1_100').textContent = '--%';
+        document.getElementById('ai_v1_150').textContent = '--%';
+        document.getElementById('ai_v1_200').textContent = '--%';
     }
+    
+    // Automatically trigger V2 load for Day 5
+    const slider = document.getElementById('epSlider');
+    if (slider) { slider.value = 5; }
+    onSliderMove(5);
 
     if (d && d.sector_theme) {
       const st = d.sector_theme;
@@ -2172,7 +2254,25 @@ def api_predict_history():
         
     return jsonify({"history": history})
 
+
+@app.route("/api/ml_rolling")
+def api_ml_rolling():
+    sym = request.args.get("symbol")
+    event_date = request.args.get("event_date")
+    days_forward = int(request.args.get("days_forward", "5"))
+    from ep_ml_engine import engine
+    import datastore
+    bars = datastore.load_bars(sym)
+    if bars is None or event_date not in bars.index: return jsonify({"error": "No bars"})
+    d1_idx = bars.index.get_loc(event_date)
+    t_idx = d1_idx + days_forward
+    features = engine.compute_rolling_features(sym, d1_idx, t_idx)
+    if not features: return jsonify({"stopped_out": True})
+    probs = engine.predict_rolling(features)
+    return jsonify({"probs": probs})
+
 @app.route("/api/chart")
+
 def api_chart():
     sym = request.args.get("symbol", "").upper()
     date_str = request.args.get("date", "")
