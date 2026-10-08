@@ -100,39 +100,41 @@ def build_rolling_dataset():
             targets = {50: entry * 1.5, 100: entry * 2.0, 150: entry * 2.5, 200: entry * 3.0}
             
             event_mae_pct = float('nan')
-            mae_price = entry
-            hit_target_50 = False
-            for j in range(len(full_f_window)):
-                bar = full_f_window.iloc[j]
-                if bar["low"] < mae_price:
-                    mae_price = bar["low"]
-                if bar["low"] <= stop:
-                    break
-                if bar["high"] >= targets[50]:
-                    hit_target_50 = True
-                    break
-            if hit_target_50:
-                event_mae_pct = (mae_price - entry) / entry
+
+            # [FIX]: Vectorize the target evaluation
+            if len(full_f_window) > 0:
+                stop_mask = full_f_window["low"] <= stop
+                first_stop_idx = stop_mask.idxmax() if stop_mask.any() else full_f_window.index[-1] + 1
+                # Check for same-day stop hit (idxmax returns the first True, or the first index if all False, so we verify)
+                if not stop_mask.any():
+                    first_stop_idx = full_f_window.index[-1] + 1
                 
+                target_50_mask = full_f_window["high"] >= targets[50]
+                first_target_50_idx = target_50_mask.idxmax() if target_50_mask.any() else full_f_window.index[-1] + 1
+                if not target_50_mask.any():
+                    first_target_50_idx = full_f_window.index[-1] + 1
+
+                if first_target_50_idx < first_stop_idx and first_target_50_idx <= full_f_window.index[-1]:
+                    mae_price = min(entry, full_f_window.loc[:first_target_50_idx]["low"].min())
+                    event_mae_pct = (mae_price - entry) / entry
+
             is_timeout = (f_end == idx + 250)
             event_outcomes = {}
             for t_pct, t_price in targets.items():
-                hit_target = False
-                hit_stop = False
-                for j in range(len(full_f_window)):
-                    bar = full_f_window.iloc[j]
-                    if bar["low"] <= stop:
-                        hit_stop = True
-                        break
-                    if bar["high"] >= t_price:
-                        hit_target = True
-                        break
-                if hit_target:
-                    event_outcomes[t_pct] = 1
-                elif hit_stop:
-                    event_outcomes[t_pct] = 0
-                elif is_timeout:
-                    event_outcomes[t_pct] = 0
+                if len(full_f_window) > 0:
+                    target_mask = full_f_window["high"] >= t_price
+                    first_target_idx = target_mask.idxmax() if target_mask.any() else full_f_window.index[-1] + 1
+                    if not target_mask.any():
+                        first_target_idx = full_f_window.index[-1] + 1
+
+                    if first_target_idx < first_stop_idx and first_target_idx <= full_f_window.index[-1]:
+                        event_outcomes[t_pct] = 1
+                    elif first_stop_idx <= full_f_window.index[-1]:
+                        event_outcomes[t_pct] = 0
+                    elif is_timeout:
+                        event_outcomes[t_pct] = 0
+                    else:
+                        event_outcomes[t_pct] = float('nan')
                 else:
                     event_outcomes[t_pct] = float('nan')
 
