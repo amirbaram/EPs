@@ -45,7 +45,7 @@ def train_reentry_model():
     lgb_base.fit(X_train_tf, y_train, sample_weight=w_train)
     
     # Calibrate
-    calibrated_model = CalibratedClassifierCV(estimator=FrozenEstimator(lgb_base), method='isotonic', cv="prefit")
+    calibrated_model = CalibratedClassifierCV(estimator=FrozenEstimator(lgb_base), method='isotonic', )
     calibrated_model.fit(X_test_tf, y_test)
     
     serving_pipeline = Pipeline([
