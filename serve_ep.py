@@ -450,18 +450,18 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   </div>
   <div class="kpi-card" title="Expected Value (EV) per trade across the complete multi-leg system (Trade 1 Base + Trade 2/3 Yellow Re-entries with progressive exposure)">
     <div class="kpi-label">Strategy EV (Expectancy) <span class="kpi-info-icon">ℹ</span></div>
-    <div class="kpi-val" style="color:var(--green);" id="kpi_expectancy">+3.80 R</div>
-    <div class="kpi-sub" id="kpi_ev_sub">Per Trade · Multi-Leg System</div>
+    <div class="kpi-val" style="color:var(--green);" id="kpi_expectancy">+0.31 R</div>
+    <div class="kpi-sub" id="kpi_ev_sub">Per Trade · ML Dynamic Stop (Alpha=0.50)</div>
   </div>
   <div class="kpi-card" title="Cumulative portfolio P&L in R-multiples across all filtered trades">
     <div class="kpi-label">Total Strategy P&L <span class="kpi-info-icon">ℹ</span></div>
-    <div class="kpi-val" style="color:var(--gold);" id="kpi_pnl">+2,840.0 R</div>
-    <div class="kpi-sub" id="kpi_pnl_sub">+1,989.3 R Compounded</div>
+    <div class="kpi-val" style="color:var(--gold);" id="kpi_pnl">+223.21 R</div>
+    <div class="kpi-sub" id="kpi_pnl_sub">ML Peak Exhaustion</div>
   </div>
   <div class="kpi-card" title="Percentage of trades yielding positive R-multiples after multi-quarter trend following">
     <div class="kpi-label">Trade Win Rate <span class="kpi-info-icon">ℹ</span></div>
-    <div class="kpi-val" style="color:var(--accent);" id="kpi_winrate">34.2%</div>
-    <div class="kpi-sub" id="kpi_winrate_sub">Avg Win: +8.8R · Avg Loss: -0.5R</div>
+    <div class="kpi-val" style="color:var(--accent);" id="kpi_winrate">56.4%</div>
+    <div class="kpi-sub" id="kpi_winrate_sub">Dynamic Tight Stop</div>
   </div>
   <div class="kpi-card" title="Maximum peak-to-trough portfolio drawdown in R-multiples and profit factor (gross profits divided by gross losses)">
     <div class="kpi-label">Max Drawdown &amp; Profit Factor <span class="kpi-info-icon">ℹ</span></div>

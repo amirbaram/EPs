@@ -716,7 +716,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <button class="btn-emerging" onclick="openEmergingDrawer()">
       🌐 Emerging Themes <span class="badge" style="background:#8b5cf6;" id="em_badge_top">Leaderboard</span>
     </button>
-    <button class="btn-emerging" onclick="openAiTopPicksModal()" style="border-color:#10b981; color:#34d399; margin-right:8px;">
+    <button class="btn-emerging" onclick="setView('top_ai')" style="border-color:#10b981; color:#34d399; margin-right:8px;" id="tab_top_ai">
       🏆 AI Top Ranked EPs
     </button>
     <button class="btn-export" onclick="downloadTradingViewList()" title="Export current/all tickers formatted for TradingView Watchlist">
@@ -2441,6 +2441,10 @@ function getFilteredEvents() {
   else if (currentView === 'week') list = list.filter(e => e.bars_since <= 5);
   else if (currentView === 'active') list = list.filter(e => e.held_d1_low);
   else if (currentView === 'idiosyncratic') list = list.filter(e => e.is_idiosyncratic);
+  else if (currentView === 'top_ai') {
+    list = list.filter(e => (e.ml_50 || 0) > 0.40)
+               .sort((a,b) => ((b.ml_50||0) + (b.ml_100||0) + (b.ml_150||0) + (b.ml_200||0)) - ((a.ml_50||0) + (a.ml_100||0) + (a.ml_150||0) + (a.ml_200||0)));
+  }
 
   if (activeBoosters.veto_headwind) {
     list = list.filter(e => !e.is_thematic_veto || e.is_idiosyncratic);
