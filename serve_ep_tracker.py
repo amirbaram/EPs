@@ -4728,9 +4728,63 @@ def get_scored_tracker_events(force_rescan=False):
                     ev["dynamic_stop_loss_pct"] = preds.get("dynamic_stop_loss_pct", None)
                     ev["prob_exhaustion"] = preds.get("prob_exhaustion", None)
                     ev["prob_reentry"] = preds.get("prob_reentry", None)
+
+                    # Continuation Runner Dynamic Trailing Telemetry
+                    d1_low = float(bars["low"].iloc[d1_idx])
+                    d1_close = float(bars["close"].iloc[d1_idx])
+                    risk_pts = d1_close - d1_low
+                    high_since = float(bars["high"].iloc[d1_idx:].max())
+                    open_r = (high_since - d1_close) / risk_pts if risk_pts > 0 else 0.0
+                    if open_r >= 2.5:
+                        c_feats = engine.compute_continuation_trailer_features(bars, len(bars) - 1, d1_close, high_since, risk_pts, entry_bar=d1_idx)
+                        if c_feats:
+                            buf = engine.predict_continuation_trailer(c_feats)
+                            ev["continuation_trailer_buffer_pct"] = buf
+                            ev["continuation_trailer_stop"] = round(high_since * (1.0 - buf / 100.0), 2)
             except Exception:
                 pass
     return events
+
+@app.route("/api/continuation_qualify")
+def api_continuation_qualify():
+    sym = request.args.get("symbol")
+    event_date = request.args.get("event_date")
+    if not sym or not event_date:
+        return jsonify({"error": "Missing symbol or event_date"}), 400
+    import datastore
+    from ep_ml_engine import engine
+    bars = datastore.load_bars(sym)
+    if bars is None or event_date not in bars.index:
+        return jsonify({"error": "Symbol or event date not found"}), 404
+    d1_idx = bars.index.get_loc(event_date)
+    d1_low = float(bars["low"].iloc[d1_idx])
+    t1_exit = None
+    for b in range(d1_idx + 1, min(len(bars), d1_idx + 11)):
+        if bars["low"].iloc[b] <= d1_low:
+            t1_exit = b; break
+    if t1_exit is None:
+        return jsonify({"has_ur_candidate": False, "reason": "No Day 1 Low breach within 10 days"})
+    shakeout_low = float(bars["low"].iloc[t1_exit])
+    ur_signal = None
+    for b in range(t1_exit + 1, min(len(bars), t1_exit + 16)):
+        l_b = float(bars["low"].iloc[b])
+        if l_b < shakeout_low:
+            shakeout_low = l_b
+        if shakeout_low < d1_low * 0.85:
+            return jsonify({"has_ur_candidate": False, "reason": "Shakeout breached 15% limit"})
+        if bars["close"].iloc[b] >= d1_low:
+            ur_signal = b; break
+    if ur_signal is None:
+        return jsonify({"has_ur_candidate": False, "reason": "No reclaim above Day 1 Low"})
+    ur_feats = engine.compute_ur_reentry_features(sym, d1_idx, t1_exit, ur_signal, shakeout_low, df=bars)
+    pred = engine.predict_ur_reentry(ur_feats) if ur_feats else {"prob_win": 0.5, "is_qualified": True}
+    return jsonify({
+        "has_ur_candidate": True,
+        "signal_date": str(bars.index[ur_signal].date()),
+        "shakeout_low": round(shakeout_low, 2),
+        "features": ur_feats,
+        "qualification": pred
+    })
 
 @app.route("/api/tracker_events")
 def api_tracker_events():

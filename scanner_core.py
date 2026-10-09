@@ -77,6 +77,71 @@ def detectLarssonFlip(df):
     yellow_dates = dates[flipped & result['larsson_state'].eq('yellow')].tolist()
     return blue_dates, yellow_dates
 
+def calc_intermediate_ribbon(df, spans=(8, 12, 16, 21)):
+    """Calculates a 4-EMA intermediate continuation ribbon (default: 8, 12, 16, 21).
+    Used for Trade 2 & Trade 3 continuation detection, triggers, and reverse flip exits.
+    Also supports smooth configuration (10, 15, 20, 30).
+    """
+    result = df.copy()
+    s1, s2, s3, s4 = spans
+    col1 = f'ribbon_ema{s1}'
+    col2 = f'ribbon_ema{s2}'
+    col3 = f'ribbon_ema{s3}'
+    col4 = f'ribbon_ema{s4}'
+
+    result[col1] = _pine_ema(result['close'], s1)
+    result[col2] = _pine_ema(result['close'], s2)
+    result[col3] = _pine_ema(result['close'], s3)
+    result[col4] = _pine_ema(result['close'], s4)
+
+    bullish = (
+        (result[col1] >= result[col2])
+        & (result[col2] >= result[col3])
+        & (result[col3] >= result[col4])
+    )
+    bearish = (
+        (result[col1] < result[col2])
+        & (result[col2] < result[col3])
+        & (result[col3] < result[col4])
+    )
+    valid = result[[col1, col2, col3, col4]].notna().all(axis=1)
+
+    result['ribbon_state'] = pd.Series(None, index=result.index, dtype='object')
+    result.loc[valid, 'ribbon_state'] = 'gray'
+    result.loc[valid & bullish, 'ribbon_state'] = 'yellow'
+    result.loc[valid & bearish, 'ribbon_state'] = 'blue'
+
+    result['ribbon_color'] = pd.Series(None, index=result.index, dtype='object')
+    result.loc[result['ribbon_state'] == 'gray', 'ribbon_color'] = 'rgba(158, 158, 158, 1.0)'
+    result.loc[result['ribbon_state'] == 'yellow', 'ribbon_color'] = 'rgba(255, 193, 7, 1.0)'
+    result.loc[result['ribbon_state'] == 'blue', 'ribbon_color'] = 'rgba(33, 150, 243, 1.0)'
+
+    emas_sub = result[[col1, col2, col3, col4]]
+    result['ribbon_compression'] = emas_sub.std(axis=1) / emas_sub.mean(axis=1)
+    result['ribbon_bandwidth'] = (result[col1] - result[col4]) / result[col4]
+
+    state = result['ribbon_state']
+    prev = state.shift(1)
+    result['ribbon_flip'] = 'none'
+    result.loc[(state == 'yellow') & (prev != 'yellow'), 'ribbon_flip'] = 'yellow_flip'
+    result.loc[(state == 'blue') & (prev != 'blue'), 'ribbon_flip'] = 'blue_flip'
+    return result
+
+def detect_intermediate_ribbon_flip(df, spans=(8, 12, 16, 21)):
+    """Returns dates flipping into blue and dates flipping into yellow for the intermediate ribbon."""
+    result = df.copy() if 'ribbon_state' in df.columns else calc_intermediate_ribbon(df, spans=spans)
+    state = result['ribbon_state']
+    previous = state.shift(1)
+    flipped = state.notna() & previous.notna() & state.fillna('').ne(previous.fillna(''))
+    time_col = 'time' if 'time' in result.columns else ('date' if 'date' in result.columns else None)
+    if time_col is not None:
+        dates = pd.to_datetime(result[time_col])
+    else:
+        dates = pd.to_datetime(result.index)
+    blue_dates = dates[flipped & result['ribbon_state'].eq('blue')].tolist()
+    yellow_dates = dates[flipped & result['ribbon_state'].eq('yellow')].tolist()
+    return blue_dates, yellow_dates
+
 import numpy as np
 
 def get_normalized_angle(src_series, lookback):
