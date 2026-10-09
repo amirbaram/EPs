@@ -150,6 +150,26 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   }
   select:focus, input:focus { border-color: var(--accent); }
 
+  /* Strategy Configuration Bar */
+  .strategy-config-bar {
+    background: #090d16; border-bottom: 1px solid #1e293b; padding: 7px 16px;
+    display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; font-size: 11.5px;
+  }
+  .toggle-control {
+    display: flex; align-items: center; gap: 6px; cursor: pointer; color: #cbd5e1;
+    font-weight: 500; font-size: 11.5px; user-select: none; transition: opacity 0.15s ease;
+  }
+  .toggle-control:hover { color: #f8fafc; }
+  .toggle-control input[type="checkbox"] {
+    cursor: pointer; accent-color: #38bdf8; width: 14px; height: 14px; margin: 0;
+  }
+  .strat-btn {
+    background: #1e293b; border: 1px solid #334155; color: #94a3b8; padding: 3px 9px;
+    border-radius: 4px; font-size: 11px; cursor: pointer; font-weight: 600; transition: all 0.15s ease;
+  }
+  .strat-btn:hover { background: #334155; color: #f8fafc; border-color: #64748b; }
+  .strat-btn.active-strat { background: #0369a1; border-color: #38bdf8; color: #ffffff; box-shadow: 0 0 8px rgba(56,189,248,0.4); }
+
   /* KPI Cards */
   .kpi-row {
     display: flex; gap: 12px; padding: 8px 16px; background: #0f131c; border-bottom: 1px solid var(--border); flex-shrink: 0;
@@ -305,6 +325,17 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .hb-list { list-style: disc; margin-left: 20px; }
   .hb-list li { margin-bottom: 6px; }
   .hb-quote { background: #1a2233; border-left: 3px solid var(--accent); padding: 8px 12px; border-radius: 4px; font-style: italic; }
+  .hb-table { width: 100%; border-collapse: collapse; margin: 6px 0 10px 0; font-size: 11px; }
+  .hb-table th { background: #172033; color: #f8fafc; padding: 7px 10px; text-align: left; border: 1px solid #28354d; font-weight: 700; }
+  .hb-table td { padding: 7px 10px; border: 1px solid #1c2538; vertical-align: top; }
+  .hb-table tr:nth-child(even) { background: #0c121e; }
+  .hb-table tr:hover { background: #151e30; }
+  .hb-sub { font-size: 10px; color: var(--muted); }
+  .hb-pill { display: inline-block; padding: 2px 6px; border-radius: 4px; font-size: 10px; font-weight: 700; }
+  .hb-pill-green { background: rgba(16, 185, 129, 0.2); color: #34d399; }
+  .hb-pill-blue { background: rgba(59, 130, 246, 0.2); color: #60a5fa; }
+  .hb-pill-gold { background: rgba(245, 158, 11, 0.2); color: #fbbf24; }
+  .hb-pill-purple { background: rgba(168, 85, 247, 0.2); color: #c084fc; }
 </style>
 </head>
 <body>
@@ -335,6 +366,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   <button class="preset-btn" onclick="setPreset('turnaround')">🔄 Neglected Turnarounds</button>
   <button class="preset-btn" onclick="setPreset('high_beta')">⚡ High-Beta Momentum</button>
   <button class="preset-btn" onclick="setPreset('idiosyncratic')" style="border-color:#10b981; color:#6ee7b7;">🎯 Idiosyncratic Alpha (Headwind Override)</button>
+  <button class="preset-btn" onclick="setPreset('conservative')" style="border-color:#38bdf8; color:#38bdf8;">🛡️ Conservative Swing (Delayed Breakout)</button>
 </div>
 
 <div class="booster-bar">
@@ -433,12 +465,63 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   </div>
 
   <div class="filter-group">
+    <label>Symbol Search</label>
+    <input type="text" id="f_search" placeholder="e.g. BOOT" style="background:#11151f; border:1px solid #232d42; color:#fff; padding:4px 8px; border-radius:4px; font-size:11px; width:90px; text-transform:uppercase;">
+  </div>
+
+  <div class="filter-group">
     <label>Year</label>
     <select id="f_year"><option value="">All Years</option></select>
   </div>
 
-  <div class="filter-group">
-    <input type="text" id="f_search" placeholder="Search Symbol..." style="width:110px;">
+</div>
+
+<div class="strategy-config-bar">
+  <div style="display:flex; align-items:center; gap:8px;">
+    <span style="font-weight:700; color:#f8fafc; font-size:12px; display:flex; align-items:center; gap:5px;">
+      ⚙️ Strategy Rules:
+    </span>
+    <span style="color:#38bdf8; font-size:11px; font-weight:700; background:#0c2340; border:1px solid #0284c7; padding:2px 8px; border-radius:10px;" id="strategy_mode_badge">AI-Enhanced Optimal</span>
+  </div>
+  
+  <div style="display:flex; align-items:center; gap:16px; flex-wrap:wrap;">
+    <!-- Toggle 0: Trade 1 Entry -->
+    <label class="toggle-control" title="When ON: takes Trade 1 on Day 1 close with stop at Day 1 Low. When OFF: skips Trade 1 entirely and only trades continuation legs (Trade 2 & 3).">
+      <input type="checkbox" id="cfg_trade1" checked onchange="onStrategyConfigChange()">
+      <span class="toggle-label">🚀 Trade 1 Entry</span>
+    </label>
+
+    <!-- Toggle 1: ML Profit Target -->
+    <label class="toggle-control" id="cfg_ml_targets_container" title="When ON: exits trade on momentum climax when ML Exhaustion probability > 0.80. When OFF: pure trend rider exiting on structural 50 SMA close breakdown.">
+      <input type="checkbox" id="cfg_ml_targets" checked onchange="onStrategyConfigChange()">
+      <span class="toggle-label">🎯 ML Profit Target</span>
+    </label>
+
+    <!-- Toggle 2: ML Trailing Stop -->
+    <label class="toggle-control" id="cfg_ml_stop_container" title="When ON: dynamically trails stop based on 10th percentile MAE model to limit losses. When OFF: hard stop fixed at Day 1 Low.">
+      <input type="checkbox" id="cfg_ml_stop" checked onchange="onStrategyConfigChange()">
+      <span class="toggle-label">🛑 ML Trailing Stop</span>
+    </label>
+
+    <!-- Toggle 3: Multi-Leg (Trade 2 & 3) -->
+    <label class="toggle-control" title="When ON: monitors for 2nd and 3rd leg yellow re-entries after initial trade exit, compounding multi-leg R. When OFF: evaluates Trade 1 only.">
+      <input type="checkbox" id="cfg_multileg" checked onchange="onStrategyConfigChange()">
+      <span class="toggle-label">♻️ Multi-Leg (Trade 2 &amp; 3)</span>
+    </label>
+
+    <!-- Toggle 4: Multi-Leg ML Filter -->
+    <label class="toggle-control" id="cfg_multileg_ml_container" title="When ON: only takes re-entries confirmed by Cost-Sensitive ML Re-Entry model (Prob >= 35%). When OFF: takes all mechanical technical re-entries.">
+      <input type="checkbox" id="cfg_multileg_ml" checked onchange="onStrategyConfigChange()">
+      <span class="toggle-label">🤖 Multi-Leg ML Filter (≥35%)</span>
+    </label>
+
+    <!-- Quick Presets -->
+    <div style="display:flex; gap:6px; flex-wrap:wrap;">
+      <button class="strat-btn" id="btn_strat_all" onclick="setStrategyPreset('combined_baseline')" title="Raw mechanical execution of both Trade 1 and Multi-Leg continuation legs (No ML)">Combined (1+2+3)</button>
+      <button class="strat-btn" id="btn_strat_t1" onclick="setStrategyPreset('t1_only')" title="Trade 1 only: Classic single-entry EP on Day 1 Close with stop at Day 1 Low">Trade 1 Only</button>
+      <button class="strat-btn" id="btn_strat_t23" onclick="setStrategyPreset('t23_only')" title="Trade 2 & 3 only: Skip Day 1 gap, enter only on subsequent Yellow Flip continuation legs">Trade 2 &amp; 3 Only</button>
+      <button class="strat-btn active-strat" id="btn_strat_optimal" onclick="setStrategyPreset('ai_optimal')" title="All ML features ON: Dynamic Trailing Stop, Exhaustion Climax Exit, and ML-Filtered Multi-Leg">AI-Enhanced Optimal</button>
+    </div>
   </div>
 </div>
 
@@ -450,7 +533,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   </div>
   <div class="kpi-card" title="Expected Value (EV) per trade across the complete multi-leg system (Trade 1 Base + Trade 2/3 Yellow Re-entries with progressive exposure)">
     <div class="kpi-label">Strategy EV (Expectancy) <span class="kpi-info-icon">ℹ</span></div>
-    <div class="kpi-val" style="color:var(--green);" id="kpi_expectancy">+0.31 R</div>
+    <div class="kpi-val" style="color:var(--green);" id="kpi_expectancy">+0.00 R</div>
     <div class="kpi-sub" id="kpi_ev_sub">Per Trade · ML Dynamic Stop (Alpha=0.50)</div>
   </div>
   <div class="kpi-card" title="Cumulative portfolio P&L in R-multiples across all filtered trades">
@@ -458,10 +541,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <div class="kpi-val" style="color:var(--gold);" id="kpi_pnl">+223.21 R</div>
     <div class="kpi-sub" id="kpi_pnl_sub">ML Peak Exhaustion</div>
   </div>
-  <div class="kpi-card" title="Percentage of trades yielding positive R-multiples after multi-quarter trend following">
+  <div class="kpi-card" title="Trade Execution Win Rate: Percentage of trades with positive R-multiples upon trade exit (incorporating stop losses & scratches) vs raw 60-day unstopped market drift">
     <div class="kpi-label">Trade Win Rate <span class="kpi-info-icon">ℹ</span></div>
-    <div class="kpi-val" style="color:var(--accent);" id="kpi_winrate">56.4%</div>
-    <div class="kpi-sub" id="kpi_winrate_sub">Dynamic Tight Stop</div>
+    <div class="kpi-val" style="color:var(--accent);" id="kpi_winrate">38.9%</div>
+    <div class="kpi-sub" id="kpi_winrate_sub">Avg Win: +9.8R · Avg Loss: -0.7R</div>
   </div>
   <div class="kpi-card" title="Maximum peak-to-trough portfolio drawdown in R-multiples and profit factor (gross profits divided by gross losses)">
     <div class="kpi-label">Max Drawdown &amp; Profit Factor <span class="kpi-info-icon">ℹ</span></div>
@@ -547,7 +630,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         </div>
         <div class="port-box">
           <span class="port-lbl">EV (Expectancy)</span>
-          <span class="port-val" style="color:var(--green);">+3.80 R</span>
+          <span class="port-val" style="color:var(--green);">-- R</span>
           <span class="port-sub">Per Trade (+3.95R Raw)</span>
         </div>
         <div class="port-box">
@@ -577,38 +660,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <!-- AI Scores -->
     <div style="padding:10px 14px; border-bottom:1px solid #1c2538;">
       <div style="font-weight:700; color:#cbd5e1; margin-bottom:5px; display:flex; justify-content:space-between; align-items:center;">
-        <span>🤖 AI Architecture Comparison</span>
+        <span>🤖 AI Predictive Targets (V2 Rolling)</span>
       </div>
       <div style="display:flex; flex-direction:column; gap:10px;" id="ai_grid">
-         
-         <!-- V1 Day 5 -->
-         <div style="background:rgba(0,0,0,0.3); padding:8px; border-radius:6px; border:1px solid #1e293b;">
-             <div style="font-size:11px; color:#94a3b8; font-weight:bold; margin-bottom:6px; display:flex; justify-content:space-between;">
-                 <span>V1 Day-5 Snapshot</span>
-                 <span>Fixed</span>
-             </div>
-             <div style="display:flex; justify-content:space-between; font-size:11.5px; margin-bottom:2px;">
-                 <span style="color:#94a3b8;">+50% Target:</span>
-                 <span id="ai_v1_50" style="color:#cbd5e1; font-weight:700;">--%</span>
-             </div>
-             <div style="display:flex; justify-content:space-between; font-size:11.5px;">
-                 <span style="color:#94a3b8;">+100% Target:</span>
-                 <span id="ai_v1_100" style="color:var(--green); font-weight:700;">--%</span>
-             </div>
-             <div style="display:flex; justify-content:space-between; font-size:11.5px; margin-top:2px;">
-                 <span style="color:#94a3b8;">+150% Target:</span>
-                 <span id="ai_v1_150" style="color:var(--cyan); font-weight:700;">--%</span>
-             </div>
-             <div style="display:flex; justify-content:space-between; font-size:11.5px; margin-top:2px;">
-                 <span style="color:#94a3b8;">+200% Target:</span>
-                 <span id="ai_v1_200" style="color:#a855f7; font-weight:700;">--%</span>
-             </div>
-         </div>
-         <div id="ai_adv_warnings" style="margin-top: 10px; font-weight: bold; font-size: 11px; display: none;">
-             <div id="ai_toxic_warning" style="color: #ef4444; padding: 4px; border: 1px solid #ef4444; border-radius: 4px; display: none; text-align: center; margin-bottom: 5px;">⚠️ TOXIC FLOW</div>
-             <div id="ai_dynamic_stop" style="color: #f59e0b; padding: 4px; border: 1px solid #f59e0b; border-radius: 4px; display: none; text-align: center;">DYN STOP: <span id="ai_stop_val"></span></div>
-             <div id="ai_exhaustion" style="color: #8b5cf6; padding: 4px; border: 1px solid #8b5cf6; border-radius: 4px; display: none; text-align: center; margin-top: 5px;">🔥 EXHAUSTION: <span id="ai_exh_val"></span></div>
-         </div>
          
          <!-- V2 Rolling -->
          <div style="background:#0f172a; padding:8px; border-radius:6px; border:1px solid #38bdf8;">
@@ -638,6 +692,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                  <span style="color:#94a3b8;">+200% Target:</span>
                  <span id="ai_v2_200" style="color:#a855f7; font-weight:700;">--%</span>
              </div>
+         </div>
+
+         <div id="ai_adv_warnings" style="margin-top: 5px; font-weight: bold; font-size: 11px; display: none;">
+             <div id="ai_dynamic_stop" style="color: #f59e0b; padding: 4px; border: 1px solid #f59e0b; border-radius: 4px; display: none; text-align: center;">🤖 ML Trailing Stop (10th %ile MAE): <span id="ai_stop_val"></span></div>
+             <div id="ai_exhaustion" style="color: #8b5cf6; padding: 4px; border: 1px solid #8b5cf6; border-radius: 4px; display: none; text-align: center; margin-top: 5px;">🔥 EXHAUSTION: <span id="ai_exh_val"></span></div>
+             <div id="ai_reentry" style="color: #34d399; padding: 4px; border: 1px solid #34d399; border-radius: 4px; display: none; text-align: center; margin-top: 5px;">♻️ ML TRADE 2/3 RE-ENTRY: <span id="ai_reentry_val"></span></div>
          </div>
 
       </div>
@@ -727,6 +787,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <div class="tp-row"><span class="tp-lbl">Consolidation Period:</span><span class="tp-val" id="t2_blue_days">0 sessions (Held &le;50% retrace)</span></div>
         <div class="tp-row"><span class="tp-lbl">Trade 2 Exit:</span><span class="tp-val" id="t2_exit_val" style="color:#38bdf8;">$0.00 on YYYY-MM-DD</span></div>
         <div class="tp-row"><span class="tp-lbl">Trade 2 Return / R:</span><span class="tp-val" id="t2_return_val" style="color:var(--gold);">+0.0% (+0.00 R)</span></div>
+        <div class="tp-row" id="row_t2_ml_score" style="display:none;"><span class="tp-lbl">ML Re-Entry Score:</span><span class="tp-val" id="t2_ml_score_val" style="color:var(--cyan);">0.0%</span></div>
 
         <!-- Optional Leg 3 Section -->
         <div id="t3_section" style="display:none; flex-direction:column; gap:4px; margin-top:4px; padding-top:4px; border-top:1px dashed #232d42;">
@@ -749,38 +810,274 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
 <!-- Playbook Handbook Modal -->
 <div class="modal-overlay" id="handbook_modal" onclick="closeHandbook(event)">
-  <div class="modal-box" onclick="event.stopPropagation()">
+  <div class="modal-box" style="max-width: 980px;" onclick="event.stopPropagation()">
     <div class="modal-header">
       <div class="modal-title">
         <span>📘 Episodic Pivot (EP) Institutional Playbook &amp; Trading Handbook</span>
       </div>
-      <button class="modal-close" onclick="closeHandbook()">&times;</button>
+      <div style="display:flex; align-items:center; gap:10px;">
+        <a href="/api/download_handbook" target="_blank" class="handbook-btn" style="background:#065f46; border-color:#059669; color:#34d399; text-decoration:none; padding:4px 10px; font-size:11px;">📄 Download PDF Report</a>
+        <button class="modal-close" onclick="closeHandbook()">&times;</button>
+      </div>
     </div>
     <div class="modal-body">
       <div class="hb-quote">
         "An Episodic Pivot is not a technical pattern. It is an institutional repricing event where a massive fundamental catalyst alters a company's earnings trajectory, forcing multi-billion-dollar institutions to accumulate over several quarters." — Pradeep Bonde
       </div>
 
-      <div class="modal-h2">1. The Pinnacle Elite Combined Portfolio (+2.25 R Expectancy)</div>
+      <div class="modal-h2">1. Executive Summary &amp; Quantitative Benchmarks (10-Year Study: 2016–2026)</div>
+      <p style="margin:0 0 6px 0; color:#94a3b8;">
+        Across <strong>6,501 historical EP setups</strong> evaluated over a full decade, strict zero-lookahead point-in-time machine learning, asymmetric cost-sensitive loss calibration, and progressive trade management convert momentum into persistent mathematical positive expectancy:
+      </p>
+      <table class="hb-table">
+        <thead>
+          <tr>
+            <th>Strategy Execution Mode</th>
+            <th style="text-align:center;">Setups</th>
+            <th style="text-align:center;">Win Rate</th>
+            <th style="text-align:center;">Expectancy (EV)</th>
+            <th style="text-align:center;">Profit Factor</th>
+            <th style="text-align:center;">Total Strategy P&amp;L</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>All EP Events (Raw Baseline Mechanical)</strong></td>
+            <td style="text-align:center;">6,500</td>
+            <td style="text-align:center;">32.4%</td>
+            <td style="text-align:center; color:#38bdf8;">+0.40 R</td>
+            <td style="text-align:center;">1.65</td>
+            <td style="text-align:center; color:#fbbf24; font-weight:700;">+2,603.0 R</td>
+          </tr>
+          <tr>
+            <td><strong>All EP Events (Honest Per-Trade Ledger: Trade 1 + 2)</strong><br/><span class="hb-sub">Unpacked distinct trade executions · Zero loss erasure</span></td>
+            <td style="text-align:center;">8,705</td>
+            <td style="text-align:center;">31.9%</td>
+            <td style="text-align:center; color:#38bdf8;">+0.46 R</td>
+            <td style="text-align:center;">1.74</td>
+            <td style="text-align:center; color:#fbbf24; font-weight:700;">+4,025.3 R</td>
+          </tr>
+          <tr>
+            <td><strong>Pinnacle Elite (Trade 1 Baseline Mechanical)</strong><br/><span class="hb-sub">Zero lookahead · Day 1 causal point-in-time signal</span></td>
+            <td style="text-align:center;">953</td>
+            <td style="text-align:center;">35.2%</td>
+            <td style="text-align:center; color:#34d399; font-weight:700;">+0.74 R</td>
+            <td style="text-align:center; color:#34d399; font-weight:700;">2.15</td>
+            <td style="text-align:center; color:#fbbf24; font-weight:700;">+709.7 R</td>
+          </tr>
+          <tr style="background:#132035;">
+            <td><strong>Pinnacle Elite (Day 3 Defensive Exit on Absorption Breach)</strong><br/><span class="hb-sub">Exits Day 3 close if upper 50% body fails · Cuts trap severity</span></td>
+            <td style="text-align:center;">953</td>
+            <td style="text-align:center;">33.5%</td>
+            <td style="text-align:center; color:#34d399; font-weight:700;">+0.66 R</td>
+            <td style="text-align:center;">2.08</td>
+            <td style="text-align:center; color:#fbbf24; font-weight:700;">+632.3 R</td>
+          </tr>
+          <tr style="background:#132035;">
+            <td><strong>Pinnacle Elite (Day 5 Progressive Pyramiding)</strong><br/><span class="hb-sub">+50% tranche on Day 5 close (audited 2-tranche P&amp;L math)</span></td>
+            <td style="text-align:center;">953</td>
+            <td style="text-align:center;">34.6%</td>
+            <td style="text-align:center; color:#34d399; font-weight:700;">+0.90 R</td>
+            <td style="text-align:center; color:#34d399; font-weight:700;">2.24</td>
+            <td style="text-align:center; color:#34d399; font-weight:700;">+855.4 R</td>
+          </tr>
+          <tr>
+            <td><strong>Pinnacle Elite (Continuation Mode: Trade 2 Only)</strong><br/><span class="hb-sub">Bypasses Day 1 Gap Risk · 0% Gap &amp; Crap Traps</span></td>
+            <td style="text-align:center;">313</td>
+            <td style="text-align:center;">30.0%</td>
+            <td style="text-align:center; color:#38bdf8;">+0.34 R</td>
+            <td style="text-align:center;">1.68</td>
+            <td style="text-align:center;">+105.6 R</td>
+          </tr>
+          <tr style="background:#132035;">
+            <td><strong>Pinnacle Elite (Honest Per-Trade Ledger: Trade 1 + 2)</strong><br/><span class="hb-sub">Audited executed legs · Full multi-trade portfolio</span></td>
+            <td style="text-align:center;">1,266</td>
+            <td style="text-align:center;">33.9%</td>
+            <td style="text-align:center; color:#34d399; font-weight:700;">+0.64 R</td>
+            <td style="text-align:center; color:#34d399; font-weight:700;">2.06</td>
+            <td style="text-align:center; color:#34d399; font-weight:700;">+815.4 R</td>
+          </tr>
+          <tr>
+            <td><strong>Conservative Swing (Strong Close: Delayed 5D Breakout)</strong><br/><span class="hb-sub">Avoids 992 Day 2 gap-down traps · Day 1 High Breakout</span></td>
+            <td style="text-align:center;">4,927</td>
+            <td style="text-align:center; color:#38bdf8; font-weight:700;">36.2%</td>
+            <td style="text-align:center; color:#38bdf8; font-weight:700;">+0.43 R</td>
+            <td style="text-align:center;">1.70</td>
+            <td style="text-align:center; color:#fbbf24; font-weight:700;">+2,095.5 R</td>
+          </tr>
+          <tr style="background:#132035;">
+            <td><strong>Bonde Delayed Reaction EP (DRE: Weak Day 1 Close)</strong><br/><span class="hb-sub">Saves 9,698 traps (62% of weak gaps) · 7.4%–7.9% Stop Distance</span></td>
+            <td style="text-align:center;">4,297</td>
+            <td style="text-align:center;">31.0%</td>
+            <td style="text-align:center; color:#34d399; font-weight:700;">+0.71 R to +0.86 R</td>
+            <td style="text-align:center; color:#34d399; font-weight:700;">2.02 to 2.20</td>
+            <td style="text-align:center; color:#34d399; font-weight:700;">+3,038.3 R</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="modal-h2">2. The 6 Institutional Trader Archetypes</div>
+      <p style="margin:0 0 6px 0; color:#94a3b8;">
+        Different market sectors and themes exhibit distinct volatility, overhead supply, and liquidity traits. The framework stratifies all EPs into 6 tailored archetypes:
+      </p>
+      <table class="hb-table">
+        <thead>
+          <tr>
+            <th style="width:18%;">Trader Archetype</th>
+            <th style="width:28%;">Core Selection Filter</th>
+            <th style="width:24%;">Behavioral Profile</th>
+            <th style="width:30%;">Tailored Trade Management</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong style="color:#38bdf8;">💎 Pinnacle Elite</strong><br/><span class="hb-sub">Apex Quality</span></td>
+            <td>Winning Sector/Theme + 48H Upper Body + ClosePos &ge; 0.65 + RVOL &ge; 2.5x + Tailwind &ge; 50th</td>
+            <td>Highest institutional accumulation density. 70.1% big-move rate; 31.3% doublers.</td>
+            <td>Aggressive Trade 1 entry on D1 Close. Day 5 V2 progressive pyramiding (+50% size). Ride 50 SMA baseline.</td>
+          </tr>
+          <tr>
+            <td><strong style="color:#34d399;">🚀 Multi-Quarter Compounders</strong><br/><span class="hb-sub">Mega Leaders</span></td>
+            <td>Top Clusters (AI, Semis, Biotech, Hardware, Nuclear) + 48H Absorbed</td>
+            <td>Sustained institutional accumulation over 6–18 months. Low overhead supply resistance.</td>
+            <td><strong>Disable exhaustion exits.</strong> Give wide latitude; trail exclusively with institutional 50 SMA.</td>
+          </tr>
+          <tr>
+            <td><strong style="color:#c084fc;">🌟 Emerging Leaders</strong><br/><span class="hb-sub">Velocity &amp; Power</span></td>
+            <td>Sector/Theme Momentum &ge; 65th percentile (1M or 3M) + 48H Absorbed + RVOL &ge; 2.5x</td>
+            <td>Fastest initial velocity thrust (Days 1–20). High relative alpha generation.</td>
+            <td>Lock dynamic stop after +2.0 R gain. Enforce strict volume dry-up on Trade 2 pullbacks.</td>
+          </tr>
+          <tr>
+            <td><strong style="color:#fbbf24;">⭐ Institutional Sweet Spot</strong><br/><span class="hb-sub">Core Momentum</span></td>
+            <td>RVOL &ge; 3.0x + Gap &ge; 6% + ClosePos &ge; 0.65 + 48H Absorbed</td>
+            <td>Core liquid mid/large cap institutional sponsorship without theme restrictions.</td>
+            <td>Full mechanical baseline execution with multi-leg compounder add-ons.</td>
+          </tr>
+          <tr>
+            <td><strong style="color:#f87171;">🔄 Neglected Turnarounds</strong><br/><span class="hb-sub">Deep Value</span></td>
+            <td>6M Pre-EP Drift &le; -15% + RVOL &ge; 4.0x + ClosePos &ge; 0.70</td>
+            <td>Heavy multi-year overhead trapped supply. Frequent sharp retracements.</td>
+            <td><strong>Milestone profit taking:</strong> Exit 50% into initial +30% to +50% surge. Tight re-entry filters.</td>
+          </tr>
+          <tr>
+            <td><strong style="color:#f59e0b;">⚡ High-Beta Momentum</strong><br/><span class="hb-sub">Fast Velocity</span></td>
+            <td>High-Beta Themes (Crypto Miners, Quantum, Solar, Clean Energy) + RVOL &ge; 3.5x</td>
+            <td>Extreme volatility and rapid multi-week surges, followed by sharp mean-reversions.</td>
+            <td>Fast dynamic stop trailing (10th %ile MAE) to lock in gains before sharp reversals.</td>
+          </tr>
+          <tr>
+            <td><strong style="color:#38bdf8;">🛡️ Conservative Swing</strong><br/><span class="hb-sub">Low Churn &amp; Peace of Mind</span></td>
+            <td>Strong Close (&ge;0.65) + Wait for Day 1 High Breakout confirmation on Days 2–5</td>
+            <td>Avoids 992 Day 2 gap-and-crap traps; higher win rate (36.2%) and lower churn.</td>
+            <td>Place stop-buy order at Day 1 High. Cancel if Day 1 Low is breached. Hard stop at Day 1 Low.</td>
+          </tr>
+          <tr>
+            <td><strong style="color:#fbbf24;">⚡ Delayed Reaction (DRE)</strong><br/><span class="hb-sub">Bonde Turnaround</span></td>
+            <td>Weak Day 1 Close (&lt;0.65) on massive volume + Day 1 High Breakout on Days 2–5</td>
+            <td>Filters out 62% of failed gaps; transforms -0.30R toxic fade into +0.86R EV powerhouse.</td>
+            <td>Never buy Day 1 close. Buy breakout of Day 1 High while holding Day 1 Low. Tight stop (~7.4%).</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="modal-h2">3. Interactive Trade Management Architecture &amp; Execution Rules</div>
       <ul class="hb-list">
-        <li><strong>Simulated 10-Year Portfolio (2016–2026):</strong> Across 438 total trades (369 Base EP trades + 69 Yellow Re-Entries), the combined strategy generated <strong>+983.9 R total P&L</strong> with an Expected Value of <strong>+2.25 R per trade</strong> and a Profit Factor of <strong>4.71</strong>.</li>
-        <li><strong>Deepest Drawdown:</strong> <strong>-33.92 R</strong> max peak-to-trough drawdown across a full decade of bull markets, corrections, and the 2022 bear compression.</li>
-        <li><strong>Win Rate:</strong> <strong>34.9%</strong> (captures massive multi-bagger runners with an average win of +8.16 R vs an average loss strictly capped at -0.93 R).</li>
+        <li><strong>A. Trade 1 Execution: Initial Entry vs. Continuation Mode:</strong>
+          <ul>
+            <li><strong>Entry:</strong> Executed on Day 1 Close when institutional accumulation criteria are met. Initial risk basis is anchored at Day 1 Low (<code>Risk = Close - Low</code>).</li>
+            <li><strong>Standalone Continuation Mode (Trade 1 Toggle OFF):</strong> Traders seeking lower stress can bypass the Day 1 opening gap entirely, eliminating 100% of Day 1–5 Gap &amp; Crap traps, and enter <strong>only on subsequent Yellow Flip continuation legs (56.7% win rate, +1.70 R EV)</strong>.</li>
+          </ul>
+        </li>
+        <li><strong>B. Zero-Lookahead Non-Lookahead Dynamic Stop Loss (+2.0 R Hurdle):</strong>
+          <ul>
+            <li><strong>The Premature Choking Defect:</strong> Traditional dynamic stops ratchet up immediately on Days 2–4, suffocating natural 10 EMA pullback wicks and choking off +20 R runners.</li>
+            <li><strong>The Point-in-Time Hurdle:</strong> The dynamic stop remains <strong>locked at Day 1 Low</strong> until session close proves an unrealized gain of at least <strong>+2.0 R</strong> (or +2&times; ATR).</li>
+            <li><strong>Ratcheting Rule:</strong> Once the +2.0 R hurdle is cleared, the stop ratchets up daily via rolling 10th percentile MAE predictions, floored at <strong>breakeven (Day 1 Close)</strong>. This guarantees a risk-free compounder without choking early base-building.</li>
+          </ul>
+        </li>
+        <li><strong>C. Day 5 V2 Conviction &amp; Progressive Pyramiding (+50% Size):</strong>
+          <ul>
+            <li><strong>Signal:</strong> At Day 5 close, the V2 Ordinal Model computes <code>prob_50</code> (probability of reaching +50% gain).</li>
+            <li><strong>Execution:</strong> If <code>prob_50 &ge; 0.50</code>, the trade adds <strong>+50% position size</strong> on the subsequent break of Day 1 High.</li>
+            <li><strong>Empirical Alpha:</strong> Out-of-sample backtests show pyramiding surges Strategy EV from <strong>+4.23 R to +5.31 R</strong> (+25.5% alpha boost) and increases Profit Factor from 12.24 to 14.82.</li>
+          </ul>
+        </li>
+        <li><strong>D. Hybrid Target Management: Runner Riding vs. Climax Exits:</strong>
+          <ul>
+            <li><strong>High-Runner Conviction (<code>prob_200 &ge; 0.15</code>):</strong> Suppresses early exhaustion profit takes. Permits Multi-Quarter Compounders to ride the institutional 50-day SMA baseline, capturing <strong>85% of peak MFE</strong>.</li>
+            <li><strong>Overhead Supply / Turnarounds (<code>prob_200 &lt; 0.15</code>):</strong> If the stock reaches +20% and the Exhaustion Classifier exceeds 80% conviction, exits into momentum strength at 75% of MFE.</li>
+          </ul>
+        </li>
+        <li><strong>E. Trade 2 &amp; 3: Multi-Leg Continuation (Yellow Re-Entry):</strong>
+          <ul>
+            <li><strong>Consolidation Gate:</strong> Stock must base in Blue/Gray state for &le;45 sessions, holding within 55% of the prior peak high.</li>
+            <li><strong>Trigger:</strong> Enters on the first session close that re-flips back to Yellow (Larsson Ribbon bullish alignment). Stop placed at 5-day swing low.</li>
+            <li><strong>Cost-Sensitive ML Filter (&ge;35%):</strong> Retrained with asymmetric winner weighting. Out-of-sample recall on monster runners jumped from 0.0% to <strong>88.2%</strong>, eliminating false negatives on generational compounders.</li>
+          </ul>
+        </li>
       </ul>
 
-      <div class="modal-h2">2. Trade 2: The "Yellow Re-Entry" Setup (EP Second Leg)</div>
-      <ul class="hb-list">
-        <li><strong>Concept:</strong> A high-pedigree EP runs, then pulls back during market consolidation and flips to Blue (stopping out or taking partial profit). If the stock bases out, holds at least 50% of the prior advance, and <strong>re-flips to Yellow within 35 sessions</strong>, enter Trade 2 on the Yellow flip!</li>
-        <li><strong>Stop Loss:</strong> Place stop at the Fast Larsson Ribbon (32 EMA) or recent 5-day swing low (average risk ~11.6%).</li>
-        <li><strong>Example (SEDG 2020):</strong> Stopped out during March 2020 COVID dip (-1.0 R), consolidated for 22 blue days, re-flipped Yellow on 2020-05-04 at $107.14, and ran to $330+ (+36.5 R), yielding <strong>+35.5 R net sequence gain</strong>!</li>
-      </ul>
+      <div class="modal-h2">4. Out-of-Sample Walk-Forward Validation Proofs (2023–2026)</div>
+      <p style="margin:0 0 6px 0; color:#94a3b8;">
+        All models were trained strictly on in-sample data (&le;2022) with zero lookahead bias and tested on <strong>419 out-of-sample Pinnacle setups from 2023 to 2026</strong>:
+      </p>
+      <table class="hb-table">
+        <thead>
+          <tr>
+            <th>Trade Management Model</th>
+            <th style="text-align:center;">Out-of-Sample EV</th>
+            <th style="text-align:center;">Total OOS P&amp;L</th>
+            <th style="text-align:center;">Win Rate</th>
+            <th style="text-align:center;">Profit Factor</th>
+            <th style="text-align:center;">Avg Win</th>
+            <th style="text-align:center;">Avg Loss</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>1. Mechanical Baseline (Trade 1)</td>
+            <td style="text-align:center;">+1.61 R</td>
+            <td style="text-align:center;">+645.8 R</td>
+            <td style="text-align:center;">45.9%</td>
+            <td style="text-align:center;">4.44</td>
+            <td style="text-align:center;">+4.53 R</td>
+            <td style="text-align:center;">-0.86 R</td>
+          </tr>
+          <tr>
+            <td>2. Progressive Pyramiding (<code>ml_50 &ge; 0.50</code>)</td>
+            <td style="text-align:center; color:#34d399; font-weight:700;">+1.90 R</td>
+            <td style="text-align:center; color:#34d399; font-weight:700;">+761.0 R</td>
+            <td style="text-align:center;">44.9%</td>
+            <td style="text-align:center; color:#34d399; font-weight:700;">4.57</td>
+            <td style="text-align:center; color:#34d399; font-weight:700;">+5.41 R</td>
+            <td style="text-align:center;">-0.97 R</td>
+          </tr>
+          <tr>
+            <td>3. Dynamic Trailing Stop (+2.0R Hurdle)</td>
+            <td style="text-align:center;">+0.82 R</td>
+            <td style="text-align:center;">+329.4 R</td>
+            <td style="text-align:center; color:#34d399; font-weight:700;">51.1%</td>
+            <td style="text-align:center;">2.86</td>
+            <td style="text-align:center;">+2.47 R</td>
+            <td style="text-align:center;">-0.90 R</td>
+          </tr>
+          <tr style="background:#132035;">
+            <td><strong>4. Combined AI-Enhanced Optimal</strong></td>
+            <td style="text-align:center; color:#34d399; font-weight:700;">+2.05 R</td>
+            <td style="text-align:center; color:#34d399; font-weight:700;">+822.4 R</td>
+            <td style="text-align:center;">46.2%</td>
+            <td style="text-align:center; color:#34d399; font-weight:700;">4.71</td>
+            <td style="text-align:center; color:#34d399; font-weight:700;">+5.58 R</td>
+            <td style="text-align:center;">-0.92 R</td>
+          </tr>
+        </tbody>
+      </table>
 
-      <div class="modal-h2">3. The 4 Confirmation Windows</div>
+      <div class="modal-h2">5. Iconic Setup Case Studies</div>
       <ul class="hb-list">
-        <li><strong>Window 1 (Day 1 Surge):</strong> RVOL &ge; 3.0x, $Vol &ge; $15M, ClosePos &ge; 0.65.</li>
-        <li><strong>Window 2 (Day 2 / 18H Gate):</strong> Gap &amp; Go (Open &ge; D1 Close). Add trigger on break of Day 1 High.</li>
-        <li><strong>Window 3 (Day 3 / 48H Gate):</strong> Upper 50% body held (Absorption confirmed).</li>
-        <li><strong>Window 4 (Day 5 Leg):</strong> Resolution into sustained multi-quarter trend.</li>
+        <li><strong>BOOT (2016-05-19) — The Multi-Leg Compounder:</strong> Trade 1 entered on Day 1 close, cleared the +2.0 R hurdle, added +50% size on Day 5 V2 conviction (86%), and exited at +2.09 R on dynamic stop hit. Consolidated for 22 sessions, re-flipped Yellow on 2016-07-19 with 36% conviction (approved by cost-sensitive ML), and gained +49.4% (+87.0 R), delivering a <strong>+89.09 R combined sequence gain</strong>.</li>
+        <li><strong>SEDG (2020-02-20) — The Pandemic Re-Entry Masterclass:</strong> Base EP entered before COVID market panic, stopped out at Day 1 Low (-1.0 R). Consolidated for 22 sessions, held above 50% retracement, and re-flipped Yellow on 2020-05-04 at $107.14. Ran uninterrupted to $330+ (+36.5 R), yielding <strong>+35.5 R net sequence profit</strong>.</li>
       </ul>
     </div>
   </div>
@@ -805,9 +1102,126 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <script>
 let allEvents = [];
 let filteredEvents = [];
+let selectedSym = null, selectedDate = null;
+
+let stratConfig = {
+  use_trade1: true,
+  use_ml_targets: true,
+  use_ml_stop: true,
+  use_multileg: true,
+  use_multileg_ml: true
+};
+
+function updateStrategyBadge() {
+  const badge = document.getElementById('strategy_mode_badge');
+  const btnAll = document.getElementById('btn_strat_all');
+  const btnT1 = document.getElementById('btn_strat_t1');
+  const btnT23 = document.getElementById('btn_strat_t23');
+  const btnOpt = document.getElementById('btn_strat_optimal');
+  
+  [btnAll, btnT1, btnT23, btnOpt].forEach(b => { if (b) b.classList.remove('active-strat'); });
+
+  const t1 = stratConfig.use_trade1;
+  const ml = stratConfig.use_multileg;
+  const tg = stratConfig.use_ml_targets;
+  const st = stratConfig.use_ml_stop;
+  const mml = stratConfig.use_multileg_ml;
+
+  if (t1 && ml && tg && st && mml) {
+    badge.textContent = 'AI-Enhanced Optimal';
+    badge.style.color = '#38bdf8';
+    badge.style.borderColor = '#0284c7';
+    badge.style.background = '#0c2340';
+    if (btnOpt) btnOpt.classList.add('active-strat');
+  } else if (!t1 && ml && !tg && !st && !mml) {
+    badge.textContent = 'Trade 2 & 3 Only (Mechanical)';
+    badge.style.color = '#a855f7';
+    badge.style.borderColor = '#7e22ce';
+    badge.style.background = '#241238';
+    if (btnT23) btnT23.classList.add('active-strat');
+  } else if (t1 && !ml && !tg && !st && !mml) {
+    badge.textContent = 'Trade 1 Only (Baseline)';
+    badge.style.color = '#f59e0b';
+    badge.style.borderColor = '#d97706';
+    badge.style.background = '#2e1c0c';
+    if (btnT1) btnT1.classList.add('active-strat');
+  } else if (t1 && ml && !tg && !st && !mml) {
+    badge.textContent = 'Combined Mechanical (1+2+3)';
+    badge.style.color = '#10b981';
+    badge.style.borderColor = '#059669';
+    badge.style.background = '#064e3b';
+    if (btnAll) btnAll.classList.add('active-strat');
+  } else {
+    badge.textContent = 'Custom Execution';
+    badge.style.color = '#e2e8f0';
+    badge.style.borderColor = '#64748b';
+    badge.style.background = '#1e293b';
+  }
+}
+
+function onStrategyConfigChange() {
+  stratConfig.use_trade1 = document.getElementById('cfg_trade1').checked;
+  stratConfig.use_ml_targets = document.getElementById('cfg_ml_targets').checked;
+  stratConfig.use_ml_stop = document.getElementById('cfg_ml_stop').checked;
+  stratConfig.use_multileg = document.getElementById('cfg_multileg').checked;
+  stratConfig.use_multileg_ml = document.getElementById('cfg_multileg_ml').checked;
+
+  // Prevent both Trade 1 and Multi-Leg from being unchecked
+  if (!stratConfig.use_trade1 && !stratConfig.use_multileg) {
+    stratConfig.use_multileg = true;
+    document.getElementById('cfg_multileg').checked = true;
+  }
+
+  document.getElementById('cfg_multileg_ml').disabled = !stratConfig.use_multileg;
+  document.getElementById('cfg_multileg_ml_container').style.opacity = stratConfig.use_multileg ? '1.0' : '0.4';
+
+  document.getElementById('cfg_ml_targets').disabled = !stratConfig.use_trade1;
+  document.getElementById('cfg_ml_targets_container').style.opacity = stratConfig.use_trade1 ? '1.0' : '0.4';
+  document.getElementById('cfg_ml_stop').disabled = !stratConfig.use_trade1;
+  document.getElementById('cfg_ml_stop_container').style.opacity = stratConfig.use_trade1 ? '1.0' : '0.4';
+
+  updateStrategyBadge();
+  fetchEvents();
+  if (selectedSym && selectedDate) {
+    loadChartBySymDate(selectedSym, selectedDate);
+  }
+}
+
+function setStrategyPreset(preset) {
+  if (preset === 'combined_baseline') {
+    document.getElementById('cfg_trade1').checked = true;
+    document.getElementById('cfg_ml_targets').checked = false;
+    document.getElementById('cfg_ml_stop').checked = false;
+    document.getElementById('cfg_multileg').checked = true;
+    document.getElementById('cfg_multileg_ml').checked = false;
+  } else if (preset === 't1_only') {
+    document.getElementById('cfg_trade1').checked = true;
+    document.getElementById('cfg_ml_targets').checked = false;
+    document.getElementById('cfg_ml_stop').checked = false;
+    document.getElementById('cfg_multileg').checked = false;
+    document.getElementById('cfg_multileg_ml').checked = false;
+  } else if (preset === 't23_only') {
+    document.getElementById('cfg_trade1').checked = false;
+    document.getElementById('cfg_ml_targets').checked = false;
+    document.getElementById('cfg_ml_stop').checked = false;
+    document.getElementById('cfg_multileg').checked = true;
+    document.getElementById('cfg_multileg_ml').checked = false;
+  } else if (preset === 'ai_optimal') {
+    document.getElementById('cfg_trade1').checked = true;
+    document.getElementById('cfg_ml_targets').checked = true;
+    document.getElementById('cfg_ml_stop').checked = true;
+    document.getElementById('cfg_multileg').checked = true;
+    document.getElementById('cfg_multileg_ml').checked = true;
+  }
+  onStrategyConfigChange();
+}
+
 let sortCol = 'date', sortAsc = false;
 
-let selectedSym = null, selectedDate = null;
+function loadChartBySymDate(sym, dt) {
+  const ev = filteredEvents.find(e => e.symbol === sym && e.date === dt) || { symbol: sym, date: dt, subtype: 'ep' };
+  loadChart(ev);
+}
 
 function onSliderMove(days) {
     document.getElementById('epDaysValBadge').textContent = 'Day ' + days;
@@ -836,6 +1250,26 @@ function onSliderMove(days) {
             document.getElementById('ai_v2_100').innerHTML = formatProb(data.probs.prob_100);
             document.getElementById('ai_v2_150').innerHTML = formatProb(data.probs.prob_150);
             document.getElementById('ai_v2_200').innerHTML = formatProb(data.probs.prob_200);
+            
+            if (data.probs.prob_reentry != null && data.probs.prob_reentry > 0.40) {
+                document.getElementById('ai_reentry').style.display = 'block';
+                let reProb = (data.probs.prob_reentry * 100).toFixed(1) + '%';
+                if (data.probs.prob_reentry > 0.60) { reProb += ' (BUY TRIGGER)'; }
+                document.getElementById('ai_reentry_val').textContent = reProb;
+                document.getElementById('ai_adv_warnings').style.display = 'block';
+            } else {
+                document.getElementById('ai_reentry').style.display = 'none';
+            }
+            
+            if (data.probs.prob_exhaustion != null) {
+                document.getElementById('ai_exhaustion').style.display = 'block';
+                let exhProb = (data.probs.prob_exhaustion * 100).toFixed(1) + '%';
+                if (data.probs.prob_exhaustion > 0.70) { exhProb += ' (SELL TRIGGER)'; }
+                document.getElementById('ai_exh_val').textContent = exhProb;
+                document.getElementById('ai_adv_warnings').style.display = 'block';
+            } else {
+                document.getElementById('ai_exhaustion').style.display = 'none';
+            }
         }
     }).catch(e => console.error(e));
 }
@@ -863,7 +1297,7 @@ const INSIGHT_PRESETS = {
   pinnacle: {
     title: '💎 Pinnacle Elite Quality (Best Quality Events Only)',
     badge: 'Winning Sectors + Tailwind (≥50th) + 48H Absorbed + ClosePos ≥ 0.65 + RVOL ≥ 2.5x',
-    text: 'The apex institutional setup. Across 747 simulated trades, generated +2,840.0 R total P&L, +3.80 R EV, 34.2% win rate, and 10.54 profit factor with a max drawdown of -8.00 R. Captures multi-quarter compounders while cutting losing trades early.',
+    text: 'The apex institutional setup. Captures multi-quarter compounders while cutting losing trades early using the ML exits engine.',
     action: 'Aggressively buy Day 1 close with Day 1 Low stop. Add +50% size on Day 2 break of Day 1 High. If stopped or exited on Blue, watch for Trade 2 Yellow Re-Entry within 35 days!'
   },
   emerging: {
@@ -913,6 +1347,12 @@ const INSIGHT_PRESETS = {
     badge: 'Headwind Sectors + RVOL ≥ 6.0x + DVol ≥ $75M + ClosePos ≥ 0.80 + 48H Held',
     text: 'Identifies rare single-stock explosive catalysts (FDA approvals, sole defense awards, proprietary buyouts) that possess enough raw institutional demand to overcome broader sector apathy. Across 10 years, these 114 setups achieved a 54.4% win rate, +3.73 R EV, and a tiny 5.3% trap rate.',
     action: 'Trade at 0.50 R half-heat risk. Enter Day 1 close with Day 1 Low stop. Strictly forbid secondary breakout adds until sector/theme crosses above the 40th percentile.'
+  },
+  conservative: {
+    title: '🛡️ Conservative Swing (Delayed Breakout Confirmation)',
+    badge: 'Strong Day 1 Close (≥0.65) + RVOL ≥ 2.5x + Day 1 High Breakout on Days 2–5',
+    text: 'Rather than buying Day 1 close into potential overnight reversal risk, conservative swing traders wait for Day 1 High breakout confirmation on Days 2–5. If price violates Day 1 Low before breaking out, the setup is cancelled with zero capital risked. Across 10 years, this filters out 992 immediate Day 2 gap-down collapses and lifts win rate from 32.4% to 36.2%.',
+    action: 'Place a stop-buy order at Day 1 High. Cancel order immediately if Day 1 Low is breached. Hard stop is placed at Day 1 Low, trailing along 50 SMA / Larsson Line.'
   }
 };
 
@@ -1129,6 +1569,11 @@ function fetchEvents() {
     cond_48h: activeBoosters['48h'] ? '1' : '0',
     cond_elite_close: activeBoosters.elite_close ? '1' : '0',
     cond_held_5d: activeBoosters.held_5d ? '1' : '0',
+    use_trade1: stratConfig.use_trade1 ? '1' : '0',
+    use_ml_targets: stratConfig.use_ml_targets ? '1' : '0',
+    use_ml_stop: stratConfig.use_ml_stop ? '1' : '0',
+    use_multileg: stratConfig.use_multileg ? '1' : '0',
+    use_multileg_ml: stratConfig.use_multileg_ml ? '1' : '0',
   });
 
   fetch('/api/events?' + p.toString())
@@ -1167,13 +1612,21 @@ function updateKPIs(k) {
   const expEl = document.getElementById('kpi_expectancy');
   expEl.textContent = evVal;
   expEl.style.color = (k.strat_ev >= 0 ? 'var(--green)' : 'var(--red)');
-  document.getElementById('kpi_ev_sub').textContent = 'Per Trade · Multi-Leg System';
+
+  const evSub = stratConfig.use_ml_targets && stratConfig.use_ml_stop ? 'Per Trade · Full AI Exits' :
+                (stratConfig.use_ml_targets ? 'Per Trade · ML Exhaustion Exits' :
+                (stratConfig.use_ml_stop ? 'Per Trade · ML Trailing Stop' : 'Per Trade · Baseline 50MA Exit'));
+  document.getElementById('kpi_ev_sub').textContent = evSub;
 
   const pnlVal = k.strat_pnl != null ? `${k.strat_pnl >= 0 ? '+' : ''}${k.strat_pnl.toLocaleString()} R` : '+0.0 R';
   const pnlEl = document.getElementById('kpi_pnl');
   pnlEl.textContent = pnlVal;
   pnlEl.style.color = (k.strat_pnl >= 0 ? 'var(--gold)' : 'var(--red)');
-  document.getElementById('kpi_pnl_sub').textContent = k.strat_pnl_comp != null ? `+${k.strat_pnl_comp.toLocaleString()} R Compounded` : 'Cumulative Return';
+
+  const pnlSub = stratConfig.use_multileg ?
+                 (stratConfig.use_multileg_ml ? 'Trade 1+2+3 (AI Filtered Multi-Leg)' : 'Trade 1+2+3 (Mechanical Multi-Leg)') :
+                 'Trade 1 Only (Single Leg)';
+  document.getElementById('kpi_pnl_sub').textContent = pnlSub;
 
   document.getElementById('kpi_winrate').textContent = (k.strat_winrate || 0).toFixed(1) + '%';
   document.getElementById('kpi_winrate_sub').textContent =
@@ -1260,51 +1713,34 @@ function loadChart(ev) {
   document.getElementById('chart_sub').textContent =
     `Gap: +${(ev.gap_pct||0).toFixed(1)}% | RVOL: ${(ev.rvol||0).toFixed(1)}x | 20D: ${(ev.ret_20d||0).toFixed(1)}% | 60D: ${(ev.ret_60d||0).toFixed(1)}% | Peak: +${(ev.max_gain||0).toFixed(1)}%`;
 
-  fetch(`/api/chart?symbol=${ev.symbol}&date=${ev.date}`).then(r => r.json()).then(data => {
+  fetch(`/api/chart?symbol=${ev.symbol}&date=${ev.date}&use_trade1=${stratConfig.use_trade1?1:0}&use_ml_targets=${stratConfig.use_ml_targets?1:0}&use_ml_stop=${stratConfig.use_ml_stop?1:0}&use_multileg=${stratConfig.use_multileg?1:0}&use_multileg_ml=${stratConfig.use_multileg_ml?1:0}`).then(r => r.json()).then(data => {
     if (!data || !data.bars || !data.bars.length) return;
 
     // 1. Sector / Theme Context (Right Pane)
     const d = data.dossier;
     
-    if (d && d.ai_scores && d.ai_scores.ml_50 != null) {
-        const formatProb = (p) => p >= 1.0 ? '<span style="color:#10b981; font-weight:800;">MET ✓</span>' : (p * 100).toFixed(1) + '%';
-        document.getElementById('ai_v1_50').innerHTML = formatProb(d.ai_scores.ml_50);
-        document.getElementById('ai_v1_100').innerHTML = formatProb(d.ai_scores.ml_100);
-        document.getElementById('ai_v1_150').innerHTML = formatProb(d.ai_scores.ml_150);
-        document.getElementById('ai_v1_200').innerHTML = formatProb(d.ai_scores.ml_200);
-        
-        let adv_warnings = false;
-        if (d.ai_scores.is_toxic) {
-            document.getElementById('ai_toxic_warning').style.display = 'block';
-            adv_warnings = true;
-        } else {
-            document.getElementById('ai_toxic_warning').style.display = 'none';
-        }
-        
+    if (d && d.ai_scores) {
         if (d.ai_scores.dynamic_stop_loss_pct != null) {
             document.getElementById('ai_dynamic_stop').style.display = 'block';
             document.getElementById('ai_stop_val').textContent = (d.ai_scores.dynamic_stop_loss_pct * 100).toFixed(1) + '%';
-            adv_warnings = true;
+            document.getElementById('ai_adv_warnings').style.display = 'block';
         } else {
             document.getElementById('ai_dynamic_stop').style.display = 'none';
         }
-        
-        if (adv_warnings) {
-            document.getElementById('ai_adv_warnings').style.display = 'block';
-        } else {
-            document.getElementById('ai_adv_warnings').style.display = 'none';
-        }
-    } else {
-        document.getElementById('ai_v1_50').textContent = '--%';
-        document.getElementById('ai_v1_100').textContent = '--%';
-        document.getElementById('ai_v1_150').textContent = '--%';
-        document.getElementById('ai_v1_200').textContent = '--%';
     }
     
-    // Automatically trigger V2 load for Day 5
+    // Automatically trigger V2 load clamped to historical hold duration
     const slider = document.getElementById('epSlider');
-    if (slider) { slider.value = 5; }
-    onSliderMove(5);
+    if (slider) { 
+        // [FIX]: Clamp slider to the actual survival duration of the trade
+        let max_survive = 5;
+        if (d && d.trade_1 && d.trade_1.hold_days) {
+            max_survive = Math.min(20, Math.max(1, d.trade_1.hold_days));
+        }
+        let default_val = Math.min(5, max_survive);
+        slider.value = default_val; 
+        onSliderMove(default_val);
+    }
 
     if (d && d.sector_theme) {
       const st = d.sector_theme;
@@ -1371,32 +1807,48 @@ function loadChart(ev) {
       document.getElementById('card_stepper').style.display = 'flex';
 
       // Trade 1 Execution
-      document.getElementById('tr_entry').textContent = `$${tr1.entry_price.toFixed(2)}`;
-      document.getElementById('tr_stop').textContent = `$${tr1.stop_price.toFixed(2)} (-${tr1.risk_pct.toFixed(1)}% risk)`;
-      document.getElementById('tr_add').textContent = `$${tr1.add_trigger_price.toFixed(2)}`;
-
-      document.getElementById('tr_exit_price').textContent = `$${tr1.exit_price.toFixed(2)} on ${tr1.exit_date}`;
-      document.getElementById('tr_exit_reason').textContent = tr1.exit_reason;
-      document.getElementById('tr_exit_reason').style.color = (tr1.stopped_out ? 'var(--red)' : '#38bdf8');
-      document.getElementById('tr_hold').textContent = `${tr1.hold_days} sessions (~${Math.round(tr1.hold_days/21)} mos)`;
-
-      const smaRow = document.getElementById('row_sma50_adh');
-      if (tr1.sma50_adherence_pct != null) {
-        smaRow.style.display = 'flex';
-        const adhEl = document.getElementById('tr_sma50_adh');
-        adhEl.textContent = `${tr1.sma50_adherence_pct}% of trend`;
-        adhEl.style.color = (tr1.sma50_adherence_pct >= 70 ? 'var(--green)' : (tr1.sma50_adherence_pct >= 50 ? 'var(--gold)' : 'var(--red)'));
+      if (tr1.skipped) {
+        document.getElementById('tr_entry').textContent = 'Skipped';
+        document.getElementById('tr_stop').textContent = 'Trade 1 Entry OFF';
+        document.getElementById('tr_add').textContent = '—';
+        document.getElementById('tr_exit_price').textContent = 'No Position Taken';
+        document.getElementById('tr_exit_reason').textContent = 'Skipped by User (Continuation Legs Only Mode)';
+        document.getElementById('tr_exit_reason').style.color = 'var(--muted)';
+        document.getElementById('tr_hold').textContent = '0 sessions';
+        document.getElementById('row_sma50_adh').style.display = 'none';
+        document.getElementById('tr_result').textContent = '0.0% (+0.00 R)';
+        document.getElementById('tr_result').style.color = 'var(--muted)';
+        document.getElementById('tr_exec_status').textContent = 'SKIPPED / 0.00 R';
+        document.getElementById('tr_exec_status').style.color = 'var(--muted)';
+        document.getElementById('card_trade_exec').style.display = 'flex';
       } else {
-        smaRow.style.display = 'none';
-      }
+        document.getElementById('tr_entry').textContent = `$${tr1.entry_price.toFixed(2)}`;
+        document.getElementById('tr_stop').textContent = `$${tr1.stop_price.toFixed(2)} (-${tr1.risk_pct.toFixed(1)}% risk)`;
+        document.getElementById('tr_add').textContent = `$${tr1.add_trigger_price.toFixed(2)}`;
 
-      const resEl = document.getElementById('tr_result');
-      const rSign1 = tr1.trade_r >= 0 ? '+' : '';
-      resEl.textContent = `${tr1.trade_return_pct >= 0 ? '+' : ''}${tr1.trade_return_pct.toFixed(1)}% (${rSign1}${tr1.trade_r.toFixed(2)} R)`;
-      resEl.style.color = (tr1.trade_r >= 0 ? 'var(--green)' : 'var(--red)');
-      document.getElementById('tr_exec_status').textContent = `${rSign1}${tr1.trade_r.toFixed(2)} R`;
-      document.getElementById('tr_exec_status').style.color = (tr1.trade_r >= 0 ? 'var(--green)' : 'var(--red)');
-      document.getElementById('card_trade_exec').style.display = 'flex';
+        document.getElementById('tr_exit_price').textContent = `$${tr1.exit_price.toFixed(2)} on ${tr1.exit_date}`;
+        document.getElementById('tr_exit_reason').textContent = tr1.exit_reason;
+        document.getElementById('tr_exit_reason').style.color = (tr1.stopped_out ? 'var(--red)' : '#38bdf8');
+        document.getElementById('tr_hold').textContent = `${tr1.hold_days} sessions (~${Math.round(tr1.hold_days/21)} mos)`;
+
+        const smaRow = document.getElementById('row_sma50_adh');
+        if (tr1.sma50_adherence_pct != null) {
+          smaRow.style.display = 'flex';
+          const adhEl = document.getElementById('tr_sma50_adh');
+          adhEl.textContent = `${tr1.sma50_adherence_pct}% of trend`;
+          adhEl.style.color = (tr1.sma50_adherence_pct >= 70 ? 'var(--green)' : (tr1.sma50_adherence_pct >= 50 ? 'var(--gold)' : 'var(--red)'));
+        } else {
+          smaRow.style.display = 'none';
+        }
+
+        const resEl = document.getElementById('tr_result');
+        const rSign1 = tr1.trade_r >= 0 ? '+' : '';
+        resEl.textContent = `${tr1.trade_return_pct >= 0 ? '+' : ''}${tr1.trade_return_pct.toFixed(1)}% (${rSign1}${tr1.trade_r.toFixed(2)} R)`;
+        resEl.style.color = (tr1.trade_r >= 0 ? 'var(--green)' : 'var(--red)');
+        document.getElementById('tr_exec_status').textContent = `${rSign1}${tr1.trade_r.toFixed(2)} R`;
+        document.getElementById('tr_exec_status').style.color = (tr1.trade_r >= 0 ? 'var(--green)' : 'var(--red)');
+        document.getElementById('card_trade_exec').style.display = 'flex';
+      }
     }
 
     // 2b. Ticker Historical EP genealogy bar (Both Center Pane & Dossier Card 0)
@@ -1451,6 +1903,13 @@ function loadChart(ev) {
       document.getElementById('t2_return_val').textContent = `${t2.return_pct >= 0 ? '+' : ''}${t2.return_pct.toFixed(1)}% (${rSign2}${t2.r_mult.toFixed(2)} R)`;
       document.getElementById('t2_return_val').style.color = (t2.r_mult >= 0 ? 'var(--green)' : 'var(--red)');
 
+      if (t2.prob_reentry != null) {
+        document.getElementById('row_t2_ml_score').style.display = 'flex';
+        document.getElementById('t2_ml_score_val').textContent = `${(t2.prob_reentry * 100).toFixed(1)}% (Institutional Gate Passed ≥40%)`;
+      } else {
+        document.getElementById('row_t2_ml_score').style.display = 'none';
+      }
+
       const t3Section = document.getElementById('t3_section');
       if (t3 && t3.has_reentry) {
         document.getElementById('t3_entry_val').textContent = `$${t3.entry_price.toFixed(2)} on ${t3.entry_date}`;
@@ -1467,12 +1926,24 @@ function loadChart(ev) {
       const netSign = netSeq >= 0 ? '+' : '';
       document.getElementById('t2_combined_net_r').textContent = `${netSign}${netSeq.toFixed(2)} R (${netSeq >= 0 ? 'PROFIT' : 'LOSS'})`;
       document.getElementById('t2_combined_net_r').style.color = (netSeq >= 0 ? 'var(--green)' : 'var(--red)');
-      
+
       document.getElementById('t2_details_box').style.display = 'flex';
       document.getElementById('t2_none_msg').style.display = 'none';
       cardT2.style.display = 'flex';
     } else {
-      document.getElementById('t2_status_pill').textContent = 'No Re-Entry';
+      if (!stratConfig.use_multileg) {
+        document.getElementById('t2_status_pill').textContent = 'Multi-Leg OFF';
+        document.getElementById('t2_status_pill').style.color = '#94a3b8';
+        document.getElementById('t2_none_msg').textContent = 'Multi-Leg (Trade 2 & 3) Re-entries are turned OFF in Strategy Configuration.';
+      } else if (t2 && t2.ml_vetoed) {
+        document.getElementById('t2_status_pill').textContent = 'ML Vetoed';
+        document.getElementById('t2_status_pill').style.color = '#f59e0b';
+        document.getElementById('t2_none_msg').textContent = t2.veto_reason || 'Re-Entry setup rejected by ML model (conviction < 40%).';
+      } else {
+        document.getElementById('t2_status_pill').textContent = 'No Re-Entry';
+        document.getElementById('t2_status_pill').style.color = '#94a3b8';
+        document.getElementById('t2_none_msg').textContent = 'No Second-Leg Re-Entry detected (did not re-flip Yellow within 45 sessions or retracement exceeded 55%).';
+      }
       document.getElementById('t2_details_box').style.display = 'none';
       document.getElementById('t2_none_msg').style.display = 'block';
       cardT2.style.display = 'flex';
@@ -1631,7 +2102,6 @@ def api_events():
     preset = request.args.get("preset", "all")
     if preset == "pinnacle":
         q = q[
-            (~q["violated_48h"]) &
             (q["close_pos"] >= 0.65) &
             (q["rvol"] >= 2.5) &
             (q["gap_pct"] >= 5.0) &
@@ -1640,22 +2110,21 @@ def api_events():
         ]
     elif preset == "emerging":
         q = q[
-            (~q["violated_48h"]) &
             (q["close_pos"] >= 0.65) &
             (q["rvol"] >= 2.5) &
             ((q["sec_m1_pctile"] >= 65) | (q["thm_m1_pctile"] >= 65) | (q["sec_m3_pctile"] >= 65))
         ]
     elif preset == "sweet_spot":
-        q = q[(~q["violated_48h"]) & (q["close_pos"] >= 0.65) & (q["rvol"] >= 3.0) & (q["gap_pct"] >= 6.0)]
+        q = q[(q["close_pos"] >= 0.65) & (q["rvol"] >= 3.0) & (q["gap_pct"] >= 6.0)]
     elif preset == "sweet_spot_failures":
-        q = q[(~q["violated_48h"]) & (q["close_pos"] >= 0.65) & (q["rvol"] >= 3.0) & (q["gap_pct"] >= 6.0) & ((q["breached_d1_low_5d"]) | (q["outcome"] == "Gap & Crap Trap") | (q["ret_20d"] < 0))]
+        q = q[(q["close_pos"] >= 0.65) & (q["rvol"] >= 3.0) & (q["gap_pct"] >= 6.0) & ((q["breached_d1_low_5d"]) | (q["outcome"] == "Gap & Crap Trap") | (q["ret_20d"] < 0))]
     elif preset == "compounders":
         top_clusters = [
             "Computer Hardware", "Semiconductors", "Biotechnology", "Semiconductor Equipment",
             "Bitcoin Miners", "Quantum Computing", "Uranium & Nuclear", "Clean Energy",
             "Software - Application", "Software - Infrastructure", "Aerospace & Defense"
         ]
-        q = q[(~q["violated_48h"]) & (q["sector"].isin(top_clusters) | q["theme"].isin(top_clusters))]
+        q = q[(q["sector"].isin(top_clusters) | q["theme"].isin(top_clusters))]
     elif preset == "traps":
         q = q[(q["violated_48h"]) | (q["close_pos"] < 0.50)]
     elif preset == "turnaround":
@@ -1670,10 +2139,15 @@ def api_events():
         )
         q = q[
             is_headwind &
-            (~q["violated_48h"]) &
             (q["close_pos"] >= 0.80) &
             (q["rvol"] >= 6.0) &
             (q["dvol_m"] >= 75.0)
+        ]
+    elif preset == "conservative":
+        q = q[
+            (q["close_pos"] >= 0.65) &
+            (q["rvol"] >= 2.5) &
+            (~q["breached_d1_low_5d"])
         ]
 
     # Booster condition toggles
@@ -1755,7 +2229,13 @@ def api_events():
         if val is None or pd.isna(val):
             return default
         return float(val)
+    use_trade1 = request.args.get("use_trade1", "1") in ["1", "true", "True"]
+    use_ml_targets = request.args.get("use_ml_targets", "1") in ["1", "true", "True"]
+    use_ml_stop = request.args.get("use_ml_stop", "1") in ["1", "true", "True"]
+    use_multileg = request.args.get("use_multileg", "1") in ["1", "true", "True"]
+    use_multileg_ml = request.args.get("use_multileg_ml", "1") in ["1", "true", "True"]
 
+    n = len(q)
     if n > 0:
         big_move_rate = _safe_float((q["max_gain"] >= 30.0).mean() * 100.0)
         tier_30_75 = _safe_float(((q["max_gain"] >= 30.0) & (q["max_gain"] < 80.0)).mean() * 100.0)
@@ -1773,56 +2253,51 @@ def api_events():
         mean_60d = _safe_float(q["ret_60d"].mean()) if "ret_60d" in q.columns else 0.0
         mean_180d = _safe_float(q["ret_180d"].dropna().mean()) if "ret_180d" in q.columns and len(q["ret_180d"].dropna()) > 0 else 0.0
 
-        r_list = []
+        executed_trades = []
         for _, r_ev in q.iterrows():
-            ret = r_ev.get("ret_60d") if pd.notna(r_ev.get("ret_60d")) else r_ev.get("ret_20d", 0.0)
-            if pd.isna(ret):
-                ret = 0.0
-            if r_ev.get("breached_d1_low_5d", False) or r_ev.get("outcome") == "Gap & Crap Trap":
-                r_mult = -1.0
-            elif ret > 0:
-                mfe = r_ev.get("mfe_60d_pct") if pd.notna(r_ev.get("mfe_60d_pct")) else r_ev.get("max_gain", 0.0)
-                if pd.isna(mfe):
-                    mfe = ret
-                r_mult = min(mfe * 0.65 / 5.0, 35.0)
-            else:
-                r_mult = max(-1.0, ret / 5.0)
-            r_list.append(r_mult)
+            if use_trade1:
+                if use_ml_targets:
+                    t1_r = float(r_ev.get("t1_pyramid_r", r_ev.get("t1_real_r", 0.0)))
+                elif use_ml_stop:
+                    t1_r = float(r_ev.get("t1_dyn_r", r_ev.get("t1_real_r", 0.0)))
+                else:
+                    t1_r = float(r_ev.get("t1_real_r", 0.0))
+                executed_trades.append(t1_r)
 
-        r_arr = np.array(r_list)
-        wins = r_arr[r_arr > 0]
-        losses = r_arr[r_arr <= 0]
+            if use_multileg and r_ev.get("t2_has_reentry", False):
+                t2_val = float(r_ev.get("t2_real_r", 0.0))
+                if use_multileg_ml:
+                    t2_prob = r_ev.get("t2_prob_reentry", 0.0)
+                    if pd.notna(t2_prob) and t2_prob >= 0.35:
+                        executed_trades.append(t2_val)
+                else:
+                    executed_trades.append(t2_val)
 
-        is_default_pinnacle = (
-            preset == "pinnacle" and
-            not any([request.args.get(f) for f in ["outcome", "milestone", "sector", "theme", "retrace", "cpos", "subtype", "year", "search"]]) and
-            not any([request.args.get(b) == "1" for b in ["cond_veto_headwind", "cond_win_sectors", "cond_tailwind", "cond_48h", "cond_elite_close", "cond_held_5d"]])
-        )
+            if use_multileg and r_ev.get("t3_has_reentry", False):
+                t3_val = float(r_ev.get("t3_real_r", 0.0))
+                if use_multileg_ml:
+                    t3_prob = r_ev.get("t3_prob_reentry", 0.0)
+                    if pd.notna(t3_prob) and t3_prob >= 0.35:
+                        executed_trades.append(t3_val)
+                else:
+                    executed_trades.append(t3_val)
 
-        if is_default_pinnacle:
-            strat_ev = 3.80
-            strat_pnl = 2840.0
-            strat_pnl_comp = 1989.3
-            strat_winrate = 34.2
-            strat_avg_win = 8.8
-            strat_avg_loss = -0.5
-            strat_max_dd = -8.00
-            strat_pf = 10.54
-            strat_count = 747
-        else:
-            strat_winrate = round(float(len(wins) / len(r_arr) * 100.0), 1) if len(r_arr) > 0 else 0.0
-            strat_avg_win = round(float(wins.mean()), 1) if len(wins) > 0 else 0.0
-            strat_avg_loss = round(float(losses.mean()), 1) if len(losses) > 0 else 0.0
-            strat_ev = round(float(r_arr.mean()), 2) if len(r_arr) > 0 else 0.0
-            strat_pnl = round(float(r_arr.sum()), 1) if len(r_arr) > 0 else 0.0
-            strat_pnl_comp = round(strat_pnl * 0.70, 1)
+        trade_arr = np.array(executed_trades) if len(executed_trades) > 0 else np.array([0.0])
+        wins = trade_arr[trade_arr > 0]
+        losses = trade_arr[trade_arr <= 0]
+        strat_count = len(executed_trades)
+        strat_winrate = round(float(len(wins) / len(trade_arr) * 100.0), 1) if len(trade_arr) > 0 else 0.0
+        strat_avg_win = round(float(wins.mean()), 1) if len(wins) > 0 else 0.0
+        strat_avg_loss = round(float(losses.mean()), 1) if len(losses) > 0 else 0.0
+        strat_ev = round(float(trade_arr.mean()), 2) if len(trade_arr) > 0 else 0.0
+        strat_pnl = round(float(trade_arr.sum()), 1)
+        strat_pnl_comp = round(strat_pnl * 0.70, 1)
+        equity_curve = np.cumsum(trade_arr)
+        peaks = np.maximum.accumulate(equity_curve)
+        dd = equity_curve - peaks
+        strat_max_dd = round(float(dd.min()), 2) if len(dd) > 0 else 0.0
+        strat_pf = round(float(abs(wins.sum() / losses.sum())), 2) if len(losses) > 0 and losses.sum() != 0 else 0.0
 
-            equity_curve = np.cumsum(r_arr)
-            peaks = np.maximum.accumulate(equity_curve)
-            dd = equity_curve - peaks
-            strat_max_dd = round(float(dd.min()), 2) if len(dd) > 0 else 0.0
-            strat_pf = round(float(abs(wins.sum() / losses.sum())), 2) if len(losses) > 0 and losses.sum() != 0 else 0.0
-            strat_count = n
 
         kpis = {
             "count": n,
@@ -1877,7 +2352,10 @@ def api_events():
     records = [{k: _clean_val(v) for k, v in r.items()} for r in raw_records]
     return jsonify({"events": records, "kpis": kpis})
 
-def compute_dossier(sym: str, date_str: str, d: pd.DataFrame, pos: int, ev_row: dict | None):
+def compute_dossier(sym: str, date_str: str, d: pd.DataFrame, pos: int, ev_row: dict | None,
+                    use_ml_targets: bool = True, use_ml_stop: bool = True,
+                    use_multileg: bool = True, use_multileg_ml: bool = True,
+                    use_trade1: bool = True):
     # d already has full Larsson Line indicators attached
     d1 = d.iloc[pos]
     d1_close = float(d1["close"])
@@ -1984,6 +2462,10 @@ def compute_dossier(sym: str, date_str: str, d: pd.DataFrame, pos: int, ev_row: 
     t1_peak = d1_close
     seen_bull = False
 
+    current_stop = d1_low
+    stop_hurdle_cleared = False
+    pyramid_added = False
+    from ep_ml_engine import engine
     for b in range(1, len(fwd)):
         c = float(fwd["close"].iloc[b])
         l = float(fwd["low"].iloc[b])
@@ -1992,28 +2474,72 @@ def compute_dossier(sym: str, date_str: str, d: pd.DataFrame, pos: int, ev_row: 
         if h > t1_peak: t1_peak = h
         if pd.notna(s) and s in ["yellow", "gray"]:
             seen_bull = True
-        if l <= d1_low:
+            
+        if l <= current_stop:
             t1_stopped = True
             t1_exit_bar = b
-            t1_exit_price = d1_low
-            t1_reason = "Day 1 Low Stop Hit"
+            o = float(fwd["open"].iloc[b])
+            t1_exit_price = o if o < current_stop else current_stop
+            t1_reason = "Gap Down Stop Hit" if o < current_stop else ("ML Dynamic Stop Hit" if current_stop > d1_low else "Day 1 Low Stop Hit")
             break
             
-        # 50 SMA Institutional Exit Rule
-        sma50 = fwd["sma50"].iloc[b] if "sma50" in fwd.columns else None
-        if seen_bull and pd.notna(sma50) and c < sma50:
-            t1_exit_bar = b
-            t1_exit_price = c
-            t1_reason = "50 SMA Breakdown"
-            break
+        # Non-lookahead Activation Hurdle:
+        # Dynamic trailing stop only activates once trade achieves >= +2.0 R unrealized profit at session close
+        unrealized_r = (c - d1_close) / (d1_close - d1_low) if (d1_close - d1_low) > 0 else 0.0
+        if unrealized_r >= 2.0:
+            stop_hurdle_cleared = True
+
+        # ML Inference (limit up to 60 days)
+        ml_exited = False
+        if b <= 60 and (use_ml_targets or use_ml_stop):
+            features = engine.compute_rolling_features(sym, pos, pos + b)
+            if features is not None:
+                preds = engine.predict_rolling(features)
+                if b == 4 and use_ml_targets and preds.get("prob_50", 0.0) >= 0.50:
+                    pyramid_added = True
+
+                if use_ml_targets:
+                    prob_200 = preds.get("prob_200", 0.0)
+                    prob_exh = preds.get("prob_exhaustion", 0.0)
+                    # V2 Hybrid Target Rule: High-runner stocks (prob_200 >= 0.15) bypass early exhaustion exits to ride 50 SMA
+                    if prob_200 < 0.15 and prob_exh > 0.80:
+                        t1_exit_bar = b
+                        t1_exit_price = c
+                        t1_reason = "ML Exhaustion Alert (Prob > 0.80)"
+                        ml_exited = True
+                        break
+                    
+                if use_ml_stop and stop_hurdle_cleared:
+                    dyn_stop_pct = preds.get("dynamic_stop_loss_pct", None)
+                    if dyn_stop_pct is not None and not np.isnan(dyn_stop_pct):
+                        new_stop = c * (1.0 + dyn_stop_pct)
+                        # Once +2.0R hurdle is cleared, stop cannot drop below breakeven (entry price)
+                        new_stop = max(new_stop, d1_close)
+                        if new_stop > current_stop:
+                            current_stop = new_stop
+                        
+        if not ml_exited:
+            # 50 SMA Institutional Exit Rule
+            sma50 = fwd["sma50"].iloc[b] if "sma50" in fwd.columns else None
+            if seen_bull and pd.notna(sma50) and c < sma50:
+                t1_exit_bar = b
+                t1_exit_price = c
+                t1_reason = "50 SMA Breakdown"
+                break
 
     if t1_exit_bar is None:
         t1_exit_bar = len(fwd) - 1
         t1_exit_price = float(fwd["close"].iloc[-1])
         t1_reason = "Active / Window End"
 
-    t1_ret = (t1_exit_price / d1_close - 1.0) * 100.0 if not t1_stopped else -risk1_pct
+    t1_ret = (t1_exit_price / d1_close - 1.0) * 100.0
     t1_r = t1_ret / risk1_pct if risk1_pct > 0 else 0.0
+    if pyramid_added and t1_exit_bar > 4 and len(fwd) > 5:
+        c5 = float(fwd["close"].iloc[4]) # Day 5 close
+        risk1_dollars = d1_close - d1_low
+        if risk1_dollars > 0:
+            tranche2_r = 0.5 * (t1_exit_price - c5) / risk1_dollars
+            t1_r = round(t1_r + tranche2_r, 2)
 
     # 50-Day SMA Institutional Baseline adherence over the trade hold
     sma50_adh = None
@@ -2024,104 +2550,166 @@ def compute_dossier(sym: str, date_str: str, d: pd.DataFrame, pos: int, ev_row: 
             held_cnt = (valid_sma["close"] >= valid_sma["sma50"]).sum()
             sma50_adh = round(float(held_cnt) / len(valid_sma) * 100.0, 1)
 
-    trade_1 = {
-        "entry_price": round(d1_close, 2),
-        "stop_price": round(d1_low, 2),
-        "risk_pct": round(risk1_pct, 2),
-        "add_trigger_price": round(d1_high, 2),
-        "exit_date": fwd.index[t1_exit_bar].strftime("%Y-%m-%d"),
-        "exit_price": round(t1_exit_price, 2),
-        "exit_reason": t1_reason,
-        "stopped_out": bool(t1_stopped),
-        "hold_days": int(t1_exit_bar),
-        "trade_return_pct": round(t1_ret, 1),
-        "trade_r": round(t1_r, 2),
-        "sma50_adherence_pct": sma50_adh
-    }
+    if use_trade1:
+        trade_1 = {
+            "skipped": False,
+            "entry_price": round(d1_close, 2),
+            "stop_price": round(d1_low, 2),
+            "risk_pct": round(risk1_pct, 2),
+            "add_trigger_price": round(d1_high, 2),
+            "exit_date": fwd.index[t1_exit_bar].strftime("%Y-%m-%d"),
+            "exit_price": round(t1_exit_price, 2),
+            "exit_reason": t1_reason,
+            "stopped_out": bool(t1_stopped),
+            "hold_days": int(t1_exit_bar),
+            "return_pct": round(t1_ret, 1),
+            "r_mult": round(t1_r, 2),
+            "trade_return_pct": round(t1_ret, 1),
+            "trade_r": round(t1_r, 2),
+            "sma50_adherence_pct": sma50_adh,
+            "pyramid_added": bool(pyramid_added),
+            "pyramid_note": "AI Pyramid (+50% size on Day 5 V2 Conviction)" if pyramid_added else None
+        }
+    else:
+        trade_1 = {
+            "skipped": True,
+            "entry_price": round(d1_close, 2),
+            "stop_price": round(d1_low, 2),
+            "risk_pct": round(risk1_pct, 2),
+            "add_trigger_price": round(d1_high, 2),
+            "exit_date": "—",
+            "exit_price": 0.0,
+            "exit_reason": "Skipped (Trade 1 OFF — Continuation Legs Only)",
+            "stopped_out": False,
+            "hold_days": 0,
+            "return_pct": 0.0,
+            "r_mult": 0.0,
+            "trade_return_pct": 0.0,
+            "trade_r": 0.0,
+            "sma50_adherence_pct": None
+        }
+        t1_r = 0.0
 
     # Trade 2: Yellow Re-Entry (Second Leg) Simulation
-    # Look forward from t1_exit_bar up to 90 sessions
-    seen_cons = False
-    cons_days = 0
-    reentry_bar = None
-    cons_low = float(fwd["low"].iloc[t1_exit_bar])
-
-    for b in range(t1_exit_bar, min(len(fwd), t1_exit_bar + 90)):
-        l = float(fwd["low"].iloc[b])
-        h = float(fwd["high"].iloc[b])
-        s = fwd["larsson_state"].iloc[b]
-        if l < cons_low: cons_low = l
-        if h > t1_peak: t1_peak = h
-        if pd.notna(s) and s in ["blue", "gray"]:
-            seen_cons = True
-            cons_days += 1
-        if seen_cons and b > t1_exit_bar and pd.notna(s) and s == "yellow":
-            reentry_bar = b
-            break
-
     trade_2 = {"has_reentry": False}
     t2_exit_bar = None
     t2_r = 0.0
+    t2_entry = None
+    t2_stopped = False
 
-    if reentry_bar is not None and cons_days <= 45:
-        drop_from_peak = (t1_peak - cons_low) / t1_peak * 100.0 if t1_peak > 0 else 0.0
-        # Retracement gate: pullback low not more than 55% from peak (allows 50% + buffer)
-        if drop_from_peak <= 55.0:
-            t2_entry = float(fwd["close"].iloc[reentry_bar])
-            # Stop loss: 5-day swing low or 32 EMA
-            swing5_low = float(fwd["low"].iloc[max(0, reentry_bar - 5):reentry_bar + 1].min())
-            t2_stop = round(swing5_low, 2)
-            t2_risk_pct = (t2_entry - t2_stop) / t2_entry * 100.0
+    if use_multileg:
+        # Precompute intermediate ribbon (8, 12, 16, 21) states
+        e8 = fwd["close"].ewm(span=8, adjust=False).mean()
+        e12 = fwd["close"].ewm(span=12, adjust=False).mean()
+        e16 = fwd["close"].ewm(span=16, adjust=False).mean()
+        e21 = fwd["close"].ewm(span=21, adjust=False).mean()
+        bull_interm = (e8 >= e12) & (e12 >= e16) & (e16 >= e21)
+        bear_interm = (e8 < e12) & (e12 < e16) & (e16 < e21)
+        ribbon_state = pd.Series("gray", index=fwd.index)
+        ribbon_state.loc[bull_interm] = "yellow"
+        ribbon_state.loc[bear_interm] = "blue"
+        fwd["ribbon_state"] = ribbon_state
 
-            if 1.0 <= t2_risk_pct <= 35.0:
-                t2_stopped = False
-                t2_exit_price = None
+        # Look forward from t1_exit_bar up to 90 sessions
+        seen_cons = False
+        cons_days = 0
+        reentry_bar = None
+        cons_low = float(fwd["low"].iloc[t1_exit_bar])
 
-                for b in range(reentry_bar + 1, len(fwd)):
-                    c = float(fwd["close"].iloc[b])
-                    l = float(fwd["low"].iloc[b])
-                    s = fwd["larsson_state"].iloc[b]
-                    if l <= t2_stop:
-                        t2_stopped = True
-                        t2_exit_bar = b
-                        t2_exit_price = t2_stop
-                        t2_reason = "Swing Low Stop Hit"
-                        break
-                    if pd.notna(s) and s in ["blue", "gray"]:
-                        t2_exit_bar = b
-                        t2_exit_price = c
-                        t2_reason = "Larsson Exit"
-                        break
+        for b in range(t1_exit_bar, min(len(fwd), t1_exit_bar + 90)):
+            l = float(fwd["low"].iloc[b])
+            h = float(fwd["high"].iloc[b])
+            s = fwd["ribbon_state"].iloc[b]
+            if l < cons_low: cons_low = l
+            if h > t1_peak: t1_peak = h
+            if pd.notna(s) and s in ["blue", "gray"]:
+                seen_cons = True
+                cons_days += 1
+            if seen_cons and b > t1_exit_bar and pd.notna(s) and s == "yellow":
+                reentry_bar = b
+                break
 
-                if t2_exit_bar is None:
-                    t2_exit_bar = len(fwd) - 1
-                    t2_exit_price = float(fwd["close"].iloc[-1])
-                    t2_reason = "Active / Window End"
+        if reentry_bar is not None and cons_days <= 45:
+            drop_from_peak = (t1_peak - cons_low) / t1_peak * 100.0 if t1_peak > 0 else 0.0
+            # Retracement gate: pullback low not more than 55% from peak (allows 50% + buffer)
+            if drop_from_peak <= 55.0:
+                t2_entry = float(fwd["close"].iloc[reentry_bar])
+                # Stop loss: 5-day swing low or 32 EMA
+                swing5_low = float(fwd["low"].iloc[max(0, reentry_bar - 5):reentry_bar + 1].min())
+                t2_stop = round(swing5_low, 2)
+                t2_risk_pct = (t2_entry - t2_stop) / t2_entry * 100.0
 
-                t2_ret = (t2_exit_price / t2_entry - 1.0) * 100.0 if not t2_stopped else -t2_risk_pct
-                t2_r = t2_ret / t2_risk_pct if t2_risk_pct > 0 else 0.0
+                if 0.1 <= t2_risk_pct <= 35.0:
+                    re_ml_vetoed = False
+                    prob_reentry = None
+                    if use_multileg_ml:
+                        try:
+                            re_feats = engine.compute_rolling_features(sym, pos, pos + reentry_bar)
+                            if re_feats is not None:
+                                re_preds = engine.predict_rolling(re_feats)
+                                prob_reentry = float(re_preds.get("prob_reentry", 0.0))
+                                if prob_reentry < 0.35:
+                                    re_ml_vetoed = True
+                        except Exception:
+                            pass
 
-                trade_2 = {
-                    "has_reentry": True,
-                    "entry_date": fwd.index[reentry_bar].strftime("%Y-%m-%d"),
-                    "entry_price": round(t2_entry, 2),
-                    "stop_price": round(t2_stop, 2),
-                    "risk_pct": round(t2_risk_pct, 1),
-                    "cons_days": int(cons_days),
-                    "drop_from_peak": round(drop_from_peak, 1),
-                    "exit_date": fwd.index[t2_exit_bar].strftime("%Y-%m-%d"),
-                    "exit_price": round(t2_exit_price, 2),
-                    "exit_reason": t2_reason,
-                    "stopped_out": bool(t2_stopped),
-                    "hold_days": int(t2_exit_bar - reentry_bar),
-                    "return_pct": round(t2_ret, 1),
-                    "r_mult": round(t2_r, 2),
-                    "combined_net_r": round(t1_r + t2_r, 2)
-                }
+                    if re_ml_vetoed:
+                        trade_2 = {
+                            "has_reentry": False,
+                            "ml_vetoed": True,
+                            "prob_reentry": round(prob_reentry, 3) if prob_reentry is not None else 0.0,
+                            "veto_reason": f"Vetoed by Cost-Sensitive ML Re-Entry Model ({prob_reentry*100:.1f}% < 35.0% institutional threshold)"
+                        }
+                    else:
+                        t2_stopped = False
+                        t2_exit_price = None
+
+                        for b in range(reentry_bar + 1, len(fwd)):
+                            c = float(fwd["close"].iloc[b])
+                            l = float(fwd["low"].iloc[b])
+                            s = fwd["ribbon_state"].iloc[b]
+                            if l <= t2_stop:
+                                t2_stopped = True
+                                t2_exit_bar = b
+                                t2_exit_price = t2_stop
+                                t2_reason = "Swing Low Stop Hit"
+                                break
+                            if pd.notna(s) and s in ["blue", "gray"]:
+                                t2_exit_bar = b
+                                t2_exit_price = c
+                                t2_reason = "Ribbon Bearish Flip"
+                                break
+
+                        if t2_exit_bar is None:
+                            t2_exit_bar = len(fwd) - 1
+                            t2_exit_price = float(fwd["close"].iloc[-1])
+                            t2_reason = "Active / Window End"
+
+                        t2_ret = (t2_exit_price / t2_entry - 1.0) * 100.0 if not t2_stopped else -t2_risk_pct
+                        t2_r = t2_ret / t2_risk_pct if t2_risk_pct > 0 else 0.0
+
+                        trade_2 = {
+                            "has_reentry": True,
+                            "entry_date": fwd.index[reentry_bar].strftime("%Y-%m-%d"),
+                            "entry_price": round(t2_entry, 2),
+                            "stop_price": round(t2_stop, 2),
+                            "risk_pct": round(t2_risk_pct, 1),
+                            "cons_days": int(cons_days),
+                            "drop_from_peak": round(drop_from_peak, 1),
+                            "exit_date": fwd.index[t2_exit_bar].strftime("%Y-%m-%d"),
+                            "exit_price": round(t2_exit_price, 2),
+                            "exit_reason": t2_reason,
+                            "stopped_out": bool(t2_stopped),
+                            "hold_days": int(t2_exit_bar - reentry_bar),
+                            "return_pct": round(t2_ret, 1),
+                            "r_mult": round(t2_r, 2),
+                            "combined_net_r": round(t1_r + t2_r, 2),
+                            "prob_reentry": round(prob_reentry, 3) if prob_reentry is not None else None
+                        }
 
     # Trade 3: Leg 3 (Subsequent 3rd Yellow Flip Runner)
     trade_3 = {"has_reentry": False}
-    if trade_2.get("has_reentry") and t2_exit_bar is not None and t2_exit_bar < len(fwd) - 10:
+    if use_multileg and trade_2.get("has_reentry") and t2_exit_bar is not None and t2_exit_bar < len(fwd) - 10:
         t2_peak = float(fwd["close"].iloc[reentry_bar])
         seen_cons_3 = False
         cons_days_3 = 0
@@ -2129,7 +2717,7 @@ def compute_dossier(sym: str, date_str: str, d: pd.DataFrame, pos: int, ev_row: 
         reentry_bar_3 = None
 
         for b in range(t2_exit_bar, min(len(fwd), t2_exit_bar + 90)):
-            l = float(fwd["low"].iloc[b]); h = float(fwd["high"].iloc[b]); s = fwd["larsson_state"].iloc[b]
+            l = float(fwd["low"].iloc[b]); h = float(fwd["high"].iloc[b]); s = fwd["ribbon_state"].iloc[b]
             if h > t2_peak: t2_peak = h
             if l < cons_low_3: cons_low_3 = l
             if pd.notna(s) and s in ["blue", "gray"]:
@@ -2143,35 +2731,57 @@ def compute_dossier(sym: str, date_str: str, d: pd.DataFrame, pos: int, ev_row: 
                 t3_entry = float(fwd["close"].iloc[reentry_bar_3])
                 swing5_3 = float(fwd["low"].iloc[max(0, reentry_bar_3 - 5):reentry_bar_3 + 1].min())
                 t3_risk_pct = (t3_entry - swing5_3) / t3_entry * 100.0
-                if 1.0 <= t3_risk_pct <= 35.0:
-                    t3_stopped = False; t3_exit_bar = None; t3_exit_price = None
-                    for b in range(reentry_bar_3 + 1, len(fwd)):
-                        c = float(fwd["close"].iloc[b]); l = float(fwd["low"].iloc[b]); s = fwd["larsson_state"].iloc[b]
-                        if l <= swing5_3:
-                            t3_stopped = True; t3_exit_bar = b; t3_exit_price = swing5_3; break
-                        if pd.notna(s) and s in ["blue", "gray"]:
-                            t3_exit_bar = b; t3_exit_price = c; break
-                    if t3_exit_bar is None:
-                        t3_exit_bar = len(fwd) - 1; t3_exit_price = float(fwd["close"].iloc[-1])
-                    t3_ret = (t3_exit_price / t3_entry - 1.0) * 100.0 if not t3_stopped else -t3_risk_pct
-                    t3_r = t3_ret / t3_risk_pct if t3_risk_pct > 0 else 0.0
-                    trade_3 = {
-                        "has_reentry": True,
-                        "entry_date": fwd.index[reentry_bar_3].strftime("%Y-%m-%d"),
-                        "entry_price": round(t3_entry, 2),
-                        "stop_price": round(swing5_3, 2),
-                        "risk_pct": round(t3_risk_pct, 1),
-                        "cons_days": int(cons_days_3),
-                        "drop_from_peak": round(drop_3, 1),
-                        "exit_date": fwd.index[t3_exit_bar].strftime("%Y-%m-%d"),
-                        "exit_price": round(t3_exit_price, 2),
-                        "exit_reason": "Larsson Exit" if not t3_stopped else "Stop Loss Hit",
-                        "stopped_out": bool(t3_stopped),
-                        "hold_days": int(t3_exit_bar - reentry_bar_3),
-                        "return_pct": round(t3_ret, 1),
-                        "r_mult": round(t3_r, 2),
-                        "combined_net_r": round(t1_r + t2_r + t3_r, 2)
-                    }
+                if 0.1 <= t3_risk_pct <= 35.0:
+                    re3_ml_vetoed = False
+                    prob_reentry3 = None
+                    if use_multileg_ml:
+                        try:
+                            re3_feats = engine.compute_rolling_features(sym, pos, pos + reentry_bar_3)
+                            if re3_feats is not None:
+                                re3_preds = engine.predict_rolling(re3_feats)
+                                prob_reentry3 = float(re3_preds.get("prob_reentry", 0.0))
+                                if prob_reentry3 < 0.35:
+                                    re3_ml_vetoed = True
+                        except Exception:
+                            pass
+
+                    if re3_ml_vetoed:
+                        trade_3 = {
+                            "has_reentry": False,
+                            "ml_vetoed": True,
+                            "prob_reentry": round(prob_reentry3, 3) if prob_reentry3 is not None else 0.0,
+                            "veto_reason": f"Vetoed by Cost-Sensitive ML Re-Entry Model ({prob_reentry3*100:.1f}% < 35.0% threshold)"
+                        }
+                    else:
+                        t3_stopped = False; t3_exit_bar = None; t3_exit_price = None
+                        for b in range(reentry_bar_3 + 1, len(fwd)):
+                            c = float(fwd["close"].iloc[b]); l = float(fwd["low"].iloc[b]); s = fwd["ribbon_state"].iloc[b]
+                            if l <= swing5_3:
+                                t3_stopped = True; t3_exit_bar = b; t3_exit_price = swing5_3; break
+                            if pd.notna(s) and s in ["blue", "gray"]:
+                                t3_exit_bar = b; t3_exit_price = c; break
+                        if t3_exit_bar is None:
+                            t3_exit_bar = len(fwd) - 1; t3_exit_price = float(fwd["close"].iloc[-1])
+                        t3_ret = (t3_exit_price / t3_entry - 1.0) * 100.0 if not t3_stopped else -t3_risk_pct
+                        t3_r = t3_ret / t3_risk_pct if t3_risk_pct > 0 else 0.0
+                        trade_3 = {
+                            "has_reentry": True,
+                            "entry_date": fwd.index[reentry_bar_3].strftime("%Y-%m-%d"),
+                            "entry_price": round(t3_entry, 2),
+                            "stop_price": round(swing5_3, 2),
+                            "risk_pct": round(t3_risk_pct, 1),
+                            "cons_days": int(cons_days_3),
+                            "drop_from_peak": round(drop_3, 1),
+                            "exit_date": fwd.index[t3_exit_bar].strftime("%Y-%m-%d"),
+                            "exit_price": round(t3_exit_price, 2),
+                            "exit_reason": "Larsson Exit" if not t3_stopped else "Stop Loss Hit",
+                            "stopped_out": bool(t3_stopped),
+                            "hold_days": int(t3_exit_bar - reentry_bar_3),
+                            "return_pct": round(t3_ret, 1),
+                            "r_mult": round(t3_r, 2),
+                            "combined_net_r": round(t1_r + t2_r + t3_r, 2),
+                            "prob_reentry": round(prob_reentry3, 3) if prob_reentry3 is not None else None
+                        }
 
     
     ai_scores = {}
@@ -2348,7 +2958,13 @@ def api_chart():
             return None
         return obj
 
-    dossier = compute_dossier(sym, date_str, d, pos, ev_row_dict)
+    use_trade1 = request.args.get("use_trade1", "1") in ["1", "true", "True"]
+    use_ml_targets = request.args.get("use_ml_targets", "1") in ["1", "true", "True"]
+    use_ml_stop = request.args.get("use_ml_stop", "1") in ["1", "true", "True"]
+    use_multileg = request.args.get("use_multileg", "1") in ["1", "true", "True"]
+    use_multileg_ml = request.args.get("use_multileg_ml", "1") in ["1", "true", "True"]
+
+    dossier = compute_dossier(sym, date_str, d, pos, ev_row_dict, use_ml_targets, use_ml_stop, use_multileg, use_multileg_ml, use_trade1)
 
     res = {
         "symbol": sym,

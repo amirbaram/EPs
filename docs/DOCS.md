@@ -798,3 +798,47 @@ Empirical testing comparing 1-Day, 2-Day, and 1-Week Larsson Line exits across s
 ### 11.4 Strategy PDF Documentation
 Full visual handbook with high-resolution charts of OKLO, SEDG, and the progressive equity curve is available in `docs/EP_Pinnacle_Elite_Strategy_Handbook.pdf`.
 
+### 11.5 Intermediate Continuation EMA Ribbon (Trade 2 & 3 Second-Leg Compounder)
+To solve the "trend resumption after pullback" challenge without subjective discretion or lookahead bias, an exhaustive 10-year parameter sweep across 18 EMA ribbon combinations was conducted across 6,501 historical EP events (2016–2026).
+
+#### Sweep Results & Winning Configurations:
+1. **Ribbon (8, 12, 16, 21) — #1 in Total Net Profit (Primary Default):**
+   - **Total Net R:** **+2,917.2 R** across 8,061 simulated trades
+   - **Profit Factor:** **1.65**
+   - **Expectancy (EV):** **+0.362 R per trade**
+   - **Win Rate:** **32.8%** with multi-bagger right-tail compounding
+   - **Role:** Fast, responsive intermediate trend alignment that captures early second-leg explosive moves.
+
+2. **Ribbon (10, 15, 20, 30) — #1 in Expectancy:**
+   - **Total Net R:** **+2,624.8 R** across 6,626 trades
+   - **Profit Factor:** **1.65**
+   - **Expectancy (EV):** **+0.396 R per trade**
+   - **Win Rate:** **34.1%**
+   - **Role:** Smoother trend envelope with fewer whipsaws; available via interactive dropdown in `serve_ep.py` and `/api/chart`.
+
+#### Execution Rules (Strict Zero Lookahead):
+- **Trigger:** Bullish ribbon alignment (EMA1 >= EMA2 >= EMA3 >= EMA4), transitioning from Gray or Blue to Yellow (`yellow_flip`).
+- **Entry Timing:** Strictly executed at **`next_open`** (Open price of signal bar + 1). No intraday bar-close lookahead.
+- **Stop Loss:** Pegged at the **5-day swing low** prior to the signal bar.
+- **Realistic Gap-Down Fill:** If the entry bar opens below the stop price, the fill occurs at **`open`** (not theoretical stop price), preventing fictitious slip-free fills.
+- **Day 1 Stop Loss Protection:** If the entry bar's low violates the stop price intraday on Day 1, the position is stopped out immediately on Day 1.
+- **Exit Condition:** Held continuously as long as the ribbon stays Yellow or Gray (compression), and exits on the first reverse flip to Bearish Blue (`blue_flip`) or stop loss violation.
+
+### 11.6 Dual-Track Continuation Architecture (Post-Trade 1 Failure Recovery)
+To capture the large universe of institutional runners that experience an engineered stop-hunt or multi-week base digestion after Day 1, continuation setups are resolved into two distinct execution tracks:
+
+#### Track 1: Institutional Undercut & Reclaim (U&R)
+- **Problem Solved:** Catches fast bear-trap shakeouts where Trade 1 is stopped out in the first 1–10 sessions, but institutional accumulation immediately absorbs the float.
+- **Controlled Undercut Guard:** The shakeout low must remain within 15% of Day 1 Low (`shakeout_low >= d1_low * 0.85`), automatically rejecting structural crashes.
+- **Trigger:** A session closing back **ABOVE Day 1 Low** within 15 sessions of the initial stop-out.
+- **Stop Loss:** Pegged at the absolute **shakeout swing low** (delivering tight 3.5%–5.5% risk).
+- **Empirical Edge:** Captured **+328.3 R net profit** across 1,169 failed-breach recoveries with a 29.2% win rate and 1.44 Profit Factor, capturing monster multi-baggers like `BE` (+1,123.5%), `NVAX` (+673.1%), and `AMPX` (+320.5%).
+
+#### Track 2: Corrected Dynamic Base Breakout (Intermediate Ribbon 8, 12, 16, 21)
+- **Dynamic Anchor Reset:** Solves the historical anchor bug by resetting `cons_low` dynamically whenever a new swing peak is formed. Drawdown depth is strictly measured from the *active* consolidation peak, not an old low from weeks prior.
+- **Persistent Yellow Power Continuation:** Eliminates the "must turn blue first" catch-22. If a leader pulls back >= 5% from its peak while the ribbon stays yellow (due to overwhelming institutional demand), re-entry triggers when price breaks above its 5-day high or reclaims 8 EMA.
+- **Extended Base Search Window:** Allows up to **65 trading sessions** (13 weeks) of base building as long as price holds above its rising 50 SMA.
+- **Empirical Edge:** Captured **396 delayed stage-2 base breakouts** on failed-breach setups (+45.4 R net) and **5,545 continuation trades across the full universe**, while reducing portfolio maximum drawdown by **+37.14 R** (-195.5 R down to -158.3 R).
+
+
+

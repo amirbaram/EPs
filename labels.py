@@ -87,12 +87,12 @@ def themes(sym: str) -> list[str]:
 
 def tickers_in_theme(theme: str) -> set[str]:
     load()
-    return set(_SYMS_BY_THEME.get(theme, set()))
+    return set((_SYMS_BY_THEME or {}).get(theme, set()))
 
 
 def all_themes() -> list[str]:
     load()
-    return sorted(_SYMS_BY_THEME)
+    return sorted(_SYMS_BY_THEME or {})
 
 
 # proxy ETF per theme (first entry of build_labels.THEME_ETFS) — chartable stand-in for the

@@ -1,553 +1,4 @@
-"""EP Live Tracker & Follow-Through Monitor (Port 8783).
-
-Tracks current-market episodic pivots across their confirmation lifecycle:
-- Today's Fresh EPs (Day 1 Ignition)
-- Past Week EPs (Follow-Through Pipeline across 4 Confirmation Windows)
-- Active PEAD Runners (Holding Day 1 Stop Loss)
-- Emerging Sectors & Themes Momentum Radar (Dynamic 4-TF composite + 10-Yr EP Edge)
-- Actionable Trade Management & Position Sizing Guidance (Progressive Exposure)
-- Interactive Lightweight Chart with Entry, Stop, and Add Trigger lines
-
-Run: .venv/bin/python serve_ep_tracker.py --port 8783
-"""
-from __future__ import annotations
-
-import argparse
-import datetime as dt
-import json
-import os
-from pathlib import Path
-
-import numpy as np
-import pandas as pd
-from flask import Flask, jsonify, request, Response
-
-import datastore
-import indicators
-import labels
-import scanner_core
-import setups
-import universe
-import thematic_engine
-import ep_portfolio_manager as pm
-import ep_premarket
-
-app = Flask(__name__)
-
-CACHE_PATH = Path("data/cache/tracker_eps.json")
-CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-CATALYST_PATH = Path("data/ep_catalysts.json")
-FILINGS_CACHE_PATH = Path("data/cache/ep_sec_filings.json")
-
-def load_ep_catalysts() -> dict:
-    if CATALYST_PATH.exists():
-        try:
-            with open(CATALYST_PATH, "r") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {}
-
-def load_sec_filings() -> dict:
-    if FILINGS_CACHE_PATH.exists():
-        try:
-            with open(FILINGS_CACHE_PATH, "r") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {}
-
-TOP_SECTORS = [
-    "Computer Hardware", "Biotechnology", "Healthcare", "Technology", "Semiconductors",
-    "Industrials", "Capital Markets", "Financial Services", "Specialty Industrial Machinery"
-]
-TOP_THEMES = [
-    "Semiconductors", "Biotechnology", "Software - Infrastructure", "Computer Hardware",
-    "Bitcoin Miners", "Quantum Computing", "Uranium & Nuclear", "Artificial Intelligence",
-    "Communication Equipment", "Solar", "Technology"
-]
-
-TRACKER_DATA = []
-
-def scan_recent_eps(days_back: int = 14) -> list[dict]:
-    """Scans the active universe for qualifying Pinnacle Elite EPs within the last N sessions."""
-    symbols = list(universe.active_symbols())
-    results = []
-    engine = thematic_engine.get_thematic_engine()
-    
-    # Load universe metadata for market cap ($B)
-    mcap_map = {}
-    try:
-        uni_df = pd.read_csv("data/universe_active.csv").set_index("yf_symbol")
-        if "mcap_m" in uni_df.columns:
-            mcap_map = (uni_df["mcap_m"] / 1000.0).dropna().to_dict()
-    except Exception:
-        pass
-    
-    print(f"Scanning {len(symbols)} active universe symbols for recent Pinnacle EPs...")
-    for sym in symbols:
-        raw = datastore.load_bars(sym)
-        if raw is None or len(raw) < 50:
-            continue
-        d = indicators.add_indicators(raw)
-        d = scanner_core.calc_larssson_line(d)
-        if d is None or len(d) < 30:
-            continue
-        n = len(d)
-        
-        # Precompute 60-day dollar volume median once per symbol
-        med60 = (d["close"] * d["volume"]).rolling(60, min_periods=10).median().shift(1)
-        
-        # Scan window
-        scan_len = min(days_back, n - 30)
-        for i in range(n - scan_len, n):
-            row = d.iloc[i]
-            ev_dt = d.index[i].strftime("%Y-%m-%d")
-            m60_val = med60.iloc[i] if pd.notna(med60.iloc[i]) else None
-            
-            gap = round(float(row["gap_pct"]), 1) if pd.notna(row["gap_pct"]) else 0.0
-            rvol = round(float(row["rvol"]), 1) if pd.notna(row["rvol"]) else 0.0
-            c_pos = round((float(row["close"]) - float(row["low"])) / max(0.001, float(row["high"]) - float(row["low"])), 2)
-            dvol_m = round(float(row["close"]) * float(row["volume"]) / 1e6, 1)
-            vol_shares = float(row["volume"])
-            
-            sub = setups._is_ep_event(row, m60_val)
-            
-            # Baseline eligibility for classical EP (requires c_pos >= 0.65)
-            is_classical_ep = bool(sub) and ((gap >= 5.0 or (sub == "ep9m" and dvol_m >= 50.0)) and rvol >= 2.5 and c_pos >= 0.65 and dvol_m >= 15.0)
-            
-            # Pradeep Bonde Delayed Reaction EP (DRE):
-            # Day 1 had high catalyst energy (Gap >= 5.0% or 9M volume) and RVOL >= 2.5x, $Vol >= $15M,
-            # but closed weak (c_pos < 0.65 or red close). Forward bars must hold Day 1 Low!
-            fwd = d.iloc[i:]
-            bars_since = len(fwd) - 1
-            held_d1_low = float(fwd["low"].min()) >= float(row["low"])
-            is_dre = (not is_classical_ep) and (gap >= 5.0 or vol_shares >= 9_000_000) and rvol >= 2.5 and dvol_m >= 15.0 and (c_pos < 0.65) and held_d1_low
-            
-            if not (is_classical_ep or is_dre):
-                continue
-            
-            if is_dre and not sub:
-                sub = "dre"
-            
-            # Novel 9M Volume check: first time volume >= 9M in prior 60 sessions
-            is_novel_9m = False
-            if vol_shares >= 9_000_000:
-                prior_60 = d.iloc[max(0, i - 60):i]
-                if len(prior_60) > 0 and (prior_60["volume"] < 9_000_000).all():
-                    is_novel_9m = True
-
-            # Market cap in $B
-            mcap_b = round(mcap_map.get(sym, 0.0), 2)
-            is_cap10 = (0.0 < mcap_b <= 10.0)
-            
-            # Lazy thematic evaluation for confirmed EP candidates
-            thm_eval = engine.evaluate_symbol(sym)
-            theme_score = float(thm_eval.get("composite_score", 50.0))
-            archetype = str(thm_eval.get("primary_archetype", "Neutral Flow"))
-            is_veto = bool(thm_eval.get("is_veto", False))
-            theme_badge = str(thm_eval.get("badge_type", "neutral"))
-            sec_name = str(thm_eval.get("sector", "Unknown"))
-            thm_name = str(thm_eval.get("theme", "General"))
-            is_tailwind = (theme_score >= 65.0) and not is_veto
-
-            sec_info = thm_eval.get("sector_info", {})
-            thm_info = thm_eval.get("theme_info", {})
-            sec_pctiles = {"1w": sec_info.get("w1_pct", 50), "1m": sec_info.get("m1_pct", 50), "3m": sec_info.get("m3_pct", 50), "ytd": sec_info.get("ytd_pct", 50)}
-            thm_pctiles = {"1w": thm_info.get("w1_pct", 50), "1m": thm_info.get("m1_pct", 50), "3m": thm_info.get("m3_pct", 50), "ytd": thm_info.get("ytd_pct", 50)}
-
-            if is_veto:
-                diagnosis = f"Severe Headwind: {thm_name} is in bottom 35th percentile. Historical trap rate is 37.5%."
-            elif is_tailwind:
-                diagnosis = f"Institutional Tailwind: {thm_name} exhibits top-tier momentum ({archetype}, Score: {theme_score}/100)."
-            else:
-                diagnosis = f"Neutral market-in-line momentum flow ({thm_name}). Standard baseline expectancy."
-            
-            # Follow-through tracking
-            curr_bar = fwd.iloc[-1]
-            curr_px = float(curr_bar["close"])
-            d1_close = float(row["close"])
-            d1_low = float(row["low"])
-            d1_high = float(row["high"])
-            d1_open = float(row["open"])
-            
-            ret_pct = round((curr_px / d1_close - 1.0) * 100.0, 1)
-            risk_pct = round((d1_close - d1_low) / d1_close * 100.0, 1)
-            curr_r = round(ret_pct / risk_pct, 2) if risk_pct > 0 else 0.0
-            
-            # 48h absorption gate: evaluated at end of 48-hour window (Day 3 close) or current price
-            d1_body = d1_close - d1_open
-            half_body = d1_close - 0.5 * max(0.01, d1_body)
-            
-            if bars_since >= 2:
-                d3_close = float(fwd.iloc[2]["close"])
-                held_48h = (d3_close >= half_body) or (curr_px >= d1_close)
-            elif bars_since == 1:
-                held_48h = (float(fwd.iloc[1]["close"]) >= half_body) or (curr_px >= d1_close)
-            else:
-                held_48h = True
-            
-            d2_add = float(fwd.iloc[1]["high"]) > d1_high if bars_since >= 1 else False
-            
-            # Determine lifecycle status & suggested trade action
-            if not held_d1_low:
-                status = "Stopped Out / Invalidation"
-                stage_badge = "badge-stopped"
-                action_headline = "DEFENSIVE STOP TRIGGERED"
-                action_plan = f"Price breached Day 1 low stop (${d1_low:.2f}). Position closed for strict risk control (-1.0 R). Add ticker to watchlist for Trade 2 Yellow Re-Entry."
-            elif is_dre:
-                dre_risk_pct = round((d1_high - d1_low) / d1_high * 100.0, 1)
-                if curr_px >= d1_high:
-                    status = "Delayed Reaction Breakout (DRE)"
-                    stage_badge = "badge-dre-triggered"
-                    action_headline = "⚡ DRE TRIGGER CONFIRMED: BREAKOUT ABOVE DAY 1 HIGH"
-                    action_plan = f"Broke above Day 1 High (${d1_high:.2f}) after messy Day 1 digestion! Bonde Delayed Reaction Entry confirmed.\n• Stop Loss: Day 1 Low (${d1_low:.2f}) or recent tight shelf (${float(fwd['low'].min()):.2f}).\n• Quantitative Edge: 10-year verified real-bar backtest delivers +0.86 R (Day 2) to +0.71 R (Day 3) EV, 2.20 PF, 7.4% stop distance, avoiding 62% of toxic fade traps."
-                else:
-                    status = "Delayed Reaction Watchlist (DRE)"
-                    stage_badge = "badge-dre-watch"
-                    action_headline = "⚡ DRE WATCH: DIGESTING ABOVE DAY 1 LOW"
-                    action_plan = f"Stock had massive volume/gap on Day 1 but closed weak (ClosePos {c_pos:.2f}). Holding Day 1 Low (${d1_low:.2f}).\n• Action: Place stop-buy order at ${d1_high:.2f} (Day 1 High).\n• Risk: Hard stop at ${d1_low:.2f} (-{dre_risk_pct:.1f}% risk). Wait for breakout trigger."
-            elif curr_px >= d1_high:
-                if bars_since == 1:
-                    status = "Day 2 Follow-Through (+Add Active)"
-                    stage_badge = "badge-add"
-                    action_headline = "SECONDARY ADD CONFIRMED"
-                    action_plan = f"Crossed Day 1 High (${d1_high:.2f}). Secondary add triggered! Scale position to 1.5x heat. Keep stop locked at Day 1 Low (${d1_low:.2f})."
-                else:
-                    status = f"PEAD Trend Active (Day {bars_since + 1})"
-                    stage_badge = "badge-runner"
-                    action_headline = "BREAKOUT AT NEW HIGHS — PEAD RUNNER"
-                    action_plan = f"Trading above Day 1 High (${d1_high:.2f}) at ${curr_px:.2f} (+{curr_r:.2f} R). Base + Secondary Add in profit. Trail stop along 20 EMA."
-            elif bars_since >= 2 and not held_48h and curr_px < d1_close:
-                status = "48H Absorption Violated"
-                stage_badge = "badge-violated"
-                action_headline = "HIGH RISK OF TRAP — DEFENSE ACTIVE"
-                action_plan = f"Failed to hold upper 50% body on Day 3 (${half_body:.2f}). Cancel secondary adds. Keep hard stop at ${d1_low:.2f}. Prepare to take scratch/breakeven."
-            elif bars_since == 0:
-                status = "Day 1 Ignition (Fresh Today)"
-                stage_badge = "badge-fresh"
-                action_headline = "ACTIVE DAY 1 BUY SIGNAL"
-                action_plan = f"Enter on close or Day 2 open. Hard Stop: ${d1_low:.2f} (-{risk_pct:.1f}% risk). Secondary Add: Prepare to add 50% if price crosses ${d1_high:.2f}."
-            elif bars_since == 1:
-                if d2_add:
-                    status = "Day 2 Follow-Through (+Add Active)"
-                    stage_badge = "badge-add"
-                    action_headline = "SECONDARY ADD CONFIRMED"
-                    action_plan = f"Crossed Day 1 High (${d1_high:.2f}). Secondary add triggered! Scale position to 1.5x heat. Keep stop locked at Day 1 Low (${d1_low:.2f})."
-                else:
-                    status = "Day 2 Inside Range (Digesting)"
-                    stage_badge = "badge-digest"
-                    action_headline = "HOLDING DAY 1 POSITION"
-                    action_plan = f"Price digesting inside Day 1 range. Hold base position with stop at ${d1_low:.2f}. Add arms if price breaks above ${d1_high:.2f}."
-            elif bars_since in [2, 3]:
-                status = "48H Body Absorbed (Strong Support)"
-                stage_badge = "badge-absorbed"
-                action_headline = "48H GATE CONFIRMED — HOLD FOR PEAD"
-                action_plan = f"Held upper 50% body through Day 3 (${half_body:.2f}). Institutional absorption confirmed. Hold for multi-quarter PEAD drift. Trail out on first Larsson Blue Flip."
-            elif curr_px >= d1_close:
-                status = f"PEAD Trend Active (Day {bars_since + 1})"
-                stage_badge = "badge-runner"
-                action_headline = "PEAD RUNNER IN PROGRESS"
-                action_plan = f"Holding in profit (+{curr_r:.2f} R). Trail stop along dynamic 20 EMA / swing lows. Exit on first daily Larsson Line Blue Flip."
-            else:
-                status = f"Consolidating Above Stop (Day {bars_since + 1})"
-                stage_badge = "badge-digest"
-                action_headline = "BASE CONSOLIDATION ACTIVE"
-                action_plan = f"Testing post-breakout base ({curr_r:.2f} R). Hard stop intact at ${d1_low:.2f}. Watch for 20 EMA support and secondary pivot."
-
-            # 50-Day SMA Institutional Baseline
-            sma50_val = float(d["sma50"].iloc[-1]) if "sma50" in d.columns and pd.notna(d["sma50"].iloc[-1]) else None
-            above_sma50 = bool(curr_px >= sma50_val) if sma50_val is not None else True
-
-            # Prior 60-bar drift before EP for Turnaround classification
-            prior_close_pct = 0.0
-            if i >= 60:
-                prior_px = float(d["close"].iloc[i-60])
-                ep_base_px = float(d["close"].iloc[i-1]) if i > 0 else prior_px
-                prior_close_pct = (ep_base_px / prior_px - 1.0) * 100.0 if prior_px > 0 else 0.0
-
-            # The 6 Institutional Trader Archetypes (+ Idiosyncratic Alpha + DRE + Headwind):
-            is_idiosyncratic = bool(is_veto and (rvol >= 6.0 and dvol_m >= 75.0 and c_pos >= 0.80 and held_48h))
-            is_severe_headwind = bool(is_veto and not is_idiosyncratic)
-            is_pinnacle_elite = bool(is_classical_ep and held_48h and c_pos >= 0.65 and rvol >= 2.5 and dvol_m >= 15.0 and is_tailwind and above_sma50)
-            is_compounder = bool((is_cap10 or thm_name in ["Semiconductors", "Artificial Intelligence", "Biotechnology", "Computer Hardware", "Uranium & Nuclear", "Quantum Computing", "Software - Infrastructure"]) and held_48h and above_sma50)
-            is_sweet_spot = bool(rvol >= 4.5 and gap >= 6.0 and c_pos >= 0.65 and held_48h)
-            is_emerging_leader = bool((sec_pctiles.get("1m", 50) >= 65 or thm_pctiles.get("1m", 50) >= 65 or theme_score >= 65) and rvol >= 2.5 and held_48h)
-            is_turnaround = bool((prior_close_pct <= -15.0 or not above_sma50) and rvol >= 3.5 and c_pos >= 0.70)
-            is_high_beta = bool(thm_name in ["Bitcoin Miners", "Quantum Computing", "Solar", "Communication Equipment"] or (gap >= 12.0 and rvol >= 3.5))
-
-            if is_idiosyncratic:
-                trader_archetype = "🎯 Idiosyncratic Alpha"
-                archetype_key = "idiosyncratic"
-                archetype_badge = "chip-tailwind"
-                archetype_sizing = "0.50 R (Strict Half-Heat)"
-                archetype_plan_note = "Blowout catalyst turnover overrides sector lag. Max heat 0.50R, Day 2 breakout adds prohibited. Stop locked at Day 1 Low."
-            elif is_severe_headwind:
-                trader_archetype = "🚫 Severe Headwind (Trap Avoid)"
-                archetype_key = "headwind"
-                archetype_badge = "chip-veto"
-                archetype_sizing = "0.0 R (DO NOT TRADE / AVOID)"
-                archetype_plan_note = "Bottom 35th percentile sector headwind. 37.5% empirical trap rate. Institutions use gap liquidity to sell. Preserve capital."
-            elif is_dre:
-                trader_archetype = "⚡ Delayed Reaction (DRE)"
-                archetype_key = "dre"
-                archetype_badge = "chip-gold"
-                archetype_sizing = "1.0 R on D1 High Breakout"
-                archetype_plan_note = "Pradeep Bonde DRE. Messy Day 1 close digested; enter on breakout above Day 1 High stop-buy. Stop at Day 1 Low."
-            elif is_pinnacle_elite:
-                trader_archetype = "💎 Pinnacle Elite"
-                archetype_key = "pinnacle"
-                archetype_badge = "chip-tailwind"
-                archetype_sizing = "1.0 R Initial → 1.5 R on Day 5 Add"
-                archetype_plan_note = "Apex Institutional Quality. 35.2% Win Rate, +0.74R Baseline EV (+0.90R Pyramiding), PF 2.15. Zero-lookahead audited edge."
-            elif is_compounder:
-                trader_archetype = "🚀 Multi-Quarter Compounder"
-                archetype_key = "compounder"
-                archetype_badge = "chip-tailwind"
-                archetype_sizing = "1.0 R to 1.25 R"
-                archetype_plan_note = "Secular institutional accumulation. Trail exclusively with 50 SMA baseline. Disable early climax exits."
-            elif is_sweet_spot:
-                trader_archetype = "⭐ Institutional Sweet Spot"
-                archetype_key = "sweet"
-                archetype_badge = "chip-gold"
-                archetype_sizing = "1.25 R to 1.50 R (Size Boost)"
-                archetype_plan_note = "RVOL sweet spot (≥5x) cuts max drawdown in half (-6.0R) and accelerates EV to +1.68R+."
-            elif is_emerging_leader:
-                trader_archetype = "🌟 Emerging Leader"
-                archetype_key = "emerging"
-                archetype_badge = "chip-purple"
-                archetype_sizing = "1.0 R (Velocity Runner)"
-                archetype_plan_note = "Top 35% relative group momentum. Fast velocity; lock breakeven at +2.0R, scale 1/3 into climax."
-            elif is_turnaround:
-                trader_archetype = "🔄 Neglected Turnaround"
-                archetype_key = "turnaround"
-                archetype_badge = "chip-red"
-                archetype_sizing = "0.50 R to 0.75 R"
-                archetype_plan_note = "Deep value accumulation off lows. Trapped overhead supply exists; take 50% profit at +3.0R resistance."
-            elif is_high_beta:
-                trader_archetype = "⚡ High-Beta Momentum"
-                archetype_key = "high_beta"
-                archetype_badge = "chip-cyan"
-                archetype_sizing = "0.50 R (High Volatility)"
-                archetype_plan_note = "High volatility runner. Use tight trailing stop (10 EMA or ML MAE). Never let +2.0R turn into a loss."
-            else:
-                trader_archetype = "📊 Quality Swing Runner"
-                archetype_key = "swing"
-                archetype_badge = "chip-neutral"
-                archetype_sizing = "1.0 R Baseline"
-                archetype_plan_note = "Standard EP baseline. Respect Day 1 low stop loss and trail along 20 EMA."
-
-            # Archetype guidance injection into action plan
-            archetype_header = f"【ARCHETYPE: {trader_archetype.upper()}】\n• Suggested Sizing: {archetype_sizing}\n• Playbook Mandate: {archetype_plan_note}\n\n"
-            action_plan = archetype_header + action_plan
-
-            if is_idiosyncratic:
-                is_veto = False
-                theme_badge = "idiosyncratic"
-                action_headline = f"🎯 IDIOSYNCRATIC ALPHA: {action_headline}"
-            elif is_severe_headwind:
-                action_headline = f"⚠️ SEVERE HEADWIND: AVOID / PRESERVE CAPITAL"
-            elif is_tailwind:
-                action_headline = f"🚀 TAILWIND ACTIVE: {action_headline}"
-
-            # 50 SMA baseline notes
-            if sma50_val is not None:
-                if above_sma50:
-                    action_plan += f"\n\n🏛️ 50-DAY SMA BASELINE: Price is holding above institutional baseline (${sma50_val:.2f}). 10-year data shows 74.1% win rate and 23.28 PF when holding 50 SMA."
-                else:
-                    action_plan += f"\n\n⚠️ BELOW 50-DAY SMA BASELINE: Price breached baseline (${sma50_val:.2f}). Trapped overhead supply active; tighten trailing stop."
-
-            if rvol >= 5.0:
-                action_plan += f"\n\n🔥 SWEET SPOT VOLUME ACCELERATION: RVOL {rvol:.1f}x meets institutional sweet spot. Empirical drawdown is cut in half (-6.0 R). Sizing: Eligible for 1.25 R to 1.50 R heat."
-
-            if is_novel_9m:
-                action_plan += f"\n\n🔥 NOVEL 9M VOLUME DETECTED: First 9M+ share day in >60 sessions. 10-year study delivers +1.92 R EV (+102% edge boost)."
-
-            # Trade 2 & 3 Yellow Re-Entry evaluation
-            t2_has_reentry = False
-            t2_in_pullback = False
-            t2_ml_vetoed = False
-            t2_prob_reentry = None
-            t2_cons_days = 0
-            t2_drop_from_peak = 0.0
-            t2_entry_date = None
-            t2_entry_price = None
-            t2_stop_price = None
-            t2_risk_pct = None
-            t2_curr_r = None
-            t2_status_desc = "No Re-Entry Active"
-
-            # Intermediate ribbon (8, 12, 16, 21) for continuation setup detection
-            e8 = fwd["close"].ewm(span=8, adjust=False).mean()
-            e12 = fwd["close"].ewm(span=12, adjust=False).mean()
-            e16 = fwd["close"].ewm(span=16, adjust=False).mean()
-            e21 = fwd["close"].ewm(span=21, adjust=False).mean()
-            ribbon_bullish = (e8 >= e12) & (e12 >= e16) & (e16 >= e21)
-            ribbon_bearish = (e8 < e12) & (e12 < e16) & (e16 < e21)
-            ribbon_state = pd.Series("gray", index=fwd.index)
-            ribbon_state.loc[ribbon_bullish] = "yellow"
-            ribbon_state.loc[ribbon_bearish] = "blue"
-            fwd["ribbon_state"] = ribbon_state
-
-            t1_peak = float(fwd["high"].max())
-            seen_cons = False
-            cons_days = 0
-            reentry_bar = None
-            cons_low = float(fwd["low"].iloc[0])
-
-            for b in range(1, len(fwd)):
-                l_b = float(fwd["low"].iloc[b])
-                s_b = fwd["ribbon_state"].iloc[b]
-                if l_b < cons_low:
-                    cons_low = l_b
-                if pd.notna(s_b) and s_b in ["blue", "gray"]:
-                    seen_cons = True
-                    cons_days += 1
-                if seen_cons and pd.notna(s_b) and s_b == "yellow" and reentry_bar is None:
-                    reentry_bar = b
-                    break
-
-            if reentry_bar is not None and cons_days <= 45:
-                drop_from_peak = round((t1_peak - cons_low) / t1_peak * 100.0, 1) if t1_peak > 0 else 0.0
-                if drop_from_peak <= 55.0:
-                    t2_has_reentry = True
-                    t2_entry_date = fwd.index[reentry_bar].strftime("%Y-%m-%d")
-                    t2_entry_price = round(float(fwd["close"].iloc[reentry_bar]), 2)
-                    swing5_low = round(float(fwd["low"].iloc[max(0, reentry_bar - 5):reentry_bar + 1].min()), 2)
-                    t2_stop_price = swing5_low
-                    t2_risk_pct = round((t2_entry_price - t2_stop_price) / t2_entry_price * 100.0, 1) if t2_entry_price > 0 else 5.0
-                    t2_cons_days = cons_days
-                    t2_drop_from_peak = drop_from_peak
-                    if t2_risk_pct > 0:
-                        t2_curr_r = round((curr_px - t2_entry_price) / (t2_entry_price - t2_stop_price), 2)
-                    
-                    try:
-                        from ep_ml_engine import engine as ml_engine
-                        re_feats = ml_engine.compute_rolling_features(sym, i, i + reentry_bar)
-                        if re_feats is not None:
-                            re_preds = ml_engine.predict_rolling(re_feats)
-                            t2_prob_reentry = round(float(re_preds.get("prob_reentry", 0.0)), 3)
-                            if t2_prob_reentry < 0.35:
-                                t2_ml_vetoed = True
-                    except Exception:
-                        pass
-
-                    if t2_ml_vetoed:
-                        t2_status_desc = f"ML Vetoed ({t2_prob_reentry*100:.1f}% < 35% threshold)"
-                    else:
-                        t2_status_desc = f"Active Trade 2 (+{t2_curr_r:.2f} R)"
-            elif seen_cons and reentry_bar is None:
-                drop_from_peak = round((t1_peak - cons_low) / t1_peak * 100.0, 1) if t1_peak > 0 else 0.0
-                swing5_low = round(float(fwd["low"].iloc[max(0, len(fwd) - 5):].min()), 2)
-                t2_in_pullback = True
-                t2_cons_days = cons_days
-                t2_drop_from_peak = drop_from_peak
-                t2_stop_price = swing5_low
-                t2_status_desc = f"Pullback in Progress (Day {cons_days}, Retraced {drop_from_peak}%, Shelf ${swing5_low:.2f})"
-
-            t2_info = {
-                "has_reentry": t2_has_reentry,
-                "in_pullback": t2_in_pullback,
-                "ml_vetoed": t2_ml_vetoed,
-                "prob_reentry": t2_prob_reentry,
-                "cons_days": t2_cons_days,
-                "drop_from_peak": t2_drop_from_peak,
-                "entry_date": t2_entry_date,
-                "entry_price": t2_entry_price,
-                "stop_price": t2_stop_price,
-                "risk_pct": t2_risk_pct,
-                "curr_r": t2_curr_r,
-                "status_desc": t2_status_desc
-            }
-
-            results.append({
-                "symbol": sym,
-                "event_date": ev_dt,
-                "subtype": sub,
-                "gap_pct": gap,
-                "rvol": rvol,
-                "close_pos": c_pos,
-                "dvol_m": dvol_m,
-                "entry_price": d1_close,
-                "stop_price": d1_low,
-                "add_price": d1_high,
-                "curr_price": curr_px,
-                "risk_pct": risk_pct,
-                "ret_pct": ret_pct,
-                "curr_r": curr_r,
-                "bars_since": bars_since,
-                "status": status,
-                "stage_badge": stage_badge,
-                "action_headline": action_headline,
-                "action_plan": action_plan,
-                "held_d1_low": held_d1_low,
-                "held_48h": held_48h,
-                "d2_add": d2_add,
-                "is_dre": is_dre,
-                "is_novel_9m": is_novel_9m,
-                "mcap_b": mcap_b,
-                "is_cap10": is_cap10,
-                "sector": sec_name,
-                "theme": thm_name,
-                "theme_score": theme_score,
-                "theme_archetype": archetype,
-                "theme_badge": theme_badge,
-                "trader_archetype": trader_archetype,
-                "archetype_key": archetype_key,
-                "archetype_badge": archetype_badge,
-                "archetype_sizing": archetype_sizing,
-                "archetype_plan_note": archetype_plan_note,
-                "t2_info": t2_info,
-                "is_thematic_veto": is_veto,
-                "is_thematic_tailwind": is_tailwind,
-                "is_idiosyncratic": is_idiosyncratic,
-                "above_sma50": above_sma50,
-                "sma50_val": round(sma50_val, 2) if sma50_val is not None else None,
-                "theme_diagnosis": diagnosis,
-                "sec_pctiles": sec_pctiles,
-                "thm_pctiles": thm_pctiles
-            })
-            
-    # Sort descending by event date, then dollar volume
-    results.sort(key=lambda x: (x["event_date"], x["dvol_m"]), reverse=True)
-    print(f"Scan complete. Found {len(results)} Pinnacle EPs.")
-    return results
-
-def get_tracker_data(force_rescan: bool = False):
-    global TRACKER_DATA
-    if force_rescan or not TRACKER_DATA:
-        if CACHE_PATH.exists() and not force_rescan:
-            try:
-                with open(CACHE_PATH, "r") as f:
-                    TRACKER_DATA = json.load(f)
-                if TRACKER_DATA and ("trader_archetype" not in TRACKER_DATA[0] or "t2_info" not in TRACKER_DATA[0]):
-                    print("Cache missing trader_archetype or t2_info - forcing auto-rescan...")
-                    TRACKER_DATA = []
-                else:
-                    print(f"Loaded {len(TRACKER_DATA)} cached tracker events.")
-            except Exception as e:
-                print(f"Failed to load cache: {e}")
-        if not TRACKER_DATA or force_rescan:
-            TRACKER_DATA = scan_recent_eps(days_back=14)
-
-        # Enrich with catalysts and SEC filings
-        catalysts = load_ep_catalysts()
-        sec_filings = load_sec_filings()
-        for ev in TRACKER_DATA:
-            sym = ev["symbol"]
-            cat = catalysts.get(sym, {})
-            ev["catalyst_headline"] = cat.get("headline", f"{sym} EP Volume & Price Repricing")
-            ev["catalyst_category"] = cat.get("category", f"{ev.get('sector', 'Corporate')} Inflection")
-            ev["catalyst_tier"] = cat.get("quality_tier", "Tier-1 Institutional Repricing")
-            ev["catalyst_analysis"] = cat.get("analysis", f"{sym} demonstrated massive institutional volume turnover (${ev.get('dvol_m', 0):.1f}M, RVOL {ev.get('rvol', 0):.1f}x) triggering structural repricing.")
-            ev["catalyst_news"] = cat.get("news_summary", f"{sym} news and corporate announcements surrounding {ev.get('event_date')}.")
-            ev["sec_filings"] = sec_filings.get(sym, [])
-
-        with open(CACHE_PATH, "w") as f:
-            json.dump(TRACKER_DATA, f, indent=2)
-    return TRACKER_DATA
-
-HTML_TEMPLATE = """<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -696,32 +147,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .chip-tailwind { background: rgba(16, 185, 129, 0.15); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.3); }
   .chip-neutral { background: rgba(148, 163, 184, 0.12); color: #cbd5e1; border: 1px solid rgba(148, 163, 184, 0.25); }
   .chip-veto { background: rgba(239, 68, 68, 0.18); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.3); }
-  .chip-cyan { background: rgba(56, 189, 248, 0.15); color: #38bdf8; border: 1px solid rgba(56, 189, 248, 0.3); }
-  .chip-gold { background: rgba(245, 158, 11, 0.18); color: #fbbf24; border: 1px solid rgba(245, 158, 11, 0.35); }
-  .chip-purple { background: rgba(168, 85, 247, 0.18); color: #c084fc; border: 1px solid rgba(168, 85, 247, 0.3); }
-  .chip-red { background: rgba(239, 68, 68, 0.18); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.3); }
-
-  /* Top Strategy Config Bar & Controls */
-  .strategy-config-bar {
-    background: #0d121c; border-bottom: 1px solid var(--border); padding: 8px 16px;
-    display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; flex-shrink: 0;
-  }
-  .toggle-control {
-    display: inline-flex; align-items: center; gap: 6px; cursor: pointer; font-size: 11.5px;
-    user-select: none; color: #cbd5e1;
-  }
-  .toggle-control input[type="checkbox"] {
-    accent-color: #0284c7; width: 14px; height: 14px; cursor: pointer;
-  }
-  .strat-btn {
-    background: #182030; border: 1px solid #28354d; color: #94a3b8; padding: 4px 10px;
-    border-radius: 4px; font-size: 11px; font-weight: 600; cursor: pointer; transition: all 0.15s;
-  }
-  .strat-btn:hover { background: #222d42; color: #fff; }
-  .strat-btn.active-strat {
-    background: #0369a1; border-color: #38bdf8; color: #fff; box-shadow: 0 0 8px rgba(56, 189, 248, 0.3);
-  }
-  .tp-row { display: flex; justify-content: space-between; align-items: center; }
 
   /* Center Chart Pane */
   .chart-pane { flex: 1; display: flex; flex-direction: column; overflow: hidden; background: #0c0f16; border-right: 1px solid var(--border); min-height: 0; min-width: 0; }
@@ -930,8 +355,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <button class="btn-emerging" onclick="openEmergingDrawer()">
       🌐 Emerging Themes <span class="badge" style="background:#8b5cf6;" id="em_badge_top">Leaderboard</span>
     </button>
-    <button class="btn-emerging" onclick="onAiTopPicksClick()" style="border-color:#10b981; color:#34d399; margin-right:8px;" id="btn_top_ai_modal" title="Filter left table to AI Top Picks & open pipeline report">
-      🏆 AI Top Picks (<span id="btn_cnt_top_ai">0</span>)
+    <button class="btn-emerging" onclick="openAiTopPicksModal()" style="border-color:#10b981; color:#34d399; margin-right:8px;">
+      🏆 AI Top Ranked EPs
     </button>
     <button class="btn-export" onclick="downloadTradingViewList()" title="Export current/all tickers formatted for TradingView Watchlist">
       📋 TradingView List
@@ -951,77 +376,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <div class="view-bar">
   <span style="font-size:11px; color:var(--muted); font-weight:700; text-transform:uppercase;">View Pipeline:</span>
   <button class="view-tab active" id="tab_all" onclick="setView('all')">⭐ All Tracked EPs (<span id="cnt_all">0</span>)</button>
-  <button class="view-tab" id="tab_top_ai" onclick="setView('top_ai')" style="border-color:#10b981; color:#34d399;">🏆 AI Top Ranked (<span id="cnt_top_ai">0</span>)</button>
   <button class="view-tab" id="tab_today" onclick="setView('today')">🔥 Today's Fresh EPs (<span id="cnt_today">0</span>)</button>
   <button class="view-tab" id="tab_dre" onclick="setView('dre')" style="border-color:#f59e0b; color:#fbbf24;">⚡ Delayed Reaction EPs (<span id="cnt_dre">0</span>)</button>
   <button class="view-tab" id="tab_week" onclick="setView('week')">📅 Past Week Pipeline (<span id="cnt_week">0</span>)</button>
   <button class="view-tab" id="tab_active" onclick="setView('active')">🟢 Active Holding Stop (<span id="cnt_active">0</span>)</button>
   <button class="view-tab" id="tab_idiosyncratic" onclick="setView('idiosyncratic')" style="border-color:#10b981; color:#6ee7b7;">🎯 Idiosyncratic Alpha (<span id="cnt_idiosyncratic">0</span>)</button>
-  
-  <div style="margin-left:auto; display:flex; align-items:center; gap:6px;">
-    <label style="font-size:11px; color:var(--muted); font-weight:700; text-transform:uppercase;">Trader Archetype:</label>
-    <select id="f_trader_archetype" onchange="onArchetypeFilterChange()" style="background:#131826; border:1px solid #28354d; color:#38bdf8; font-weight:700; padding:4px 8px; border-radius:4px; font-size:11.5px; cursor:pointer;">
-      <option value="">All 6 Institutional Archetypes</option>
-      <option value="pinnacle">💎 Pinnacle Elite (Apex Quality)</option>
-      <option value="conservative">🛡️ Conservative Swing (Delayed Breakout Confirmation)</option>
-      <option value="compounder">🚀 Multi-Quarter Compounder (Secular Leaders)</option>
-      <option value="emerging">🌟 Emerging Leader (Velocity &amp; Power)</option>
-      <option value="sweet">⭐ Institutional Sweet Spot (Volume Surge)</option>
-      <option value="turnaround">🔄 Neglected Turnaround (Deep Value)</option>
-      <option value="high_beta">⚡ High-Beta Momentum (Fast Sprinter)</option>
-      <option value="dre">⚡ Delayed Reaction (DRE - Weak Day 1 Close)</option>
-      <option value="idiosyncratic">🎯 Idiosyncratic Alpha (Mega-Catalyst)</option>
-      <option value="headwind">🚫 Severe Headwind (Trap Avoidance)</option>
-    </select>
-  </div>
-</div>
-
-<!-- Strategy Execution Rules & Trade Management Bar -->
-<div class="strategy-config-bar">
-  <div style="display:flex; align-items:center; gap:8px;">
-    <span style="font-weight:700; color:#f8fafc; font-size:12px; display:flex; align-items:center; gap:5px;">
-      ⚙️ Strategy Execution:
-    </span>
-    <span style="color:#38bdf8; font-size:11px; font-weight:700; background:#0c2340; border:1px solid #0284c7; padding:2px 8px; border-radius:10px;" id="strategy_mode_badge">AI-Enhanced Optimal</span>
-  </div>
-  
-  <div style="display:flex; align-items:center; gap:14px; flex-wrap:wrap;">
-    <!-- Toggle 0: Trade 1 Entry -->
-    <label class="toggle-control" title="When ON: takes Trade 1 on Day 1 close with stop at Day 1 Low. When OFF: skips Trade 1 entirely and only trades continuation legs (Trade 2 & 3).">
-      <input type="checkbox" id="cfg_trade1" checked onchange="onStrategyConfigChange()">
-      <span class="toggle-label">🚀 Trade 1 Entry</span>
-    </label>
-
-    <!-- Toggle 1: ML Profit Target -->
-    <label class="toggle-control" title="When ON: exits trade on momentum climax when ML Exhaustion probability > 0.80. When OFF: pure trend rider exiting on structural 50 SMA breakdown.">
-      <input type="checkbox" id="cfg_ml_targets" checked onchange="onStrategyConfigChange()">
-      <span class="toggle-label">🎯 ML Profit Target (Exhaustion)</span>
-    </label>
-
-    <!-- Toggle 2: ML Trailing Stop -->
-    <label class="toggle-control" title="When ON: dynamically trails stop based on 10th percentile MAE model once +2.0R hurdle is reached. When OFF: hard stop fixed at Day 1 Low.">
-      <input type="checkbox" id="cfg_ml_stop" checked onchange="onStrategyConfigChange()">
-      <span class="toggle-label">🛑 ML Dynamic Stop (+2.0R Hurdle)</span>
-    </label>
-
-    <!-- Toggle 3: Multi-Leg (Trade 2 & 3) -->
-    <label class="toggle-control" title="When ON: monitors for 2nd and 3rd leg yellow re-entries after initial trade exit. When OFF: evaluates Trade 1 only.">
-      <input type="checkbox" id="cfg_multileg" checked onchange="onStrategyConfigChange()">
-      <span class="toggle-label">♻️ Multi-Leg (Trade 2 &amp; 3)</span>
-    </label>
-
-    <!-- Toggle 4: Multi-Leg ML Filter -->
-    <label class="toggle-control" title="When ON: only takes re-entries confirmed by Cost-Sensitive ML Re-Entry model (Prob >= 35%). When OFF: takes all mechanical technical re-entries.">
-      <input type="checkbox" id="cfg_multileg_ml" checked onchange="onStrategyConfigChange()">
-      <span class="toggle-label">🤖 Multi-Leg ML Filter (≥35%)</span>
-    </label>
-
-    <!-- Quick Presets -->
-    <div style="display:flex; gap:6px;">
-      <button class="strat-btn" id="btn_strat_baseline" onclick="setStrategyPreset('baseline')" title="Raw mechanical execution of Trade 1 (No ML)">Mechanical Baseline</button>
-      <button class="strat-btn active-strat" id="btn_strat_optimal" onclick="setStrategyPreset('optimal')" title="All ML features ON: Dynamic Trailing Stop, Exhaustion Climax Exit, and ML-Filtered Multi-Leg">AI-Enhanced Optimal</button>
-    </div>
-  </div>
 </div>
 
 <!-- Interactive Expectancy Boosters Bar -->
@@ -1039,9 +398,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <span>💎 CAP 10×10 (&lt; $10B)</span>
     <span class="booster-pill">High Multibagger EV</span>
   </div>
-  <div class="booster-chip" id="b_rvol_sweet" onclick="toggleBooster('rvol_sweet')" title="Sweet Spot RVOL: Requires RVOL ≥ 5.0x. Cuts empirical drawdown in half (-6.0R) and surges EV to +1.68R.">
+  <div class="booster-chip" id="b_rvol_sweet" onclick="toggleBooster('rvol_sweet')" title="Sweet Spot RVOL: Requires RVOL ≥ 5.0x. Cuts empirical drawdown in half (-6.0R) and surges EV to +3.96R.">
     <span>🔥 Sweet Spot RVOL (≥5.0x)</span>
-    <span class="booster-pill">EV +1.68R | MaxDD -6R</span>
+    <span class="booster-pill">EV +3.96R | MaxDD -6R</span>
   </div>
   <div class="booster-chip" id="b_48h" onclick="toggleBooster('48h')" title="48H Body Absorption: Requires holding the upper 50% of Day 1 candle body through Day 3. Slashes Gap & Crap trap rate from 48% to 22% and adds +18% win rate.">
     <span>🛡️ 48H Upper Body Absorption</span>
@@ -1070,11 +429,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   <div style="display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:12px;">
     <div>
       <div style="font-size:13px; font-weight:700; color:#c7d2fe; display:flex; align-items:center; gap:8px;">
-        <span>📊 Quantitative Expectancy Guide: Zero-Lookahead Ground Truth Attribution</span>
-        <span class="badge" style="background:#4338ca; color:#fff;">10-Year Empirical Study (6,500 EPs)</span>
+        <span>📊 Quantitative Expectancy Guide: How Filtering Alters Win Rate, Max Drawdown &amp; P&amp;L</span>
+        <span class="badge" style="background:#4338ca; color:#fff;">10-Year Empirical Study (6,501 EPs)</span>
       </div>
       <div style="font-size:11px; color:#94a3b8; margin-top:3px;">
-        Raw big gappers without filtering deliver a modest baseline (<b>32.4% Win Rate, +0.40 R EV</b>; 67.6% fail or get stopped). Asymmetric alpha comes from disciplined execution filters that eliminate capital-destructive traps and scale into institutional compounders:
+        EP edge is not about picking breakouts blindly—it is about filtering out toxic capital dilution and letting secular thematic compounders run. Below is the empirical attribution of each booster:
       </div>
     </div>
     <button class="modal-close" style="font-size:18px; line-height:1; cursor:pointer;" onclick="toggleImpactGuide()">&times;</button>
@@ -1094,10 +453,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <div style="background:#111522; border-left:3px solid #f59e0b; border-radius:4px; padding:10px 12px;">
       <div style="font-weight:700; color:#fbbf24; font-size:11.5px; display:flex; justify-content:space-between;">
         <span>2. 🔥 Sweet Spot RVOL (≥5.0x)</span>
-        <span style="color:#34d399; font-size:10px;">EV: +0.40R → +1.68R</span>
+        <span style="color:#34d399; font-size:10px;">EV: +0.82R → +3.96R</span>
       </div>
       <div style="color:#cbd5e1; font-size:11px; margin-top:4px; line-height:1.4;">
-        <b>Statistical Impact:</b> Expected Value jumps to <b>+1.68 R</b> | Max Drawdown cut in half to <b>-6.0 R</b> | Eliminates 65% of low-momentum churn.<br>
+        <b>Statistical Impact:</b> Expected Value jumps to <b>+3.96 R</b> | Max Drawdown cut in half to <b>-6.0 R</b> | Profit Factor <b>10.54</b>.<br>
         <span style="color:#94a3b8;"><b>Mechanism:</b> 5x+ volume creates true supply vacuums. Massive institutional demand cannot be satisfied in 1 session, causing multi-week Post-Earnings Announcement Drift (PEAD).</span>
       </div>
     </div>
@@ -1108,7 +467,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <span style="color:#38bdf8; font-size:10px;">Trap Rate: 48% → 22%</span>
       </div>
       <div style="color:#cbd5e1; font-size:11px; margin-top:4px; line-height:1.4;">
-        <b>Statistical Impact:</b> Slashes Gap &amp; Crap trap rate from <b>48% to 22%</b> | Win Rate jumps to <b>43.8%+</b>.<br>
+        <b>Statistical Impact:</b> Slashes Gap &amp; Crap trap rate from <b>48% to 22%</b> | Win Rate jumps by <b>+18.0%</b>.<br>
         <span style="color:#94a3b8;"><b>Mechanism:</b> Holding the upper 50% of the Day 1 body through Day 3 proves that aggressive buyers are absorbing profit-taking. Stocks failing this gate usually announce dilutive secondaries (ATM offerings).</span>
       </div>
     </div>
@@ -1167,28 +526,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <span style="color:#94a3b8;"><b>Mechanism:</b> Stocks under $10B market cap have room for 5x to 10x PEAD drift before institutional ownership saturation caps multiple expansion.</span>
       </div>
     </div>
-
-    <div style="background:#111522; border-left:3px solid #f59e0b; border-radius:4px; padding:10px 12px;">
-      <div style="font-weight:700; color:#fbbf24; font-size:11.5px; display:flex; justify-content:space-between;">
-        <span>9. ⚡ Bonde DRE (Weak Day 1 Close)</span>
-        <span style="color:#34d399; font-size:10px;">EV: +0.86R | PF 2.20</span>
-      </div>
-      <div style="color:#cbd5e1; font-size:11px; margin-top:4px; line-height:1.4;">
-        <b>Statistical Impact:</b> Filters out <b>9,698 traps (62% of weak-close gaps)</b> | Delivers <b>+0.86 R EV</b> (Day 2 breakout) to <b>+0.71 R EV</b> (Day 3) | <b>2.20 PF</b> | Tighter stop (<b>7.4%</b> vs 10.9%).<br>
-        <span style="color:#94a3b8;"><b>Mechanism:</b> When a catalyst gaps but closes weak, waiting for Day 1 High breakout proves absorption and avoids immediate Day 2 gap-down collapses.</span>
-      </div>
-    </div>
-
-    <div style="background:#111522; border-left:3px solid #38bdf8; border-radius:4px; padding:10px 12px;">
-      <div style="font-weight:700; color:#38bdf8; font-size:11.5px; display:flex; justify-content:space-between;">
-        <span>10. 🛡️ Conservative Swing (Delayed Strong Entry)</span>
-        <span style="color:#34d399; font-size:10px;">Win Rate: 36.2% | PF 1.70</span>
-      </div>
-      <div style="color:#cbd5e1; font-size:11px; margin-top:4px; line-height:1.4;">
-        <b>Statistical Impact:</b> Lifts Win Rate from <b>32.4% to 36.2%</b> (+3.8% edge) | Automatically avoids <b>992 Day 2 gap-and-crap traps</b>.<br>
-        <span style="color:#94a3b8;"><b>Mechanism:</b> Rather than buying Day 1 close into potential overnight reversal risk, conservative traders enter on Day 1 High breakout confirmation on Day 2–5.</span>
-      </div>
-    </div>
   </div>
 </div>
 
@@ -1212,7 +549,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <tr>
           <th class="tl">Date</th>
           <th class="tl">Symbol</th>
-          <th class="tl">Trader Archetype</th>
           <th class="tl">Group Momentum</th>
           <th class="tl">Stage / Status</th>
           <th>Gap %</th>
@@ -1226,7 +562,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         </tr>
       </thead>
       <tbody id="table-body">
-        <tr><td colspan="13" style="text-align:center; padding:20px; color:var(--muted);">Loading live EP pipeline...</td></tr>
+        <tr><td colspan="12" style="text-align:center; padding:20px; color:var(--muted);">Loading live EP pipeline...</td></tr>
       </tbody>
     </table>
   </div>
@@ -1277,10 +613,26 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <!-- Card 1.2: AI Prediction & Alerts -->
     <div class="card" id="card_ai_prediction" style="border-color:#10b981;">
       <div class="card-title">
-        <span style="color:#34d399;">🤖 AI Probabilities (V2 Rolling)</span>
+        <span style="color:#34d399;">🤖 AI Probabilities</span>
       </div>
       <div style="font-size:11.5px; display:flex; flex-direction:column; gap:8px;">
         
+        <!-- V1 Snapshot -->
+        <div style="display:flex; flex-direction:column; background:rgba(0,0,0,0.3); padding:8px; border-radius:6px; border:1px solid #1e293b;">
+            <div style="display:flex; justify-content:space-between; margin-bottom:4px;">
+                <span style="color:#94a3b8; font-weight:bold;">V1 Day-5 Snapshot</span>
+                <span style="color:#64748b; font-weight:bold;">Fixed</span>
+            </div>
+            <div style="display:flex; justify-content:space-between; padding-bottom:2px;">
+              <span style="color:var(--muted);">+50% Target:</span>
+              <span id="ai_v1_50" style="font-weight:700; color:#cbd5e1;">--%</span>
+            </div>
+            <div style="display:flex; justify-content:space-between; padding-bottom:2px;">
+              <span style="color:var(--muted);">+100% Target:</span>
+              <span id="ai_v1_100" style="font-weight:700; color:var(--green);">--%</span>
+            </div>
+        </div>
+
         <!-- V2 Rolling -->
         <div style="display:flex; flex-direction:column; background:#0f172a; padding:8px; border-radius:6px; border:1px solid #38bdf8;">
             <div style="display:flex; justify-content:space-between; margin-bottom:4px;">
@@ -1295,42 +647,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
               <span style="color:var(--muted);">+100% Target:</span>
               <span id="ai_v2_100" style="font-weight:700; color:var(--green);">--%</span>
             </div>
-            <div style="display:flex; justify-content:space-between; padding-bottom:2px;">
-              <span style="color:var(--muted);">+150% Target:</span>
-              <span id="ai_v2_150" style="font-weight:700; color:var(--cyan);">--%</span>
-            </div>
-            <div style="display:flex; justify-content:space-between; padding-bottom:2px;">
-              <span style="color:var(--muted);">+200% Target:</span>
-              <span id="ai_v2_200" style="font-weight:700; color:#a855f7;">--%</span>
-            </div>
-        </div>
-        <div id="ai_adv_warnings_v2" style="margin-top: 5px; font-weight: bold; font-size: 11px; display: none;">
-             <div id="ai_dynamic_stop_v2" style="color: #f59e0b; padding: 4px; border: 1px solid #f59e0b; border-radius: 4px; display: none; text-align: center;">🤖 ML Trailing Stop (10th %ile MAE): <span id="ai_stop_val_v2"></span></div>
-             <div id="ai_exhaustion_v2" style="color: #8b5cf6; padding: 4px; border: 1px solid #8b5cf6; border-radius: 4px; display: none; text-align: center; margin-top: 5px;">🔥 EXHAUSTION: <span id="ai_exh_val_v2"></span></div>
-             <div id="ai_reentry_v2" style="color: #34d399; padding: 4px; border: 1px solid #34d399; border-radius: 4px; display: none; text-align: center; margin-top: 5px;">♻️ ML TRADE 2/3 RE-ENTRY: <span id="ai_reentry_val_v2"></span></div>
         </div>
 
       </div>
     </div>
 
-    <!-- Card 1.4: Trade 2 & 3: Yellow Re-Entry (Multi-Leg PEAD) Dossier -->
-    <div class="card" id="card_trade2_exec" style="border-color:#38bdf8;">
-      <div class="card-title">
-        <span style="color:#38bdf8;">🔄 Trade 2 &amp; 3: Yellow Re-Entry</span>
-        <span id="t2_status_pill" class="score-chip chip-cyan" style="font-size:10px;">Evaluating...</span>
-      </div>
-      <div id="t2_details_box" style="display:flex; flex-direction:column; gap:6px; font-size:11px;">
-        <div class="tp-row"><span style="color:var(--muted);">Re-Entry Status:</span><span id="t2_status_val" style="font-weight:700; color:#fff;">--</span></div>
-        <div class="tp-row"><span style="color:var(--muted);">Re-Entry Trigger:</span><span id="t2_entry_val" style="font-weight:700; color:var(--green);">$0.00</span></div>
-        <div class="tp-row"><span style="color:var(--muted);">Stop Loss (5D Shelf):</span><span id="t2_stop_val" style="font-weight:700; color:var(--red);">$0.00 (-0.0%)</span></div>
-        <div class="tp-row"><span style="color:var(--muted);">Consolidation &amp; Retracement:</span><span id="t2_cons_val" style="color:#cbd5e1;">0 sessions (Pullback 0.0%)</span></div>
-        <div class="tp-row" id="row_t2_ml" style="display:none;"><span style="color:var(--muted);">ML Re-Entry Conviction:</span><span id="t2_ml_val" style="font-weight:700; color:var(--cyan);">--%</span></div>
-        <div class="tp-row"><span style="color:var(--muted);">Trade 2 Open P&amp;L:</span><span id="t2_pnl_val" style="font-weight:700; color:var(--gold);">+0.00 R</span></div>
-      </div>
-      <div id="t2_none_msg" style="display:none; color:var(--muted); font-size:11px; font-style:italic; line-height:1.4;">
-        No Second-Leg Re-Entry detected (did not re-flip Yellow within 45 sessions or retracement exceeded 55%).
-      </div>
-    </div>
 
     <!-- Card 1.3: Strategy Quality & Expectancy Audit -->
     <div class="card" id="card_quality_audit">
@@ -2118,12 +1439,9 @@ Evaluate this morning's premarket candidate cohort, eliminate the 64.5% "Gap-and
     <div class="modal-head">
       <div>
         <div class="modal-head-title">🏆 AI Predictive Engine — Live Pipeline Analysis</div>
-        <div style="font-size:11px; color:var(--muted);">Dynamically ranked by combined AI probability scores · Click any card to select &amp; chart</div>
+        <div style="font-size:11px; color:var(--muted);">Dynamically ranked by combined AI probability scores</div>
       </div>
-      <div style="display:flex; align-items:center; gap:8px;">
-        <button style="background:#0284c7; color:#fff; border:none; padding:4px 10px; border-radius:4px; font-size:11.5px; font-weight:700; cursor:pointer;" onclick="closeModal('modal_ai_top_picks'); setView('top_ai');">📋 Filter Left Table</button>
-        <button class="modal-close" onclick="closeModal('modal_ai_top_picks')">✕</button>
-      </div>
+      <button class="modal-close" onclick="closeModal('modal_ai_top_picks')">✕</button>
     </div>
     
     <div class="modal-body" style="padding:15px; color:#e2e8f0; font-size:13px; max-height:70vh; overflow-y:auto;" id="ai_top_picks_content">
@@ -2142,83 +1460,6 @@ let emergingBoard = null;
 let currentDrawerTab = 'themes';
 let drawerSortKey = 'score';
 let drawerSortAsc = false;
-
-let stratConfig = {
-  use_trade1: true,
-  use_ml_targets: true,
-  use_ml_stop: true,
-  use_multileg: true,
-  use_multileg_ml: true
-};
-
-function onStrategyConfigChange() {
-  const t1 = document.getElementById('cfg_trade1');
-  const mt = document.getElementById('cfg_ml_targets');
-  const ms = document.getElementById('cfg_ml_stop');
-  const ml = document.getElementById('cfg_multileg');
-  const mm = document.getElementById('cfg_multileg_ml');
-
-  if (t1) stratConfig.use_trade1 = t1.checked;
-  if (mt) stratConfig.use_ml_targets = mt.checked;
-  if (ms) stratConfig.use_ml_stop = ms.checked;
-  if (ml) stratConfig.use_multileg = ml.checked;
-  if (mm) stratConfig.use_multileg_ml = mm.checked;
-
-  const badge = document.getElementById('strategy_mode_badge');
-  const btnBase = document.getElementById('btn_strat_baseline');
-  const btnOpt = document.getElementById('btn_strat_optimal');
-  
-  const isBaseline = stratConfig.use_trade1 && !stratConfig.use_ml_targets && !stratConfig.use_ml_stop && !stratConfig.use_multileg && !stratConfig.use_multileg_ml;
-  const isOptimal = stratConfig.use_trade1 && stratConfig.use_ml_targets && stratConfig.use_ml_stop && stratConfig.use_multileg && stratConfig.use_multileg_ml;
-
-  if (isBaseline) {
-    if (badge) badge.textContent = "Mechanical Baseline";
-    if (btnBase) btnBase.classList.add('active-strat');
-    if (btnOpt) btnOpt.classList.remove('active-strat');
-  } else if (isOptimal) {
-    if (badge) badge.textContent = "AI-Enhanced Optimal";
-    if (btnOpt) btnOpt.classList.add('active-strat');
-    if (btnBase) btnBase.classList.remove('active-strat');
-  } else if (!stratConfig.use_trade1 && stratConfig.use_multileg) {
-    if (badge) badge.textContent = "Continuation Only (Legs 2+3)";
-    if (btnBase) btnBase.classList.remove('active-strat');
-    if (btnOpt) btnOpt.classList.remove('active-strat');
-  } else {
-    if (badge) badge.textContent = "Custom Configuration";
-    if (btnBase) btnBase.classList.remove('active-strat');
-    if (btnOpt) btnOpt.classList.remove('active-strat');
-  }
-
-  renderTable();
-  if (selectedEvent) selectEvent(selectedEvent);
-}
-
-function setStrategyPreset(preset) {
-  const t1 = document.getElementById('cfg_trade1');
-  const mt = document.getElementById('cfg_ml_targets');
-  const ms = document.getElementById('cfg_ml_stop');
-  const ml = document.getElementById('cfg_multileg');
-  const mm = document.getElementById('cfg_multileg_ml');
-
-  if (preset === 'baseline') {
-    if (t1) t1.checked = true;
-    if (mt) mt.checked = false;
-    if (ms) ms.checked = false;
-    if (ml) ml.checked = false;
-    if (mm) mm.checked = false;
-  } else if (preset === 'optimal') {
-    if (t1) t1.checked = true;
-    if (mt) mt.checked = true;
-    if (ms) ms.checked = true;
-    if (ml) ml.checked = true;
-    if (mm) mm.checked = true;
-  }
-  onStrategyConfigChange();
-}
-
-function onArchetypeFilterChange() {
-  renderTable();
-}
 
 let activeBoosters = {
   veto_headwind: false,
@@ -2272,7 +1513,7 @@ function updateLiveStatsBanner() {
   // True empirical calculations from active filtered events and strategy configuration
   let executedTrades = [];
   for (let e of list) {
-    if (stratConfig && stratConfig.use_trade1) {
+    if (typeof stratConfig !== 'undefined' && stratConfig && stratConfig.use_trade1) {
       let t1_r = 0.0;
       if (!e.held_d1_low) {
         t1_r = -1.0;
@@ -2285,7 +1526,7 @@ function updateLiveStatsBanner() {
       executedTrades.push(t1_r);
     }
 
-    if (stratConfig && stratConfig.use_multileg && e.t2_info) {
+    if (typeof stratConfig !== 'undefined' && stratConfig && stratConfig.use_multileg && e.t2_info) {
       const t2 = e.t2_info;
       const isVetoed = stratConfig.use_multileg_ml && t2.ml_vetoed;
       if (t2.has_reentry && !isVetoed) {
@@ -2409,12 +1650,6 @@ function setView(view) {
   document.querySelectorAll('.view-tab').forEach(b => b.classList.remove('active'));
   const tabEl = document.getElementById(`tab_${view}`);
   if (tabEl) tabEl.classList.add('active');
-  if (view === 'top_ai') {
-    const archFilter = document.getElementById('f_trader_archetype') || document.getElementById('sel_archetype_filter');
-    if (archFilter && archFilter.value !== '') {
-      archFilter.value = '';
-    }
-  }
   renderTable();
 }
 
@@ -2422,13 +1657,8 @@ function fetchEvents() {
   fetch('/api/tracker_events')
     .then(r => r.json())
     .then(data => {
-      allEvents = Array.isArray(data) ? data : (data.events || []);
+      allEvents = data.events || [];
       document.getElementById('cnt_all').textContent = allEvents.length;
-      const topAiCnt = document.getElementById('cnt_top_ai');
-      const activeAiList = allEvents.filter(e => e.held_d1_low && (e.ml_50 || 0) >= 0.20 && !(e.is_thematic_veto && !e.is_idiosyncratic));
-      if (topAiCnt) topAiCnt.textContent = activeAiList.length;
-      const btnTopAiCnt = document.getElementById('btn_cnt_top_ai');
-      if (btnTopAiCnt) btnTopAiCnt.textContent = activeAiList.length;
       document.getElementById('cnt_today').textContent = allEvents.filter(e => e.bars_since === 0).length;
       const dreCnt = document.getElementById('cnt_dre');
       if (dreCnt) dreCnt.textContent = allEvents.filter(e => e.is_dre).length;
@@ -2455,7 +1685,7 @@ function renderTable() {
 
   const tbody = document.getElementById('table-body');
   if (!list.length) {
-    tbody.innerHTML = '<tr><td colspan="13" style="text-align:center; padding:25px; color:var(--muted);">No matching EPs for active view, archetype &amp; booster filters.<br><span style="font-size:11px; color:#38bdf8; margin-top:4px; display:inline-block;">Click "Clear Boosters" or adjust filter conditions above to expand search.</span></td></tr>';
+    tbody.innerHTML = '<tr><td colspan="12" style="text-align:center; padding:25px; color:var(--muted);">No matching EPs for active view &amp; booster filters.<br><span style="font-size:11px; color:#38bdf8; margin-top:4px; display:inline-block;">Click "Clear Boosters" or adjust filter conditions above to expand search.</span></td></tr>';
     return;
   }
 
@@ -2474,7 +1704,6 @@ function renderTable() {
     return `<tr class="${isSel ? 'selected' : ''}" onclick="onRowClick('${e.symbol}', '${e.event_date}')">
       <td class="tl">${e.event_date}</td>
       <td class="tl" style="font-weight:700; color:#fff;">${e.symbol}${novelBadge}${dreBadge}</td>
-      <td class="tl"><span class="score-chip ${e.archetype_badge || 'chip-neutral'}">${e.trader_archetype || '📊 Quality Swing'}</span></td>
       <td class="tl">
         <span class="score-chip ${chipClass}" title="${e.theme_archetype} (${e.theme})">${e.theme_score}</span>
         <span style="font-size:10.5px; color:#c084fc; margin-left:4px; text-decoration:underline dotted; cursor:pointer;" onclick="event.stopPropagation(); openGroupStocks('${e.theme}', 'theme')" title="Click to view ${e.theme} Stock Leaderboard">${e.theme}</span>
@@ -2543,107 +1772,19 @@ function selectEvent(ev) {
   if (chartBadges) chartBadges.innerHTML = badgesHtml;
 
   // Update Trade Plan Card
-  let effectiveHeadline = ev.action_headline;
-  let effectivePlan = ev.action_plan;
-  let stopText = `$${ev.stop_price.toFixed(2)} (-${ev.risk_pct.toFixed(1)}%)`;
+  document.getElementById('plan_badge').className = ev.stage_badge;
+  document.getElementById('plan_badge').textContent = ev.status;
+  document.getElementById('action_headline').textContent = ev.action_headline;
+  document.getElementById('action_desc').textContent = ev.action_plan;
 
-  if (!stratConfig.use_trade1) {
-    effectiveHeadline = "SKIPPED TRADE 1 (CONTINUATION LEGS ONLY)";
-    effectivePlan = "Strategy is configured to skip Day 1 ignition and focus strictly on Trade 2 & 3 yellow re-entries on lower volatility.";
-    document.getElementById('plan_badge').className = "badge-digest";
-    document.getElementById('plan_badge').textContent = "Skipped T1";
-  } else {
-    document.getElementById('plan_badge').className = ev.stage_badge;
-    document.getElementById('plan_badge').textContent = ev.status;
-  }
-
-  // If ML dynamic stop is enabled and stock has reached +2.0R hurdle, ratchet stop to breakeven or trailing MAE
-  if (stratConfig.use_ml_stop && ev.curr_r >= 2.0 && ev.held_d1_low) {
-    const beStop = ev.entry_price;
-    stopText = `$${beStop.toFixed(2)} (Ratcheted Breakeven / +2.0R Hurdle Met)`;
-    effectivePlan += `\n\n🛡️ ML DYNAMIC STOP ACTIVE: +2.0R hurdle achieved. Risk eliminated; hard stop moved from Day 1 Low to Breakeven ($${beStop.toFixed(2)}).`;
-  }
-
-  // If ML profit target (exhaustion) is active and prob_exhaustion is high
-  if (stratConfig.use_ml_targets && ev.prob_exhaustion && ev.prob_exhaustion > 0.80) {
-    effectiveHeadline = "🎯 ML EXHAUSTION CLIMAX PROFIT TARGET TRIGGERED";
-    effectivePlan = `ML Exhaustion probability ${(ev.prob_exhaustion*100).toFixed(1)}% indicates high probability of sharp mean reversion. Harvest 50% to 100% of open profit at current market.\n\n` + effectivePlan;
-  }
-
-  document.getElementById('action_headline').textContent = effectiveHeadline;
-  document.getElementById('action_desc').textContent = effectivePlan;
   document.getElementById('val_entry').textContent = `$${ev.entry_price.toFixed(2)}`;
-  document.getElementById('val_stop').textContent = stopText;
+  document.getElementById('val_stop').textContent = `$${ev.stop_price.toFixed(2)} (-${ev.risk_pct.toFixed(1)}%)`;
   document.getElementById('val_add').textContent = `$${ev.add_price.toFixed(2)}`;
   
   const rSign = ev.curr_r >= 0 ? '+' : '';
   const pnlEl = document.getElementById('val_pnl');
   pnlEl.textContent = `${rSign}${ev.curr_r.toFixed(2)} R (${ev.ret_pct >= 0 ? '+' : ''}${ev.ret_pct.toFixed(1)}%)`;
   pnlEl.style.color = ev.curr_r >= 0 ? 'var(--green)' : 'var(--red)';
-
-  // Update Trade 2 & 3 Yellow Re-Entry Dossier Card
-  const t2Pill = document.getElementById('t2_status_pill');
-  const t2Box = document.getElementById('t2_details_box');
-  const t2None = document.getElementById('t2_none_msg');
-  const t2 = ev.t2_info || {};
-
-  if (!stratConfig.use_multileg) {
-    if (t2Pill) { t2Pill.className = 'score-chip chip-neutral'; t2Pill.textContent = 'Multi-Leg OFF'; }
-    if (t2Box) t2Box.style.display = 'none';
-    if (t2None) {
-      t2None.style.display = 'block';
-      t2None.textContent = 'Multi-Leg monitoring is disabled in top strategy config bar. Enable to track Trade 2 & 3 yellow re-entries.';
-    }
-  } else if (stratConfig.use_multileg_ml && t2.ml_vetoed) {
-    if (t2Pill) { t2Pill.className = 'score-chip chip-veto'; t2Pill.textContent = 'ML Vetoed'; }
-    if (t2Box) t2Box.style.display = 'none';
-    if (t2None) {
-      t2None.style.display = 'block';
-      t2None.innerHTML = `⚠️ Re-entry signal was vetoed by ML Re-Entry Model (Conviction <b>${t2.prob_reentry ? (t2.prob_reentry*100).toFixed(1) : '0'}%</b> &lt; 35% hurdle). High risk of bull trap / secondary fakeout.`;
-    }
-  } else if (t2.has_reentry) {
-    if (t2Pill) { t2Pill.className = 'score-chip chip-tailwind'; t2Pill.textContent = `Active (+${t2.curr_r !== null ? t2.curr_r : 0} R)`; }
-    if (t2Box) t2Box.style.display = 'flex';
-    if (t2None) t2None.style.display = 'none';
-    
-    document.getElementById('t2_status_val').textContent = `Yellow Flip Triggered (${t2.entry_date})`;
-    document.getElementById('t2_entry_val').textContent = `$${t2.entry_price ? t2.entry_price.toFixed(2) : '-'}`;
-    document.getElementById('t2_stop_val').textContent = `$${t2.stop_price ? t2.stop_price.toFixed(2) : '-'} (-${t2.risk_pct ? t2.risk_pct.toFixed(1) : '-'}%)`;
-    document.getElementById('t2_cons_val').textContent = `${t2.cons_days} sessions (Retraced -${t2.drop_from_peak}%)`;
-    
-    const mlRow = document.getElementById('row_t2_ml');
-    if (t2.prob_reentry !== null && mlRow) {
-      mlRow.style.display = 'flex';
-      document.getElementById('t2_ml_val').textContent = `${(t2.prob_reentry * 100).toFixed(1)}%`;
-    } else if (mlRow) {
-      mlRow.style.display = 'none';
-    }
-    
-    const pnlEl2 = document.getElementById('t2_pnl_val');
-    const r2 = t2.curr_r !== null ? t2.curr_r : 0;
-    pnlEl2.textContent = `${r2 >= 0 ? '+' : ''}${r2.toFixed(2)} R`;
-    pnlEl2.style.color = r2 >= 0 ? 'var(--green)' : 'var(--red)';
-  } else if (t2.in_pullback) {
-    if (t2Pill) { t2Pill.className = 'score-chip chip-gold'; t2Pill.textContent = `Pullback (Day ${t2.cons_days})`; }
-    if (t2Box) t2Box.style.display = 'flex';
-    if (t2None) t2None.style.display = 'none';
-    
-    document.getElementById('t2_status_val').textContent = `Consolidating (Shelf Support Watch)`;
-    document.getElementById('t2_entry_val').textContent = `Waiting for Yellow Flip`;
-    document.getElementById('t2_stop_val').textContent = `Anticipated Stop: $${t2.stop_price ? t2.stop_price.toFixed(2) : '-'}`;
-    document.getElementById('t2_cons_val').textContent = `${t2.cons_days} sessions (Retraced -${t2.drop_from_peak}%)`;
-    const mlRow = document.getElementById('row_t2_ml');
-    if (mlRow) mlRow.style.display = 'none';
-    document.getElementById('t2_pnl_val').textContent = `Pending Entry`;
-    document.getElementById('t2_pnl_val').style.color = 'var(--muted)';
-  } else {
-    if (t2Pill) { t2Pill.className = 'score-chip chip-neutral'; t2Pill.textContent = 'No Re-Entry'; }
-    if (t2Box) t2Box.style.display = 'none';
-    if (t2None) {
-      t2None.style.display = 'block';
-      t2None.textContent = 'No Second-Leg Re-Entry detected (did not re-flip Yellow within 45 sessions or retracement exceeded 55%).';
-    }
-  }
 
   // Update Quality & Booster Audit Card
   let passCount = 0;
@@ -2797,19 +1938,18 @@ function selectEvent(ev) {
     w4.style.color = 'var(--muted)';
   }
 
-  // [FIX]: Real-world day is 1-based (bars_since + 1). Rolling API offset is 0-based (bars_since).
-  let display_day = ev.bars_since + 1;
-  let fetch_offset = ev.bars_since > 0 ? ev.bars_since : 0; 
+  // Update AI Predictions (V1 and V2)
+  const v1_50 = ev.ml_50 ? (ev.ml_50 * 100).toFixed(1) + '%' : '--%';
+  const v1_100 = ev.ml_100 ? (ev.ml_100 * 100).toFixed(1) + '%' : '--%';
+  document.getElementById('ai_v1_50').textContent = v1_50;
+  document.getElementById('ai_v1_100').textContent = v1_100;
   
-  document.getElementById('ai_v2_day_badge').textContent = `Day ${display_day}`;
+  let days_elapsed = ev.bars_since > 0 ? ev.bars_since : 1;
+  document.getElementById('ai_v2_day_badge').textContent = `Day ${days_elapsed}`;
   document.getElementById('ai_v2_50').textContent = '...';
   document.getElementById('ai_v2_100').textContent = '...';
-  document.getElementById('ai_v2_150').textContent = '...';
-  document.getElementById('ai_v2_200').textContent = '...';
   
-  const formatProb = (p) => p >= 1.0 ? '<span style="color:#10b981; font-weight:800;">MET ✓</span>' : (p * 100).toFixed(1) + '%';
-
-  fetch(`/api/ml_rolling?symbol=${ev.symbol}&event_date=${ev.event_date}&days_forward=${fetch_offset}`)
+  fetch(`/api/ml_rolling?symbol=${ev.symbol}&event_date=${ev.event_date}&days_forward=${days_elapsed}`)
     .then(res => res.json())
     .then(data => {
         if (data.stopped_out || data.error) {
@@ -2820,46 +1960,10 @@ function selectEvent(ev) {
             return;
         }
         if (data.probs) {
-            document.getElementById('ai_v2_50').innerHTML = formatProb(data.probs.prob_50);
-            document.getElementById('ai_v2_100').innerHTML = formatProb(data.probs.prob_100);
-            document.getElementById('ai_v2_150').innerHTML = formatProb(data.probs.prob_150);
-            document.getElementById('ai_v2_200').innerHTML = formatProb(data.probs.prob_200);
-            
-            let adv_warnings = false;
-            
-            if (data.probs.dynamic_stop_loss_pct != null) {
-                document.getElementById('ai_dynamic_stop_v2').style.display = 'block';
-                document.getElementById('ai_stop_val_v2').textContent = (data.probs.dynamic_stop_loss_pct * 100).toFixed(1) + '%';
-                adv_warnings = true;
-            } else {
-                document.getElementById('ai_dynamic_stop_v2').style.display = 'none';
-            }
-
-            if (data.probs.prob_reentry != null && data.probs.prob_reentry > 0.40) {
-                document.getElementById('ai_reentry_v2').style.display = 'block';
-                let reProb = (data.probs.prob_reentry * 100).toFixed(1) + '%';
-                if (data.probs.prob_reentry > 0.60) { reProb += ' (BUY TRIGGER)'; }
-                document.getElementById('ai_reentry_val_v2').textContent = reProb;
-                adv_warnings = true;
-            } else {
-                document.getElementById('ai_reentry_v2').style.display = 'none';
-            }
-            
-            if (data.probs.prob_exhaustion != null) {
-                document.getElementById('ai_exhaustion_v2').style.display = 'block';
-                let exhProb = (data.probs.prob_exhaustion * 100).toFixed(1) + '%';
-                if (data.probs.prob_exhaustion > 0.70) { exhProb += ' (SELL TRIGGER)'; }
-                document.getElementById('ai_exh_val_v2').textContent = exhProb;
-                adv_warnings = true;
-            } else {
-                document.getElementById('ai_exhaustion_v2').style.display = 'none';
-            }
-            
-            if (adv_warnings) {
-                document.getElementById('ai_adv_warnings_v2').style.display = 'block';
-            } else {
-                document.getElementById('ai_adv_warnings_v2').style.display = 'none';
-            }
+            document.getElementById('ai_v2_50').textContent = (data.probs.prob_50 * 100).toFixed(1) + '%';
+            document.getElementById('ai_v2_100').textContent = (data.probs.prob_100 * 100).toFixed(1) + '%';
+            document.getElementById('ai_v2_150').textContent = (data.probs.prob_150 * 100).toFixed(1) + '%';
+            document.getElementById('ai_v2_200').textContent = (data.probs.prob_200 * 100).toFixed(1) + '%';
         }
     });
 
@@ -2931,35 +2035,6 @@ function getFilteredEvents() {
   else if (currentView === 'week') list = list.filter(e => e.bars_since <= 5);
   else if (currentView === 'active') list = list.filter(e => e.held_d1_low);
   else if (currentView === 'idiosyncratic') list = list.filter(e => e.is_idiosyncratic);
-  else if (currentView === 'top_ai') {
-    list = list.filter(e => e.held_d1_low && (e.ml_50 !== null && e.ml_50 !== undefined && e.ml_50 >= 0.20) && !(e.is_thematic_veto && !e.is_idiosyncratic))
-               .sort((a,b) => {
-                 const sa = ((a.ml_50||0)*1.0) + ((a.ml_100||0)*1.5) + ((a.ml_150||0)*2.0) + ((a.ml_200||0)*2.5);
-                 const sb = ((b.ml_50||0)*1.0) + ((b.ml_100||0)*1.5) + ((b.ml_150||0)*2.0) + ((b.ml_200||0)*2.5);
-                 return sb - sa;
-               });
-  }
-
-  // Trader Archetype Dropdown Filter
-  const archFilter = document.getElementById('f_trader_archetype') || document.getElementById('sel_archetype_filter');
-  const archVal = archFilter ? archFilter.value : 'all';
-  if (archVal && archVal !== 'all') {
-    if (archVal === 'conservative') {
-      list = list.filter(e => (e.close_pos >= 0.65 || !e.is_dre) && e.held_d1_low);
-    } else {
-      list = list.filter(e => e.archetype_key === archVal);
-    }
-  }
-
-  // Continuation Mode Only (Trade 1 OFF, Multi-Leg ON)
-  if (stratConfig && !stratConfig.use_trade1 && stratConfig.use_multileg) {
-    list = list.filter(e => {
-      const t2 = e.t2_info;
-      if (!t2) return false;
-      if (stratConfig.use_multileg_ml && t2.ml_vetoed) return false;
-      return t2.has_reentry || t2.in_pullback;
-    });
-  }
 
   if (activeBoosters.veto_headwind) {
     list = list.filter(e => !e.is_thematic_veto || e.is_idiosyncratic);
@@ -4515,20 +3590,27 @@ function openTickerInsightsModal(posId) {
 🎯 QUANTITATIVE EXECUTION & HANDLING RULES:`;
 
   if (pos.bars_since <= 3 && !pos.has_d2_add) {
-    guide += `\n1. SECONDARY ADD: If price breaks above Day 1 High ($${pos.d1_high.toFixed(2)}), scale +50% size (+${Math.max(1, Math.floor(pos.shares * 0.5))} shares). Lock stop at Day 1 Low ($${pos.stop_price.toFixed(2)}).`;
+    guide += `
+1. SECONDARY ADD: If price breaks above Day 1 High ($${pos.d1_high.toFixed(2)}), scale +50% size (+${Math.max(1, Math.floor(pos.shares * 0.5))} shares). Lock stop at Day 1 Low ($${pos.stop_price.toFixed(2)}).`;
   } else if (pos.has_d2_add) {
-    guide += `\n1. SECONDARY ADD: Executed. Position scaled to 1.5x heat. Hold core runner.`;
+    guide += `
+1. SECONDARY ADD: Executed. Position scaled to 1.5x heat. Hold core runner.`;
   }
 
-  guide += `\n2. 48-HOUR ABSORPTION: Monitor upper 50% body. Sustained hold confirms institutional accumulation.`;
-  guide += `\n3. TRAILING STOP RULE: Once gain reaches +2.5 R ($${(pos.entry_price + 2.5 * riskPerShare).toFixed(2)}), trail stop to Breakeven ($${pos.entry_price.toFixed(2)}).`;
+  guide += `
+2. 48-HOUR ABSORPTION: Monitor upper 50% body. Sustained hold confirms institutional accumulation.`;
+  guide += `
+3. TRAILING STOP RULE: Once gain reaches +2.5 R ($${(pos.entry_price + 2.5 * riskPerShare).toFixed(2)}), trail stop to Breakeven ($${pos.entry_price.toFixed(2)}).`;
   if (pos.ema20) {
-    guide += `\n4. SWING TRAIL: Trail runner along daily 20 EMA ($${pos.ema20.toFixed(2)}).`;
+    guide += `
+4. SWING TRAIL: Trail runner along daily 20 EMA ($${pos.ema20.toFixed(2)}).`;
   }
   if (pos.sma50) {
-    guide += `\n5. INSTITUTIONAL BASELINE: 50-day SMA ($${pos.sma50.toFixed(2)}). 10-year compounders hold this baseline 70%+ of the time.`;
+    guide += `
+5. INSTITUTIONAL BASELINE: 50-day SMA ($${pos.sma50.toFixed(2)}). 10-year compounders hold this baseline 70%+ of the time.`;
   }
-  guide += `\n6. EXIT TRIGGER: Discretionary exit on first daily Larsson Line Blue Flip or hard stop violation.`;
+  guide += `
+6. EXIT TRIGGER: Discretionary exit on first daily Larsson Line Blue Flip or hard stop violation.`;
 
   document.getElementById('m_ins_guide_content').textContent = guide;
 
@@ -4582,10 +3664,13 @@ function openTickerInsightsModal(posId) {
 function copyTvAlertText(condEnc, msgEnc) {
   const cond = decodeURIComponent(condEnc);
   const msg = decodeURIComponent(msgEnc);
-  const text = `TradingView Alert Setup:\nCondition: ${cond}\nMessage: ${msg}`;
+  const text = `TradingView Alert Setup:
+Condition: ${cond}
+Message: ${msg}`;
   navigator.clipboard.writeText(text)
     .then(() => alert("✅ TradingView alert parameters copied to clipboard!"))
-    .catch(() => alert(`TradingView Alert:\n${text}`));
+    .catch(() => alert(`TradingView Alert:
+${text}`));
 }
 
 function openModifyFromInsights() {
@@ -4632,22 +3717,8 @@ window.addEventListener('load', () => {
     switchMainView('premarket');
   }
 });
-function onAiTopPicksClick() {
-  setView('top_ai');
-  openAiTopPicksModal();
-}
-
-function onAiTopPickSelect(sym, dt) {
-  closeModal('modal_ai_top_picks');
-  setView('top_ai');
-  const ev = allEvents.find(e => e.symbol === sym && (e.event_date === dt || e.date === dt)) || allEvents.find(e => e.symbol === sym);
-  if (ev) {
-    selectEvent(ev);
-  }
-}
-
 function openAiTopPicksModal() {
-  document.getElementById('modal_ai_top_picks').classList.add('open');
+  document.getElementById('modal_ai_top_picks').style.display = 'flex';
   document.getElementById('ai_top_picks_content').innerHTML = '<div style="text-align:center; padding:40px; color:#94a3b8;">Processing Live ML Inference...</div>';
   
   fetch('/api/ai_top_picks')
@@ -4663,10 +3734,10 @@ function openAiTopPicksModal() {
         arr.forEach(e => {
           const bdgColor = isTrap ? 'var(--red)' : '#0ea5e9';
           grpHtml += `
-            <div style="background:#1e293b; padding:10px; margin-bottom:8px; border-radius:4px; border-left:4px solid ${isTrap ? '#ef4444' : '#10b981'}; display:flex; justify-content:space-between; align-items:center; cursor:pointer;" onclick="onAiTopPickSelect('${e.symbol}', '${e.date}')" title="Click to view ${e.symbol} on chart & dossier">
+            <div style="background:#1e293b; padding:10px; margin-bottom:8px; border-radius:4px; border-left:4px solid ${isTrap ? '#ef4444' : '#10b981'}; display:flex; justify-content:space-between; align-items:center;">
               <div>
                 <div style="font-weight:700; font-size:14px; color:#fff;">${e.symbol} <span style="font-size:10px; background:${bdgColor}; padding:2px 5px; border-radius:3px; margin-left:6px;">${e.archetype}</span></div>
-                <div style="font-size:11px; color:var(--muted); margin-top:3px;">Age: ${e.days_old} Days | 50% Win Prob: <b style="color:var(--green);">${e.prob_50}%</b> | 100% Target: <b style="color:#38bdf8;">${e.prob_100}%</b></div>
+                <div style="font-size:11px; color:var(--muted); margin-top:3px;">Age: ${e.days_old} Days | 100% Target Prob: <b style="color:var(--green);">${e.prob_100}%</b> | Consol Risk: <b style="color:var(--red);">${e.prob_consol}%</b></div>
                 ${e.caution ? `<div style="font-size:11px; color:#fca5a5; margin-top:4px;">${e.caution}</div>` : ''}
                 ${(e.alerts && e.alerts.length) ? `<div style="font-size:11px; color:#6ee7b7; margin-top:4px;">${e.alerts.join(' | ')}</div>` : ''}
               </div>
@@ -4681,8 +3752,8 @@ function openAiTopPicksModal() {
       };
       
       html += renderGroup('🔥 Top Fresh Ignitions (<= 2 Days Old)', data.fresh, false);
-      html += renderGroup('🛡️ Top Mature Leaders (Holding Support)', data.mature, false);
-      html += renderGroup('⚠️ Traps & Headwinds (Strict Avoidance)', data.traps, true);
+      html += renderGroup('🛡️ Top Mature EPs (5D Support Verified)', data.mature, false);
+      html += renderGroup('⚠️ Toxic Traps (Strict Avoidance)', data.traps, true);
       
       document.getElementById('ai_top_picks_content').innerHTML = html;
     })
@@ -4693,413 +3764,3 @@ function openAiTopPicksModal() {
 </script>
 </body>
 </html>
-"""
-
-@app.route("/")
-def index():
-    return Response(HTML_TEMPLATE, mimetype="text/html")
-
-def get_scored_tracker_events(force_rescan=False):
-    events = get_tracker_data(force_rescan=force_rescan)
-    from ep_ml_engine import engine
-    import datastore
-    import pandas as pd
-    
-    for ev in events:
-        sym = ev["symbol"]
-        dt_str = ev.get("date") or ev.get("event_date")
-        bars = datastore.load_bars(sym)
-        ev["ml_50"] = None
-        ev["ml_100"] = None
-        ev["ml_150"] = None
-        ev["ml_200"] = None
-        if bars is not None and dt_str in bars.index:
-            try:
-                d1_idx = bars.index.get_loc(dt_str)
-                t_idx = len(bars) - 1
-                v2_feats = engine.compute_rolling_features(sym, d1_idx, t_idx=t_idx)
-                if v2_feats:
-                    preds = engine.predict_rolling(v2_feats)
-                    ev["ml_50"] = preds.get("prob_50")
-                    ev["ml_100"] = preds.get("prob_100")
-                    ev["ml_150"] = preds.get("prob_150")
-                    ev["ml_200"] = preds.get("prob_200")
-                    ev["is_toxic"] = preds.get("is_toxic", False)
-                    ev["dynamic_stop_loss_pct"] = preds.get("dynamic_stop_loss_pct", None)
-                    ev["prob_exhaustion"] = preds.get("prob_exhaustion", None)
-                    ev["prob_reentry"] = preds.get("prob_reentry", None)
-            except Exception:
-                pass
-    return events
-
-@app.route("/api/tracker_events")
-def api_tracker_events():
-    events = get_scored_tracker_events(force_rescan=False)
-    return jsonify({"events": events, "count": len(events)})
-
-@app.route("/api/emerging_board")
-def api_emerging_board():
-    eng = thematic_engine.get_thematic_engine()
-    return jsonify(eng.get_emerging_summary())
-
-@app.route("/api/group_stocks")
-def api_group_stocks():
-    group = request.args.get("group", "")
-    kind = request.args.get("kind", "theme")
-    if not group:
-        return jsonify({"error": "Missing group"}), 400
-    eng = thematic_engine.get_thematic_engine()
-    return jsonify(eng.get_group_stocks(group, kind))
-
-@app.route("/api/rescan")
-def api_rescan():
-    events = get_tracker_data(force_rescan=True)
-    return jsonify({"events": events, "count": len(events)})
-
-@app.route("/api/export/tradingview")
-def api_export_tradingview():
-    events = get_tracker_data(force_rescan=False)
-    view = request.args.get("view", "all")
-    if view == "today":
-        events = [e for e in events if e.get("bars_since") == 0]
-    elif view == "week":
-        events = [e for e in events if e.get("bars_since", 999) <= 5]
-    elif view == "active":
-        events = [e for e in events if e.get("held_d1_low")]
-    elif view == "idiosyncratic":
-        events = [e for e in events if e.get("is_idiosyncratic")]
-    
-    text = ",\n".join(e["symbol"] for e in events)
-    return Response(
-        text,
-        mimetype="text/plain",
-        headers={"Content-Disposition": f"attachment; filename=tradingview_ep_watch_{view}.txt"}
-    )
-
-@app.route("/api/export/ai_json")
-def api_export_ai_json():
-    events = get_tracker_data(force_rescan=False)
-    view = request.args.get("view", "all")
-    if view == "today":
-        events = [e for e in events if e.get("bars_since") == 0]
-    elif view == "week":
-        events = [e for e in events if e.get("bars_since", 999) <= 5]
-    elif view == "active":
-        events = [e for e in events if e.get("held_d1_low")]
-    elif view == "idiosyncratic":
-        events = [e for e in events if e.get("is_idiosyncratic")]
-
-    payload = {
-        "metadata": {
-            "pipeline_view": view,
-            "total_count": len(events),
-            "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-            "market_date": "2026-10-02"
-        },
-        "setups": events
-    }
-    return jsonify(payload)
-
-@app.route("/api/premarket/data")
-def api_premarket_data():
-    force = request.args.get("force", "0") == "1"
-    data = ep_premarket.get_premarket_data(force_refresh=force)
-    return jsonify(data)
-
-@app.route("/api/premarket/scan", methods=["GET", "POST"])
-def api_premarket_scan():
-    data = ep_premarket.scan_premarket(force_refresh=True)
-    return jsonify(data)
-
-@app.route("/api/export/premarket_json")
-def api_export_premarket_json():
-    data = ep_premarket.get_premarket_data(force_refresh=False)
-    return jsonify(data)
-
-
-@app.route("/api/ml_rolling")
-def api_ml_rolling():
-    sym = request.args.get("symbol")
-    event_date = request.args.get("event_date")
-    days_forward = int(request.args.get("days_forward", "5"))
-    from ep_ml_engine import engine
-    import datastore
-    bars = datastore.load_bars(sym)
-    if bars is None or event_date not in bars.index: return jsonify({"error": "No bars"})
-    d1_idx = bars.index.get_loc(event_date)
-    t_idx = d1_idx + days_forward
-    features = engine.compute_rolling_features(sym, d1_idx, t_idx)
-    if not features: return jsonify({"stopped_out": True})
-    probs = engine.predict_rolling(features)
-    return jsonify({"probs": probs})
-
-@app.route("/api/chart")
-
-def api_chart():
-    sym = request.args.get("symbol", "").upper()
-    ev_dt = request.args.get("event_date", "")
-    if not sym:
-        return jsonify({"error": "Missing symbol"}), 400
-
-    raw = datastore.load_bars(sym)
-    if raw is None or len(raw) == 0:
-        return jsonify({"error": "No bars"}), 404
-
-    d = indicators.add_indicators(raw)
-    
-    # Slice to last 40 bars
-    sub = d.iloc[max(0, len(d) - 40):]
-    
-    bars = []
-    vol = []
-    ema20 = []
-    for idx, r in sub.iterrows():
-        t = idx.strftime("%Y-%m-%d")
-        o, h, l, c = float(r["open"]), float(r["high"]), float(r["low"]), float(r["close"])
-        v = float(r["volume"]) if pd.notna(r["volume"]) else 0
-        bars.append({"time": t, "open": o, "high": h, "low": l, "close": c})
-        vol.append({"time": t, "value": v, "color": "rgba(16,185,129,0.3)" if c >= o else "rgba(239,68,68,0.3)"})
-        if "ema20" in r and pd.notna(r["ema20"]):
-            ema20.append({"time": t, "value": round(float(r["ema20"]), 2)})
-
-    return jsonify({"symbol": sym, "bars": bars, "volume": vol, "ema20": ema20})
-
-import ep_predictor
-
-@app.route("/api/predict")
-def api_predict():
-    sym = request.args.get("sym")
-    date_str = request.args.get("date")
-    
-    events = get_tracker_data()
-    if not events:
-        return jsonify({"error": "No data"})
-        
-    features = next((e for e in events if e.get("symbol") == sym and (e.get("date") == date_str or e.get("event_date") == date_str)), None)
-    
-    if not features:
-        return jsonify({"error": "Event not found"})
-        
-    # For live tracking, "days_since_ep" is important for the 5D booster
-    dt_str = features.get("date") or features.get("event_date")
-    if dt_str:
-        import datetime
-        ep_dt = pd.to_datetime(dt_str).tz_localize(None)
-        now_dt = pd.Timestamp.now().tz_localize(None)
-        features["days_since_ep"] = (now_dt - ep_dt).days
-        
-    prediction = ep_predictor.get_predictions(features)
-    return jsonify(prediction)
-
-@app.route("/api/symbol_quote")
-def api_symbol_quote():
-    sym = request.args.get("symbol", "").strip().upper()
-    if not sym:
-        return jsonify({"error": "No symbol provided"}), 400
-    try:
-        raw = datastore.load_bars(sym)
-        if raw is None or raw.empty:
-            return jsonify({"error": f"No bar data available for symbol {sym}"}), 404
-        d = indicators.add_indicators(raw)
-        last_bar = d.iloc[-1]
-        prev_bar = d.iloc[-2] if len(d) > 1 else last_bar
-        close_px = round(float(last_bar["close"]), 2)
-        open_px = round(float(last_bar["open"]), 2)
-        high_px = round(float(last_bar["high"]), 2)
-        low_px = round(float(last_bar["low"]), 2)
-        gap_pct = round(((open_px - float(prev_bar["close"])) / float(prev_bar["close"])) * 100.0, 1)
-        ema20 = round(float(last_bar["ema20"]), 2) if "ema20" in last_bar and pd.notna(last_bar["ema20"]) else None
-        sma50 = round(float(last_bar["sma50"]), 2) if "sma50" in last_bar and pd.notna(last_bar["sma50"]) else None
-        
-        # Sector / Theme
-        sec = labels.sector(sym) or "Unknown Sector"
-        thms = labels.themes(sym) or []
-        thm = thms[0] if thms else "General"
-        
-        # Company name
-        comp_name = sym
-        try:
-            u_df = universe.load_universe()
-            if u_df is not None and "symbol" in u_df.columns and "name" in u_df.columns:
-                m = u_df[u_df["symbol"] == sym]
-                if len(m) > 0 and pd.notna(m["name"].iloc[0]):
-                    comp_name = str(m["name"].iloc[0])
-        except Exception:
-            pass
-
-        return jsonify({
-            "symbol": sym,
-            "company": comp_name,
-            "sector": sec,
-            "theme": thm,
-            "date": last_bar.name.strftime("%Y-%m-%d"),
-            "close": close_px,
-            "open": open_px,
-            "high": high_px,
-            "low": low_px,
-            "gap_pct": gap_pct,
-            "ema20": ema20,
-            "sma50": sma50
-        })
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-@app.route("/portfolio")
-def portfolio_view_route():
-    return Response(HTML_TEMPLATE, mimetype="text/html")
-
-@app.route("/api/portfolio")
-def api_portfolio():
-    eval_res = pm.evaluate_portfolio()
-    return jsonify(eval_res)
-
-@app.route("/api/portfolio/settings", methods=["POST"])
-def api_portfolio_settings():
-    data = request.get_json(force=True) or {}
-    size = data.get("portfolio_size", 100000.0)
-    risk_pct = data.get("default_risk_pct", 1.0)
-    settings = pm.update_settings(size, risk_pct)
-    return jsonify({"status": "ok", "settings": settings})
-
-@app.route("/api/portfolio/add_position", methods=["POST"])
-def api_portfolio_add_position():
-    data = request.get_json(force=True) or {}
-    sym = data.get("symbol", "")
-    entry_px = data.get("entry_price")
-    stop_px = data.get("stop_price")
-    shares = data.get("shares")
-    ev_dt = data.get("event_date")
-    risk_pct = data.get("risk_pct")
-    notes = data.get("notes", "")
-    try:
-        pos = pm.add_position(sym, entry_px, stop_px, shares, event_date=ev_dt, risk_pct=risk_pct, notes=notes)
-        return jsonify({"status": "ok", "position": pos})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 400
-
-@app.route("/api/portfolio/update_position", methods=["POST"])
-def api_portfolio_update_position():
-    data = request.get_json(force=True) or {}
-    pos_id = data.get("id")
-    action = data.get("action")
-    stop_px = data.get("stop_price")
-    entry_px = data.get("entry_price")
-    add_px = data.get("add_price")
-    add_stop = data.get("add_stop")
-    add_shares = data.get("add_shares")
-    tranche_stops = data.get("tranche_stops")
-    notes = data.get("notes")
-    try:
-        pos = pm.update_position(pos_id, action, stop_price=stop_px, entry_price=entry_px, add_price=add_px, add_shares=add_shares, add_stop=add_stop, tranche_stops=tranche_stops, notes=notes)
-        return jsonify({"status": "ok", "position": pos})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 400
-
-@app.route("/api/portfolio/close_position", methods=["POST"])
-def api_portfolio_close_position():
-    data = request.get_json(force=True) or {}
-    pos_id = data.get("id")
-    exit_px = data.get("exit_price")
-    exit_date = data.get("exit_date")
-    exit_reason = data.get("exit_reason", "Manual Close")
-    notes = data.get("notes", "")
-    try:
-        closed = pm.close_position(pos_id, exit_px, exit_date=exit_date, exit_reason=exit_reason, notes=notes)
-        return jsonify({"status": "ok", "closed_position": closed})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 400
-
-@app.route("/api/portfolio/delete_closed_position", methods=["POST"])
-def api_portfolio_delete_closed_position():
-    data = request.get_json(force=True) or {}
-    pos_id = data.get("id")
-    if not pos_id:
-        return jsonify({"error": "id is required"}), 400
-    try:
-        success = pm.delete_closed_position(pos_id)
-        if success:
-            return jsonify({"status": "ok", "deleted_id": pos_id})
-        return jsonify({"error": "Closed trade not found"}), 404
-    except Exception as e:
-        return jsonify({"error": str(e)}), 400
-
-@app.route("/api/portfolio/clear_closed_positions", methods=["POST"])
-def api_portfolio_clear_closed_positions():
-    try:
-        count = pm.clear_all_closed_positions()
-        return jsonify({"status": "ok", "cleared_count": count})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 400
-
-@app.route("/api/ai_top_picks")
-def api_ai_top_picks():
-    events = get_scored_tracker_events(force_rescan=False)
-    
-    scored_events = []
-    for ev in events:
-        m50 = ev.get("ml_50") or 0.0
-        m100 = ev.get("ml_100") or 0.0
-        m150 = ev.get("ml_150") or 0.0
-        m200 = ev.get("ml_200") or 0.0
-        score = round(((m50 * 1.0) + (m100 * 1.5) + (m150 * 2.0) + (m200 * 2.5)) * 25.0, 1)
-        
-        alerts = []
-        dyn_stop = ev.get("dynamic_stop_loss_pct")
-        if dyn_stop is not None:
-            alerts.append(f"🛑 ML Trailing Stop: {(dyn_stop * 100):.1f}%")
-        if ev.get("action_headline"):
-            alerts.append(ev["action_headline"])
-            
-        caution = None
-        is_veto = bool(ev.get("is_thematic_veto") and not ev.get("is_idiosyncratic"))
-        held_low = bool(ev.get("held_d1_low", True))
-        if is_veto:
-            caution = "⚠️ Bottom 35th percentile sector headwind (Trap Avoidance)"
-        elif not held_low:
-            caution = f"❌ Day 1 Low (${ev.get('stop_price', 0):.2f}) Breached"
-            
-        scored_events.append({
-            "symbol": ev.get("symbol"),
-            "date": ev.get("date") or ev.get("event_date"),
-            "days_old": ev.get("bars_since", 0),
-            "archetype": ev.get("trader_archetype", "Quality Swing"),
-            "score": score,
-            "prob_50": round(m50 * 100, 1),
-            "prob_100": round(m100 * 100, 1),
-            "prob_consol": round(m150 * 100, 1),
-            "held_d1_low": held_low,
-            "is_veto": is_veto,
-            "status": ev.get("status", ""),
-            "alerts": alerts,
-            "caution": caution,
-        })
-        
-    scored_events.sort(key=lambda x: x["score"], reverse=True)
-    
-    # Fresh: 0 to 2 bars since EP, holding Day 1 Low, no headwind veto
-    fresh = [e for e in scored_events if e["days_old"] <= 2 and e["held_d1_low"] and not e["is_veto"]][:10]
-    
-    # Mature: 3 to 30 bars since EP, holding Day 1 Low, no headwind veto
-    mature = [e for e in scored_events if 2 < e["days_old"] <= 30 and e["held_d1_low"] and not e["is_veto"]][:10]
-    
-    # Traps: Breached Day 1 Low OR Severe Headwind Veto
-    traps = [e for e in scored_events if e["is_veto"] or not e["held_d1_low"]][:10]
-    
-    return jsonify({
-        "fresh": fresh,
-        "mature": mature,
-        "traps": traps
-    })
-
-
-
-def main():
-    parser = argparse.ArgumentParser(description="EP Live Tracker")
-    parser.add_argument("--port", type=int, default=8783, help="Port to listen on (default: 8783)")
-    args = parser.parse_args()
-
-    print(f"🚀 EP Live Follow-Through Tracker running at: http://127.0.0.1:{args.port}")
-    app.run(host="127.0.0.1", port=args.port, debug=False)
-
-if __name__ == "__main__":
-    main()

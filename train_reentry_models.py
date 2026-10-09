@@ -4,34 +4,51 @@ import joblib
 from pathlib import Path
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
-from sklearn.calibration import CalibratedClassifierCV
-from sklearn.frozen import FrozenEstimator
 import lightgbm as lgb
-import os
+from sklearn.calibration import CalibratedClassifierCV
+try:
+    from sklearn.frozen import FrozenEstimator
+except ImportError:
+    pass
 
-def train_reentry_model():
-    print("🚀 TRAINING RE-ENTRY ML MODEL (TRADE 2 & 3)")
-    df = pd.read_parquet("data/ml_datasets/reentry/dataset_reentry.parquet")
-    
+def train_reentry_models():
+    print("🚀 TRAINING TRADE 2/3 RE-ENTRY MULTI-LEG CLASSIFIER")
+    parquet_file = Path("data/ml_datasets/reentry/dataset_reentry.parquet")
+    if not parquet_file.exists():
+        print(f"Dataset {parquet_file} not found. Run build_reentry_dataset.py first.")
+        return
+        
+    df = pd.read_parquet(parquet_file)
+    df = df.dropna(subset=["target_15pct_win"])
     features = [c for c in df.columns if c.startswith("feature_")]
+    print(f"Training on {len(df)} reentry pullback samples using {len(features)} features...")
     
     # Chronological sort for panel data to avoid leakage
     df["date_idx"] = pd.to_datetime(df["date"])
     df = df.sort_values("date_idx")
     
-    # Inverse-duration weighting to prevent survivorship bias from long pullbacks
+    # Inverse-duration weighting
     df["event_id"] = df["symbol"] + "_" + df["entry_date"]
-    event_counts = df.groupby("event_id").size()
-    df["sample_weight"] = df["event_id"].map(event_counts).apply(lambda x: 1.0 / x)
+    event_counts = df.groupby("event_id")["event_id"].transform("count")
+    df["sample_weight"] = 1.0 / event_counts
     
     train_df = df[df["date_idx"] < pd.Timestamp("2023-01-01")].copy()
     test_df = df[df["date_idx"] >= pd.Timestamp("2023-01-01")].copy()
     
     scaler = StandardScaler()
-    
     X_train_tf = scaler.fit_transform(train_df[features])
     y_train = train_df["target_15pct_win"]
     w_train = train_df["sample_weight"]
+    
+    # [FIX]: Chronological Split for calibrator to prevent Test-Set Leakage
+    split_idx = int(len(train_df) * 0.8)
+    X_base = X_train_tf[:split_idx]
+    y_base = y_train.iloc[:split_idx]
+    w_base = w_train.iloc[:split_idx]
+    
+    X_calib = X_train_tf[split_idx:]
+    y_calib = y_train.iloc[split_idx:]
+    w_calib = w_train.iloc[split_idx:]
     
     X_test_tf = scaler.transform(test_df[features])
     y_test = test_df["target_15pct_win"]
@@ -41,27 +58,23 @@ def train_reentry_model():
         n_estimators=150, max_depth=5, learning_rate=0.05, 
         class_weight='balanced', random_state=42
     )
+    lgb_base.fit(X_base, y_base, sample_weight=w_base)
     
-    lgb_base.fit(X_train_tf, y_train, sample_weight=w_train)
+    # Calibrate on unseen training holdout
+    try:
+        from sklearn.frozen import FrozenEstimator
+        calibrated_model = CalibratedClassifierCV(estimator=FrozenEstimator(lgb_base), method='isotonic')
+    except ImportError:
+        calibrated_model = CalibratedClassifierCV(estimator=lgb_base, method='isotonic', cv="prefit")
+        
+    calibrated_model.fit(X_calib, y_calib, sample_weight=w_calib)
     
-    # Calibrate
-    calibrated_model = CalibratedClassifierCV(estimator=FrozenEstimator(lgb_base), method='isotonic', )
-    calibrated_model.fit(X_test_tf, y_test)
+    serving_pipeline = Pipeline([("scaler", scaler), ("classifier", calibrated_model)])
     
-    serving_pipeline = Pipeline([
-        ("scaler", scaler),
-        ("classifier", calibrated_model)
-    ])
-    
-    os.makedirs("data/models", exist_ok=True)
-    joblib.dump(serving_pipeline, "data/models/ep_reentry_classifier.pkl")
-    print("✅ Saved Re-Entry Classifier.")
-    
-    # Evaluate
-    preds = serving_pipeline.predict_proba(X_test_tf)[:, 1]
-    from sklearn.metrics import roc_auc_score
-    auc = roc_auc_score(y_test, preds)
-    print(f"Test AUC: {auc:.3f}")
+    out_path = Path("data/models/ep_reentry_classifier.pkl")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    joblib.dump(serving_pipeline, out_path)
+    print(f"✅ Saved Trade 2/3 Re-Entry Model to {out_path}")
 
 if __name__ == "__main__":
-    train_reentry_model()
+    train_reentry_models()

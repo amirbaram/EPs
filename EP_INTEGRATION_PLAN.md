@@ -1,5 +1,7 @@
 # EP Research & Integration Plan (V3)
 
+> **Important Reference:** See [LIVE_APP_INTEGRATION_INSIGHTS.md](file:///Users/amirbaram/Documents/code/EPs/LIVE_APP_INTEGRATION_INSIGHTS.md) for the complete quantitative insights, calibrated benchmarks (38.9% win rate vs 61% drift, 15:1 asymmetric payoff), code fixes, and step-by-step implementation standards for `serve_ep_tracker.py`.
+
 To ensure the prediction model is truly comprehensive, we must incorporate all proprietary Playbook Insights and Expectancy Boosters defined in `serve_ep.py` before we integrate the engine into the live apps. 
 
 ## Phase 1: Advanced Feature Engineering & ML Extraction
