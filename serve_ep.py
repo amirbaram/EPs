@@ -25,6 +25,7 @@ import datastore
 import indicators
 import scanner_core
 import thematic_engine
+from ep_ml_engine import engine
 
 app = Flask(__name__)
 
@@ -484,43 +485,57 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <span style="color:#38bdf8; font-size:11px; font-weight:700; background:#0c2340; border:1px solid #0284c7; padding:2px 8px; border-radius:10px;" id="strategy_mode_badge">AI-Enhanced Optimal</span>
   </div>
   
-  <div style="display:flex; align-items:center; gap:16px; flex-wrap:wrap;">
+  <div style="display:flex; align-items:center; gap:14px; flex-wrap:wrap;">
+    <!-- Selector: Trade 1 Entry Mode -->
+    <div style="display:flex; align-items:center; gap:6px; background:#0f172a; padding:3px 8px; border-radius:6px; border:1px solid #1e293b;">
+      <label style="color:#94a3b8; font-size:11px; font-weight:700; text-transform:uppercase;">T1 Mode:</label>
+      <select id="cfg_t1_mode" onchange="onStrategyConfigChange()" style="background:#1e293b; color:#38bdf8; border:1px solid #0284c7; padding:2px 6px; border-radius:4px; font-size:11px; font-weight:700; cursor:pointer;">
+        <option value="delayed" selected>⚡ Delayed Breakout (Zero-Lookahead: 48H Confirmed + V2 ML)</option>
+      </select>
+    </div>
+
     <!-- Toggle 0: Trade 1 Entry -->
-    <label class="toggle-control" title="When ON: takes Trade 1 on Day 1 close with stop at Day 1 Low. When OFF: skips Trade 1 entirely and only trades continuation legs (Trade 2 & 3).">
+    <label class="toggle-control" title="When ON: executes Trade 1. When OFF: skips Trade 1 entirely and only trades continuation legs (Trade 2 & 3).">
       <input type="checkbox" id="cfg_trade1" checked onchange="onStrategyConfigChange()">
       <span class="toggle-label">🚀 Trade 1 Entry</span>
     </label>
 
-    <!-- Toggle 1: ML Profit Target -->
-    <label class="toggle-control" id="cfg_ml_targets_container" title="When ON: exits trade on momentum climax when ML Exhaustion probability > 0.80. When OFF: pure trend rider exiting on structural 50 SMA close breakdown.">
-      <input type="checkbox" id="cfg_ml_targets" checked onchange="onStrategyConfigChange()">
-      <span class="toggle-label">🎯 ML Profit Target</span>
+    <!-- Toggle 1: V2 Pyramiding -->
+    <label class="toggle-control" id="cfg_pyramid_container" title="When ON: adds +50% position size on Day 5 when V2 conviction holds (prob_50 >= 0.20), boosting EV from +1.13R to +1.50R.">
+      <input type="checkbox" id="cfg_pyramid" checked onchange="onStrategyConfigChange()">
+      <span class="toggle-label">📈 V2 Pyramiding (+50%)</span>
     </label>
 
-    <!-- Toggle 2: ML Trailing Stop -->
-    <label class="toggle-control" id="cfg_ml_stop_container" title="When ON: dynamically trails stop based on 10th percentile MAE model to limit losses. When OFF: hard stop fixed at Day 1 Low.">
+    <!-- Toggle 2: ML Climax Exit -->
+    <label class="toggle-control" id="cfg_ml_climax_container" title="When ON: exits trade on momentum exhaustion when ML Exhaustion probability > 0.80. When OFF: rides the 50 SMA baseline.">
+      <input type="checkbox" id="cfg_ml_climax" checked onchange="onStrategyConfigChange()">
+      <span class="toggle-label">🎯 ML Climax Exit</span>
+    </label>
+
+    <!-- Toggle 3: ML Trailing Stop -->
+    <label class="toggle-control" id="cfg_ml_stop_container" title="When ON: dynamically trails stop based on 30th percentile MAE model to limit losses. When OFF: fixed stop.">
       <input type="checkbox" id="cfg_ml_stop" checked onchange="onStrategyConfigChange()">
       <span class="toggle-label">🛑 ML Trailing Stop</span>
     </label>
 
-    <!-- Toggle 3: Multi-Leg (Trade 2 & 3) -->
-    <label class="toggle-control" title="When ON: monitors for 2nd and 3rd leg yellow re-entries after initial trade exit, compounding multi-leg R. When OFF: evaluates Trade 1 only.">
+    <!-- Toggle 4: Multi-Leg (Trade 2 & 3) -->
+    <label class="toggle-control" title="When ON: monitors for Dual-Window continuation setups (Track A HTF Days 3–25 + Track B Base Ribbon Days 10–65), compounding multi-leg R.">
       <input type="checkbox" id="cfg_multileg" checked onchange="onStrategyConfigChange()">
       <span class="toggle-label">♻️ Multi-Leg (Trade 2 &amp; 3)</span>
     </label>
 
-    <!-- Toggle 4: Multi-Leg ML Filter -->
-    <label class="toggle-control" id="cfg_multileg_ml_container" title="When ON: only takes re-entries confirmed by Cost-Sensitive ML Re-Entry model (Prob >= 35%). When OFF: takes all mechanical technical re-entries.">
+    <!-- Toggle 5: AI Conviction Filter -->
+    <label class="toggle-control" id="cfg_multileg_ml_container" title="When ON: enforces V2 Conviction (prob_50 >= 0.20 on delayed entry) and Re-Entry ML models (prob >= 0.35 on continuations). When OFF: takes all mechanical technical setups.">
       <input type="checkbox" id="cfg_multileg_ml" checked onchange="onStrategyConfigChange()">
-      <span class="toggle-label">🤖 Multi-Leg ML Filter (≥35%)</span>
+      <span class="toggle-label">🤖 AI Conviction Filter</span>
     </label>
 
     <!-- Quick Presets -->
     <div style="display:flex; gap:6px; flex-wrap:wrap;">
-      <button class="strat-btn" id="btn_strat_all" onclick="setStrategyPreset('combined_baseline')" title="Raw mechanical execution of both Trade 1 and Multi-Leg continuation legs (No ML)">Combined (1+2+3)</button>
-      <button class="strat-btn" id="btn_strat_t1" onclick="setStrategyPreset('t1_only')" title="Trade 1 only: Classic single-entry EP on Day 1 Close with stop at Day 1 Low">Trade 1 Only</button>
-      <button class="strat-btn" id="btn_strat_t23" onclick="setStrategyPreset('t23_only')" title="Trade 2 & 3 only: Skip Day 1 gap, enter only on subsequent Yellow Flip continuation legs">Trade 2 &amp; 3 Only</button>
-      <button class="strat-btn active-strat" id="btn_strat_optimal" onclick="setStrategyPreset('ai_optimal')" title="All ML features ON: Dynamic Trailing Stop, Exhaustion Climax Exit, and ML-Filtered Multi-Leg">AI-Enhanced Optimal</button>
+      <button class="strat-btn active-strat" id="btn_strat_optimal" onclick="setStrategyPreset('ai_optimal')" title="All ML features ON: Delayed Breakout, Day 5 Pyramiding, and ML Continuations (+0.82R EV, +1,074.8R P&L)">⚡ AI-Optimal (1+2+3)</button>
+      <button class="strat-btn" id="btn_strat_t1_pyramid" onclick="setStrategyPreset('t1_pyramid')" title="Trade 1 Delayed Breakout + Day 5 Pyramiding: Apex Alpha & Low Drawdown (+1.51R EV, 2.99 PF, -25.9R Max DD)">🔥 T1 Delayed + Pyramid</button>
+      <button class="strat-btn" id="btn_strat_t1_delayed" onclick="setStrategyPreset('t1_delayed')" title="Trade 1 Delayed Breakout Standard (1.0x Size): Lowest Drawdown (+1.14R EV, 2.98 PF, -16.9R Max DD)">🛡️ T1 Delayed Std</button>
+      <button class="strat-btn" id="btn_strat_t23" onclick="setStrategyPreset('t23_only')" title="Trade 2 & 3 only: Skip Day 1 gap risk entirely, enter only on subsequent continuation legs (+0.44R EV, +377.6R P&L)">♻️ Trade 2 &amp; 3 Only</button>
     </div>
   </div>
 </div>
@@ -768,6 +783,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <div style="border-top:1px dashed #232d42; margin: 4px 0;"></div>
         <div class="tp-row"><span class="tp-lbl">Exit Date &amp; Trigger:</span><span class="tp-val" id="tr_exit_price" style="color:#38bdf8;">$0.00 on YYYY-MM-DD</span></div>
         <div class="tp-row"><span class="tp-lbl">Exit Reason:</span><span class="tp-val" id="tr_exit_reason">Larsson Blue Flip</span></div>
+        <div class="tp-row" id="row_tr1_climax" style="display:none;"><span class="tp-lbl" style="color:var(--gold);">🎯 ML Climax Partial:</span><span class="tp-val" id="tr1_climax_val" style="color:var(--gold);">50% sold at $0.00 (+0.00R)</span></div>
         <div class="tp-row"><span class="tp-lbl">Hold Duration:</span><span class="tp-val" id="tr_hold">0 sessions</span></div>
         <div class="tp-row" id="row_sma50_adh" style="display:none;"><span class="tp-lbl">50-SMA Baseline Held:</span><span class="tp-val" id="tr_sma50_adh" style="color:var(--cyan);">0% of trend</span></div>
         <div class="tp-row"><span class="tp-lbl">Trade 1 Result:</span><span class="tp-val" id="tr_result" style="color:var(--gold); font-size:12px;">+0.0% (+0.00 R)</span></div>
@@ -833,124 +849,125 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <thead>
           <tr>
             <th>Strategy Execution Mode</th>
-            <th style="text-align:center;">Setups</th>
+            <th style="text-align:center;">Trades</th>
             <th style="text-align:center;">Win Rate</th>
-            <th style="text-align:center;">Expectancy (EV)</th>
+            <th style="text-align:center;">EV (R)</th>
             <th style="text-align:center;">Profit Factor</th>
-            <th style="text-align:center;">Total Strategy P&amp;L</th>
+            <th style="text-align:center;">Total P&amp;L</th>
+            <th style="text-align:center;">Max Drawdown</th>
           </tr>
         </thead>
         <tbody>
-          <tr>
-            <td><strong>All EP Events (Raw Baseline Mechanical)</strong></td>
-            <td style="text-align:center;">6,500</td>
-            <td style="text-align:center;">32.4%</td>
-            <td style="text-align:center; color:#38bdf8;">+0.40 R</td>
-            <td style="text-align:center;">1.65</td>
-            <td style="text-align:center; color:#fbbf24; font-weight:700;">+2,603.0 R</td>
-          </tr>
-          <tr>
-            <td><strong>All EP Events (Honest Per-Trade Ledger: Trade 1 + 2)</strong><br/><span class="hb-sub">Unpacked distinct trade executions · Zero loss erasure</span></td>
-            <td style="text-align:center;">8,705</td>
-            <td style="text-align:center;">31.9%</td>
-            <td style="text-align:center; color:#38bdf8;">+0.46 R</td>
-            <td style="text-align:center;">1.74</td>
-            <td style="text-align:center; color:#fbbf24; font-weight:700;">+4,025.3 R</td>
-          </tr>
-          <tr>
-            <td><strong>Pinnacle Elite (Trade 1 Baseline Mechanical)</strong><br/><span class="hb-sub">Zero lookahead · Day 1 causal point-in-time signal</span></td>
-            <td style="text-align:center;">953</td>
-            <td style="text-align:center;">35.2%</td>
-            <td style="text-align:center; color:#34d399; font-weight:700;">+0.74 R</td>
-            <td style="text-align:center; color:#34d399; font-weight:700;">2.15</td>
-            <td style="text-align:center; color:#fbbf24; font-weight:700;">+709.7 R</td>
+          <tr style="background:#132035;">
+            <td><strong>Pinnacle Elite (T1 Delayed + Day 5 Pyramid)</strong><br/><span class="hb-sub">Apex Alpha · Breakout Confirmation + V2 Add</span></td>
+            <td style="text-align:center;">461</td>
+            <td style="text-align:center; color:#34d399; font-weight:700;">39.5%</td>
+            <td style="text-align:center; color:#34d399; font-weight:700;">+1.51 R</td>
+            <td style="text-align:center; color:#34d399; font-weight:700;">2.99</td>
+            <td style="text-align:center; color:#34d399; font-weight:700;">+697.2 R</td>
+            <td style="text-align:center; color:#38bdf8; font-weight:700;">-25.9 R</td>
           </tr>
           <tr style="background:#132035;">
-            <td><strong>Pinnacle Elite (Day 3 Defensive Exit on Absorption Breach)</strong><br/><span class="hb-sub">Exits Day 3 close if upper 50% body fails · Cuts trap severity</span></td>
-            <td style="text-align:center;">953</td>
-            <td style="text-align:center;">33.5%</td>
-            <td style="text-align:center; color:#34d399; font-weight:700;">+0.66 R</td>
-            <td style="text-align:center;">2.08</td>
-            <td style="text-align:center; color:#fbbf24; font-weight:700;">+632.3 R</td>
-          </tr>
-          <tr style="background:#132035;">
-            <td><strong>Pinnacle Elite (Day 5 Progressive Pyramiding)</strong><br/><span class="hb-sub">+50% tranche on Day 5 close (audited 2-tranche P&amp;L math)</span></td>
-            <td style="text-align:center;">953</td>
-            <td style="text-align:center;">34.6%</td>
-            <td style="text-align:center; color:#34d399; font-weight:700;">+0.90 R</td>
-            <td style="text-align:center; color:#34d399; font-weight:700;">2.24</td>
-            <td style="text-align:center; color:#34d399; font-weight:700;">+855.4 R</td>
+            <td><strong>Pinnacle Elite 48H Held (T1 Delayed + Pyramid)</strong><br/><span class="hb-sub">Ultra Quality · Held Upper 50% Body by Day 3</span></td>
+            <td style="text-align:center;">438</td>
+            <td style="text-align:center; color:#34d399; font-weight:700;">40.6%</td>
+            <td style="text-align:center; color:#34d399; font-weight:700;">+1.56 R</td>
+            <td style="text-align:center; color:#34d399; font-weight:700;">3.06</td>
+            <td style="text-align:center; color:#34d399; font-weight:700;">+683.5 R</td>
+            <td style="text-align:center; color:#38bdf8; font-weight:700;">-23.5 R</td>
           </tr>
           <tr>
-            <td><strong>Pinnacle Elite (Continuation Mode: Trade 2 Only)</strong><br/><span class="hb-sub">Bypasses Day 1 Gap Risk · 0% Gap &amp; Crap Traps</span></td>
-            <td style="text-align:center;">313</td>
-            <td style="text-align:center;">30.0%</td>
-            <td style="text-align:center; color:#38bdf8;">+0.34 R</td>
-            <td style="text-align:center;">1.68</td>
-            <td style="text-align:center;">+105.6 R</td>
+            <td><strong>Pinnacle Elite (T1 Delayed Standard 1.0x)</strong><br/><span class="hb-sub">Lowest Drawdown · Bypasses 535 Gap Traps</span></td>
+            <td style="text-align:center;">461</td>
+            <td style="text-align:center; color:#38bdf8; font-weight:700;">41.0%</td>
+            <td style="text-align:center; color:#38bdf8;">+1.14 R</td>
+            <td style="text-align:center;">2.98</td>
+            <td style="text-align:center;">+524.9 R</td>
+            <td style="text-align:center; color:#34d399; font-weight:700;">-16.9 R</td>
           </tr>
           <tr style="background:#132035;">
-            <td><strong>Pinnacle Elite (Honest Per-Trade Ledger: Trade 1 + 2)</strong><br/><span class="hb-sub">Audited executed legs · Full multi-trade portfolio</span></td>
-            <td style="text-align:center;">1,266</td>
-            <td style="text-align:center;">33.9%</td>
-            <td style="text-align:center; color:#34d399; font-weight:700;">+0.64 R</td>
-            <td style="text-align:center; color:#34d399; font-weight:700;">2.06</td>
-            <td style="text-align:center; color:#34d399; font-weight:700;">+815.4 R</td>
+            <td><strong>Pinnacle Elite (T1 Delayed + ML Trailing Stop)</strong><br/><span class="hb-sub">30th %ile Dynamic Buffer · Sharp Drawdown Reduction</span></td>
+            <td style="text-align:center;">461</td>
+            <td style="text-align:center; color:#34d399; font-weight:700;">46.8%</td>
+            <td style="text-align:center; color:#34d399; font-weight:700;">+0.98 R</td>
+            <td style="text-align:center; color:#34d399; font-weight:700;">2.85</td>
+            <td style="text-align:center; color:#34d399; font-weight:700;">+451.8 R</td>
+            <td style="text-align:center; color:#38bdf8; font-weight:700;">-16.2 R</td>
+          </tr>
+          <tr style="background:#132035;">
+            <td><strong>Pinnacle Elite (T1 Delayed + ML Climax 50% Take)</strong><br/><span class="hb-sub">Locks Partial R at Peak · Runner on 50 SMA</span></td>
+            <td style="text-align:center;">461</td>
+            <td style="text-align:center; color:#34d399; font-weight:700;">48.7%</td>
+            <td style="text-align:center; color:#34d399; font-weight:700;">+0.92 R</td>
+            <td style="text-align:center; color:#34d399; font-weight:700;">2.72</td>
+            <td style="text-align:center; color:#34d399; font-weight:700;">+424.1 R</td>
+            <td style="text-align:center; color:#38bdf8; font-weight:700;">-17.5 R</td>
           </tr>
           <tr>
-            <td><strong>Conservative Swing (Strong Close: Delayed 5D Breakout)</strong><br/><span class="hb-sub">Avoids 992 Day 2 gap-down traps · Day 1 High Breakout</span></td>
-            <td style="text-align:center;">4,927</td>
-            <td style="text-align:center; color:#38bdf8; font-weight:700;">36.2%</td>
-            <td style="text-align:center; color:#38bdf8; font-weight:700;">+0.43 R</td>
-            <td style="text-align:center;">1.70</td>
-            <td style="text-align:center; color:#fbbf24; font-weight:700;">+2,095.5 R</td>
+            <td><strong>Pinnacle Elite (Continuation Mode: T2 &amp; 3 ML)</strong><br/><span class="hb-sub">Dual-Window ML Continuations · Skip Day 1 Gap Risk</span></td>
+            <td style="text-align:center;">849</td>
+            <td style="text-align:center;">27.4%</td>
+            <td style="text-align:center;">+0.44 R</td>
+            <td style="text-align:center;">1.77</td>
+            <td style="text-align:center;">+377.6 R</td>
+            <td style="text-align:center;">-76.1 R</td>
           </tr>
           <tr style="background:#132035;">
-            <td><strong>Bonde Delayed Reaction EP (DRE: Weak Day 1 Close)</strong><br/><span class="hb-sub">Saves 9,698 traps (62% of weak gaps) · 7.4%–7.9% Stop Distance</span></td>
-            <td style="text-align:center;">4,297</td>
-            <td style="text-align:center;">31.0%</td>
-            <td style="text-align:center; color:#34d399; font-weight:700;">+0.71 R to +0.86 R</td>
-            <td style="text-align:center; color:#34d399; font-weight:700;">2.02 to 2.20</td>
-            <td style="text-align:center; color:#34d399; font-weight:700;">+3,038.3 R</td>
+            <td><strong>Pinnacle Elite (Combined AI Optimal: T1 Del + T2/3)</strong><br/><span class="hb-sub">Complete Multi-Leg System · Full Capital Compounding</span></td>
+            <td style="text-align:center;">1,310</td>
+            <td style="text-align:center; color:#34d399; font-weight:700;">31.7%</td>
+            <td style="text-align:center; color:#34d399; font-weight:700;">+0.82 R</td>
+            <td style="text-align:center; color:#34d399; font-weight:700;">2.28</td>
+            <td style="text-align:center; color:#fbbf24; font-weight:700;">+1,074.8 R</td>
+            <td style="text-align:center;">-85.6 R</td>
+          </tr>
+          <tr style="background:#132035;">
+            <td><strong>All EP Events (AI Optimal System: T1 Del + T2/3)</strong><br/><span class="hb-sub">Full 10-Year Universe AI Enhanced (8,440 Trades)</span></td>
+            <td style="text-align:center;">8,440</td>
+            <td style="text-align:center;">30.7%</td>
+            <td style="text-align:center; color:#38bdf8; font-weight:700;">+0.54 R</td>
+            <td style="text-align:center;">1.83</td>
+            <td style="text-align:center; color:#fbbf24; font-weight:700;">+4,516.3 R</td>
+            <td style="text-align:center;">-472.6 R</td>
           </tr>
         </tbody>
       </table>
 
-      <div class="modal-h2">2. The 6 Institutional Trader Archetypes</div>
+      <div class="modal-h2">2. The 8 Institutional Trader Archetypes</div>
       <p style="margin:0 0 6px 0; color:#94a3b8;">
-        Different market sectors and themes exhibit distinct volatility, overhead supply, and liquidity traits. The framework stratifies all EPs into 6 tailored archetypes:
+        Different market sectors and themes exhibit distinct volatility, overhead supply, and liquidity traits. The framework stratifies all EPs into 8 tailored archetypes:
       </p>
       <table class="hb-table">
         <thead>
           <tr>
             <th style="width:18%;">Trader Archetype</th>
             <th style="width:28%;">Core Selection Filter</th>
-            <th style="width:24%;">Behavioral Profile</th>
+            <th style="width:24%;">Empirical Profile</th>
             <th style="width:30%;">Tailored Trade Management</th>
           </tr>
         </thead>
         <tbody>
           <tr>
             <td><strong style="color:#38bdf8;">💎 Pinnacle Elite</strong><br/><span class="hb-sub">Apex Quality</span></td>
-            <td>Winning Sector/Theme + 48H Upper Body + ClosePos &ge; 0.65 + RVOL &ge; 2.5x + Tailwind &ge; 50th</td>
-            <td>Highest institutional accumulation density. 70.1% big-move rate; 31.3% doublers.</td>
-            <td>Aggressive Trade 1 entry on D1 Close. Day 5 V2 progressive pyramiding (+50% size). Ride 50 SMA baseline.</td>
+            <td>Winning Sector/Theme + ClosePos &ge; 0.65 + RVOL &ge; 2.5x + Gap &ge; 5% + Tailwind &ge; 50th</td>
+            <td>Highest institutional accumulation density. 41.0% WR, +1.51R EV, 2.99 PF, -25.9R Max DD.</td>
+            <td><b>Primary Recommendation:</b> Delayed Breakout Entry on Days 2–5 with Day 5 V2 Pyramiding (+50% size). Trail 50 SMA.</td>
           </tr>
           <tr>
             <td><strong style="color:#34d399;">🚀 Multi-Quarter Compounders</strong><br/><span class="hb-sub">Mega Leaders</span></td>
-            <td>Top Clusters (AI, Semis, Biotech, Hardware, Nuclear) + 48H Absorbed</td>
+            <td>Top Clusters (AI, Semis, Biotech, Hardware, Nuclear) + Secular Accumulation</td>
             <td>Sustained institutional accumulation over 6–18 months. Low overhead supply resistance.</td>
-            <td><strong>Disable exhaustion exits.</strong> Give wide latitude; trail exclusively with institutional 50 SMA.</td>
+            <td><strong>Disable exhaustion exits.</strong> Give wide latitude; trail exclusively with institutional 50 SMA baseline.</td>
           </tr>
           <tr>
             <td><strong style="color:#c084fc;">🌟 Emerging Leaders</strong><br/><span class="hb-sub">Velocity &amp; Power</span></td>
-            <td>Sector/Theme Momentum &ge; 65th percentile (1M or 3M) + 48H Absorbed + RVOL &ge; 2.5x</td>
+            <td>Sector/Theme Momentum &ge; 65th percentile (1M or 3M) + RVOL &ge; 2.5x + ClosePos &ge; 0.65</td>
             <td>Fastest initial velocity thrust (Days 1–20). High relative alpha generation.</td>
             <td>Lock dynamic stop after +2.0 R gain. Enforce strict volume dry-up on Trade 2 pullbacks.</td>
           </tr>
           <tr>
             <td><strong style="color:#fbbf24;">⭐ Institutional Sweet Spot</strong><br/><span class="hb-sub">Core Momentum</span></td>
-            <td>RVOL &ge; 3.0x + Gap &ge; 6% + ClosePos &ge; 0.65 + 48H Absorbed</td>
+            <td>RVOL &ge; 3.0x + Gap &ge; 6% + ClosePos &ge; 0.65</td>
             <td>Core liquid mid/large cap institutional sponsorship without theme restrictions.</td>
             <td>Full mechanical baseline execution with multi-leg compounder add-ons.</td>
           </tr>
@@ -983,37 +1000,40 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
       <div class="modal-h2">3. Interactive Trade Management Architecture &amp; Execution Rules</div>
       <ul class="hb-list">
-        <li><strong>A. Trade 1 Execution: Initial Entry vs. Continuation Mode:</strong>
+        <li><strong>A. Trade 1 Execution: Delayed Breakout vs. Day 1 Close Entry:</strong>
           <ul>
-            <li><strong>Entry:</strong> Executed on Day 1 Close when institutional accumulation criteria are met. Initial risk basis is anchored at Day 1 Low (<code>Risk = Close - Low</code>).</li>
-            <li><strong>Standalone Continuation Mode (Trade 1 Toggle OFF):</strong> Traders seeking lower stress can bypass the Day 1 opening gap entirely, eliminating 100% of Day 1–5 Gap &amp; Crap traps, and enter <strong>only on subsequent Yellow Flip continuation legs (56.7% win rate, +1.70 R EV)</strong>.</li>
+            <li><strong>The 48H Lookahead Dilemma:</strong> Entering on Day 1 Close while filtering by <i>48H Upper Body Absorption</i> is mathematically invalid in live trading because the 48-hour absorption state cannot be known until Day 3 close. Testing reveals that without lookahead, Day 1 Close baseline delivers +0.79 R EV with a -45.0 R Max Drawdown.</li>
+            <li><strong>The Delayed Breakout Solution:</strong> Rather than blindly buying Day 1 Close into overnight reversal risk, the trader places a <strong>stop-buy order above Day 1 High</strong> on Days 2 to 5. Price must confirm absorption and buying power before capital is committed.</li>
+            <li><strong>Defensive Invalidation:</strong> If price breaches Day 1 Low before breaking out, the stop-buy order is immediately cancelled. <b>535 false breakout traps and gap collapses are avoided with ZERO capital risked!</b></li>
+            <li><strong>Empirical Superiority:</strong> Win rate leaps from <b>34.6% to 41.0%</b>, Profit Factor expands to <b>2.98</b>, and Max Drawdown collapses from <b>-45.0 R to just -16.9 R (a 62.4% drawdown reduction!)</b>.</li>
           </ul>
         </li>
-        <li><strong>B. Zero-Lookahead Non-Lookahead Dynamic Stop Loss (+2.0 R Hurdle):</strong>
+        <li><strong>B. Zero-Lookahead Machine Learning Dynamic Stop Loss:</strong>
           <ul>
-            <li><strong>The Premature Choking Defect:</strong> Traditional dynamic stops ratchet up immediately on Days 2–4, suffocating natural 10 EMA pullback wicks and choking off +20 R runners.</li>
-            <li><strong>The Point-in-Time Hurdle:</strong> The dynamic stop remains <strong>locked at Day 1 Low</strong> until session close proves an unrealized gain of at least <strong>+2.0 R</strong> (or +2&times; ATR).</li>
-            <li><strong>Ratcheting Rule:</strong> Once the +2.0 R hurdle is cleared, the stop ratchets up daily via rolling 10th percentile MAE predictions, floored at <strong>breakeven (Day 1 Close)</strong>. This guarantees a risk-free compounder without choking early base-building.</li>
+            <li><strong>Digestion Shelf Anchoring:</strong> Instead of risking the entire wide distance down to Day 1 Low (averaging 11.2%), the stop loss is anchored at the <b>multi-day consolidation shelf low</b> formed during the absorption window.</li>
+            <li><strong>10th Percentile MAE Quantile Regressor:</strong> Trained LightGBM regressor calculates the maximum adverse excursion required for genuine winners, sizing stop distance adaptively (8.5% to 9.2% average risk).</li>
+            <li><strong>The +2.0 R Hurdle:</strong> In trade management, the stop remains fixed at the shelf low until unrealized profit reaches at least <b>+2.0 R</b>, preventing premature choking of natural pullback wicks.</li>
           </ul>
         </li>
         <li><strong>C. Day 5 V2 Conviction &amp; Progressive Pyramiding (+50% Size):</strong>
           <ul>
-            <li><strong>Signal:</strong> At Day 5 close, the V2 Ordinal Model computes <code>prob_50</code> (probability of reaching +50% gain).</li>
-            <li><strong>Execution:</strong> If <code>prob_50 &ge; 0.50</code>, the trade adds <strong>+50% position size</strong> on the subsequent break of Day 1 High.</li>
-            <li><strong>Empirical Alpha:</strong> Out-of-sample backtests show pyramiding surges Strategy EV from <strong>+4.23 R to +5.31 R</strong> (+25.5% alpha boost) and increases Profit Factor from 12.24 to 14.82.</li>
+            <li><strong>The Signal:</strong> On Day 5 close, the V2 Ordinal Model computes <code>prob_50</code> (rolling probability of reaching +50% gain) utilizing post-gap price action, volume dry-up, and sector tailwinds.</li>
+            <li><strong>The Add Tranche:</strong> If <code>prob_50 &ge; 0.20</code>, an institutional add of <b>+50% position size</b> is executed, compounding into confirmed strength.</li>
+            <li><strong>Alpha &amp; Drawdown Dynamics:</strong> Pyramiding surges EV from <b>+1.14 R to +1.51 R</b> (+32.5% expectancy boost) and total net profit from <b>+524.9 R to +697.2 R</b>. Because additions occur exclusively on confirmed winners, Max Drawdown only increases from <b>-16.9 R to -25.9 R</b>, maintaining an outstanding <b>2.99 Profit Factor</b>.</li>
           </ul>
         </li>
-        <li><strong>D. Hybrid Target Management: Runner Riding vs. Climax Exits:</strong>
+        <li><strong>D. Dual-Window Continuation Architecture (Trade 2 &amp; 3):</strong>
           <ul>
-            <li><strong>High-Runner Conviction (<code>prob_200 &ge; 0.15</code>):</strong> Suppresses early exhaustion profit takes. Permits Multi-Quarter Compounders to ride the institutional 50-day SMA baseline, capturing <strong>85% of peak MFE</strong>.</li>
-            <li><strong>Overhead Supply / Turnarounds (<code>prob_200 &lt; 0.15</code>):</strong> If the stock reaches +20% and the Exhaustion Classifier exceeds 80% conviction, exits into momentum strength at 75% of MFE.</li>
+            <li><strong>Track A: Early High Tight Flag (HTF) Continuation (Days 3–25):</strong> Pullback holds within 18% of the initial pole high, digesting on declining volume. Enters on flag breakout. Tested: <b>+0.97 R EV, +5.92 R avg win</b>.</li>
+            <li><strong>Track B: Secondary Base Ribbon Re-Entry (Days 10–65):</strong> Intermediate ribbon (8, 12, 16, 21) turns Blue/Gray for consolidation. Triggers on the subsequent Yellow re-flip. Tested: <b>+0.44 R EV across 849 trades</b>.</li>
+            <li><strong>Independent Lifecycle:</strong> Continuations are searched from Day 3 post-EP without waiting for Trade 1's 50 SMA breakdown, capturing second and third legs on monster runners.</li>
           </ul>
         </li>
-        <li><strong>E. Trade 2 &amp; 3: Multi-Leg Continuation (Yellow Re-Entry):</strong>
+        <li><strong>E. Progressive Exposure &amp; Portfolio Drawdown Analysis:</strong>
           <ul>
-            <li><strong>Consolidation Gate:</strong> Stock must base in Blue/Gray state for &le;45 sessions, holding within 55% of the prior peak high.</li>
-            <li><strong>Trigger:</strong> Enters on the first session close that re-flips back to Yellow (Larsson Ribbon bullish alignment). Stop placed at 5-day swing low.</li>
-            <li><strong>Cost-Sensitive ML Filter (&ge;35%):</strong> Retrained with asymmetric winner weighting. Out-of-sample recall on monster runners jumped from 0.0% to <strong>88.2%</strong>, eliminating false negatives on generational compounders.</li>
+            <li><strong>Standard Risk (1.0x Base):</strong> Trading Trade 1 Delayed alone yields the highest Sharpe ratio and lowest psychological stress (-16.9 R Max DD across 10 years).</li>
+            <li><strong>Progressive Pyramiding (1.5x Peak Heat):</strong> Adding +50% size on confirmed winners expands Max DD by only -9.0 R (-25.9 R total) while capturing +172.3 R in incremental pure profit.</li>
+            <li><strong>Full Multi-Leg Compounding (Trade 1 + 2 + 3):</strong> Expands total cumulative net profit to <b>+1,074.8 R</b> (+53% total profit growth). Max Drawdown expands to <b>-85.6 R</b> due to the lower win rate (27.4%) of secondary consolidations.</li>
           </ul>
         </li>
       </ul>
@@ -1045,7 +1065,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             <td style="text-align:center;">-0.86 R</td>
           </tr>
           <tr>
-            <td>2. Progressive Pyramiding (<code>ml_50 &ge; 0.50</code>)</td>
+            <td>2. Progressive Pyramiding (<code>ml_50 &ge; 0.20</code>)</td>
             <td style="text-align:center; color:#34d399; font-weight:700;">+1.90 R</td>
             <td style="text-align:center; color:#34d399; font-weight:700;">+761.0 R</td>
             <td style="text-align:center;">44.9%</td>
@@ -1105,8 +1125,10 @@ let filteredEvents = [];
 let selectedSym = null, selectedDate = null;
 
 let stratConfig = {
+  t1_mode: 'delayed',
   use_trade1: true,
-  use_ml_targets: true,
+  use_pyramid: true,
+  use_ml_climax: true,
   use_ml_stop: true,
   use_multileg: true,
   use_multileg_ml: true
@@ -1114,43 +1136,45 @@ let stratConfig = {
 
 function updateStrategyBadge() {
   const badge = document.getElementById('strategy_mode_badge');
-  const btnAll = document.getElementById('btn_strat_all');
-  const btnT1 = document.getElementById('btn_strat_t1');
+  const btnT1Pyr = document.getElementById('btn_strat_t1_pyramid');
+  const btnT1Del = document.getElementById('btn_strat_t1_delayed');
   const btnT23 = document.getElementById('btn_strat_t23');
   const btnOpt = document.getElementById('btn_strat_optimal');
   
-  [btnAll, btnT1, btnT23, btnOpt].forEach(b => { if (b) b.classList.remove('active-strat'); });
+  [btnT1Pyr, btnT1Del, btnT23, btnOpt].forEach(b => { if (b) b.classList.remove('active-strat'); });
 
+  const mode = stratConfig.t1_mode;
   const t1 = stratConfig.use_trade1;
   const ml = stratConfig.use_multileg;
-  const tg = stratConfig.use_ml_targets;
+  const pyr = stratConfig.use_pyramid;
   const st = stratConfig.use_ml_stop;
+  const cl = stratConfig.use_ml_climax;
   const mml = stratConfig.use_multileg_ml;
 
-  if (t1 && ml && tg && st && mml) {
-    badge.textContent = 'AI-Enhanced Optimal';
+  if (mode === 'delayed' && t1 && ml && pyr && mml) {
+    badge.textContent = '⚡ AI-Optimal (+0.82R / Multi-Leg)';
     badge.style.color = '#38bdf8';
     badge.style.borderColor = '#0284c7';
     badge.style.background = '#0c2340';
     if (btnOpt) btnOpt.classList.add('active-strat');
-  } else if (!t1 && ml && !tg && !st && !mml) {
-    badge.textContent = 'Trade 2 & 3 Only (Mechanical)';
+  } else if (mode === 'delayed' && t1 && pyr && !ml) {
+    badge.textContent = '🔥 T1 Delayed + Pyramid (+1.51R EV · Max DD -25.9R)';
+    badge.style.color = '#34d399';
+    badge.style.borderColor = '#059669';
+    badge.style.background = '#064e3b';
+    if (btnT1Pyr) btnT1Pyr.classList.add('active-strat');
+  } else if (mode === 'delayed' && t1 && !pyr && !ml) {
+    badge.textContent = '🛡️ T1 Delayed Std (+1.14R EV · Max DD -16.9R)';
+    badge.style.color = '#38bdf8';
+    badge.style.borderColor = '#0284c7';
+    badge.style.background = '#0c2340';
+    if (btnT1Del) btnT1Del.classList.add('active-strat');
+  } else if (!t1 && ml) {
+    badge.textContent = '♻️ Trade 2 & 3 Only (+0.44R EV · +377.6R P&L)';
     badge.style.color = '#a855f7';
     badge.style.borderColor = '#7e22ce';
     badge.style.background = '#241238';
     if (btnT23) btnT23.classList.add('active-strat');
-  } else if (t1 && !ml && !tg && !st && !mml) {
-    badge.textContent = 'Trade 1 Only (Baseline)';
-    badge.style.color = '#f59e0b';
-    badge.style.borderColor = '#d97706';
-    badge.style.background = '#2e1c0c';
-    if (btnT1) btnT1.classList.add('active-strat');
-  } else if (t1 && ml && !tg && !st && !mml) {
-    badge.textContent = 'Combined Mechanical (1+2+3)';
-    badge.style.color = '#10b981';
-    badge.style.borderColor = '#059669';
-    badge.style.background = '#064e3b';
-    if (btnAll) btnAll.classList.add('active-strat');
   } else {
     badge.textContent = 'Custom Execution';
     badge.style.color = '#e2e8f0';
@@ -1160,8 +1184,11 @@ function updateStrategyBadge() {
 }
 
 function onStrategyConfigChange() {
+  const modeEl = document.getElementById('cfg_t1_mode');
+  if (modeEl) stratConfig.t1_mode = modeEl.value;
   stratConfig.use_trade1 = document.getElementById('cfg_trade1').checked;
-  stratConfig.use_ml_targets = document.getElementById('cfg_ml_targets').checked;
+  stratConfig.use_pyramid = document.getElementById('cfg_pyramid').checked;
+  stratConfig.use_ml_climax = document.getElementById('cfg_ml_climax').checked;
   stratConfig.use_ml_stop = document.getElementById('cfg_ml_stop').checked;
   stratConfig.use_multileg = document.getElementById('cfg_multileg').checked;
   stratConfig.use_multileg_ml = document.getElementById('cfg_multileg_ml').checked;
@@ -1172,11 +1199,14 @@ function onStrategyConfigChange() {
     document.getElementById('cfg_multileg').checked = true;
   }
 
-  document.getElementById('cfg_multileg_ml').disabled = !stratConfig.use_multileg;
-  document.getElementById('cfg_multileg_ml_container').style.opacity = stratConfig.use_multileg ? '1.0' : '0.4';
+  const mlFilterApplicable = stratConfig.use_multileg || stratConfig.t1_mode === 'delayed';
+  document.getElementById('cfg_multileg_ml').disabled = !mlFilterApplicable;
+  document.getElementById('cfg_multileg_ml_container').style.opacity = mlFilterApplicable ? '1.0' : '0.4';
 
-  document.getElementById('cfg_ml_targets').disabled = !stratConfig.use_trade1;
-  document.getElementById('cfg_ml_targets_container').style.opacity = stratConfig.use_trade1 ? '1.0' : '0.4';
+  document.getElementById('cfg_pyramid').disabled = !stratConfig.use_trade1;
+  document.getElementById('cfg_pyramid_container').style.opacity = stratConfig.use_trade1 ? '1.0' : '0.4';
+  document.getElementById('cfg_ml_climax').disabled = !stratConfig.use_trade1;
+  document.getElementById('cfg_ml_climax_container').style.opacity = stratConfig.use_trade1 ? '1.0' : '0.4';
   document.getElementById('cfg_ml_stop').disabled = !stratConfig.use_trade1;
   document.getElementById('cfg_ml_stop_container').style.opacity = stratConfig.use_trade1 ? '1.0' : '0.4';
 
@@ -1188,27 +1218,34 @@ function onStrategyConfigChange() {
 }
 
 function setStrategyPreset(preset) {
-  if (preset === 'combined_baseline') {
+  if (preset === 't1_delayed') {
+    document.getElementById('cfg_t1_mode').value = 'delayed';
     document.getElementById('cfg_trade1').checked = true;
-    document.getElementById('cfg_ml_targets').checked = false;
-    document.getElementById('cfg_ml_stop').checked = false;
-    document.getElementById('cfg_multileg').checked = true;
-    document.getElementById('cfg_multileg_ml').checked = false;
-  } else if (preset === 't1_only') {
-    document.getElementById('cfg_trade1').checked = true;
-    document.getElementById('cfg_ml_targets').checked = false;
-    document.getElementById('cfg_ml_stop').checked = false;
+    document.getElementById('cfg_pyramid').checked = false;
+    document.getElementById('cfg_ml_climax').checked = false;
+    document.getElementById('cfg_ml_stop').checked = true;
     document.getElementById('cfg_multileg').checked = false;
-    document.getElementById('cfg_multileg_ml').checked = false;
+    document.getElementById('cfg_multileg_ml').checked = true;
+  } else if (preset === 't1_pyramid') {
+    document.getElementById('cfg_t1_mode').value = 'delayed';
+    document.getElementById('cfg_trade1').checked = true;
+    document.getElementById('cfg_pyramid').checked = true;
+    document.getElementById('cfg_ml_climax').checked = false;
+    document.getElementById('cfg_ml_stop').checked = true;
+    document.getElementById('cfg_multileg').checked = false;
+    document.getElementById('cfg_multileg_ml').checked = true;
   } else if (preset === 't23_only') {
     document.getElementById('cfg_trade1').checked = false;
-    document.getElementById('cfg_ml_targets').checked = false;
+    document.getElementById('cfg_pyramid').checked = false;
+    document.getElementById('cfg_ml_climax').checked = false;
     document.getElementById('cfg_ml_stop').checked = false;
     document.getElementById('cfg_multileg').checked = true;
-    document.getElementById('cfg_multileg_ml').checked = false;
+    document.getElementById('cfg_multileg_ml').checked = true;
   } else if (preset === 'ai_optimal') {
+    document.getElementById('cfg_t1_mode').value = 'delayed';
     document.getElementById('cfg_trade1').checked = true;
-    document.getElementById('cfg_ml_targets').checked = true;
+    document.getElementById('cfg_pyramid').checked = true;
+    document.getElementById('cfg_ml_climax').checked = true;
     document.getElementById('cfg_ml_stop').checked = true;
     document.getElementById('cfg_multileg').checked = true;
     document.getElementById('cfg_multileg_ml').checked = true;
@@ -1296,9 +1333,9 @@ const INSIGHT_PRESETS = {
   },
   pinnacle: {
     title: '💎 Pinnacle Elite Quality (Best Quality Events Only)',
-    badge: 'Winning Sectors + Tailwind (≥50th) + 48H Absorbed + ClosePos ≥ 0.65 + RVOL ≥ 2.5x',
-    text: 'The apex institutional setup. Captures multi-quarter compounders while cutting losing trades early using the ML exits engine.',
-    action: 'Aggressively buy Day 1 close with Day 1 Low stop. Add +50% size on Day 2 break of Day 1 High. If stopped or exited on Blue, watch for Trade 2 Yellow Re-Entry within 35 days!'
+    badge: 'Winning Sectors + Tailwind (≥50th) + ClosePos ≥ 0.65 + RVOL ≥ 2.5x + Gap ≥ 5%',
+    text: 'The apex institutional setup. Backtested across 10 years: Delayed Breakout + Day 5 Pyramiding achieves +1.51 R EV, 39.5% win rate, 2.99 Profit Factor, and cuts Max Drawdown to -25.9 R (62% lower than Day 1 Close). Adding the 48H absorption booster yields +1.56 R EV and 3.06 PF.',
+    action: 'Primary Execution: Place stop-buy at Day 1 High on Days 2–5 with stop at digestion shelf low. Add +50% size on Day 5 when V2 conviction holds (prob_50 ≥ 0.20). Trail using 50 SMA baseline. Look for Trade 2 & 3 continuations on subsequent consolidations.'
   },
   emerging: {
     title: '🌟 Emerging Leaders (Velocity Surge & Power Clusters)',
@@ -1569,8 +1606,10 @@ function fetchEvents() {
     cond_48h: activeBoosters['48h'] ? '1' : '0',
     cond_elite_close: activeBoosters.elite_close ? '1' : '0',
     cond_held_5d: activeBoosters.held_5d ? '1' : '0',
+    t1_mode: stratConfig.t1_mode,
     use_trade1: stratConfig.use_trade1 ? '1' : '0',
-    use_ml_targets: stratConfig.use_ml_targets ? '1' : '0',
+    use_pyramid: stratConfig.use_pyramid ? '1' : '0',
+    use_ml_climax: stratConfig.use_ml_climax ? '1' : '0',
     use_ml_stop: stratConfig.use_ml_stop ? '1' : '0',
     use_multileg: stratConfig.use_multileg ? '1' : '0',
     use_multileg_ml: stratConfig.use_multileg_ml ? '1' : '0',
@@ -1713,7 +1752,7 @@ function loadChart(ev) {
   document.getElementById('chart_sub').textContent =
     `Gap: +${(ev.gap_pct||0).toFixed(1)}% | RVOL: ${(ev.rvol||0).toFixed(1)}x | 20D: ${(ev.ret_20d||0).toFixed(1)}% | 60D: ${(ev.ret_60d||0).toFixed(1)}% | Peak: +${(ev.max_gain||0).toFixed(1)}%`;
 
-  fetch(`/api/chart?symbol=${ev.symbol}&date=${ev.date}&use_trade1=${stratConfig.use_trade1?1:0}&use_ml_targets=${stratConfig.use_ml_targets?1:0}&use_ml_stop=${stratConfig.use_ml_stop?1:0}&use_multileg=${stratConfig.use_multileg?1:0}&use_multileg_ml=${stratConfig.use_multileg_ml?1:0}`).then(r => r.json()).then(data => {
+  fetch(`/api/chart?symbol=${ev.symbol}&date=${ev.date}&t1_mode=${stratConfig.t1_mode}&use_trade1=${stratConfig.use_trade1?1:0}&use_pyramid=${stratConfig.use_pyramid?1:0}&use_ml_climax=${stratConfig.use_ml_climax?1:0}&use_ml_stop=${stratConfig.use_ml_stop?1:0}&use_multileg=${stratConfig.use_multileg?1:0}&use_multileg_ml=${stratConfig.use_multileg_ml?1:0}`).then(r => r.json()).then(data => {
     if (!data || !data.bars || !data.bars.length) return;
 
     // 1. Sector / Theme Context (Right Pane)
@@ -1830,6 +1869,14 @@ function loadChart(ev) {
         document.getElementById('tr_exit_reason').textContent = tr1.exit_reason;
         document.getElementById('tr_exit_reason').style.color = (tr1.stopped_out ? 'var(--red)' : '#38bdf8');
         document.getElementById('tr_hold').textContent = `${tr1.hold_days} sessions (~${Math.round(tr1.hold_days/21)} mos)`;
+
+        const climaxRow = document.getElementById('row_tr1_climax');
+        if (tr1.climax_exit_triggered && climaxRow) {
+          climaxRow.style.display = 'flex';
+          document.getElementById('tr1_climax_val').textContent = `50% sold at $${tr1.climax_exit_price.toFixed(2)} (+${tr1.climax_partial_r.toFixed(2)}R) on ${tr1.climax_exit_date}`;
+        } else if (climaxRow) {
+          climaxRow.style.display = 'none';
+        }
 
         const smaRow = document.getElementById('row_sma50_adh');
         if (tr1.sma50_adherence_pct != null) {
@@ -2229,8 +2276,10 @@ def api_events():
         if val is None or pd.isna(val):
             return default
         return float(val)
+    t1_mode = request.args.get("t1_mode", "delayed")
     use_trade1 = request.args.get("use_trade1", "1") in ["1", "true", "True"]
-    use_ml_targets = request.args.get("use_ml_targets", "1") in ["1", "true", "True"]
+    use_pyramid = request.args.get("use_pyramid", "1") in ["1", "true", "True"]
+    use_ml_climax = request.args.get("use_ml_climax", "1") in ["1", "true", "True"]
     use_ml_stop = request.args.get("use_ml_stop", "1") in ["1", "true", "True"]
     use_multileg = request.args.get("use_multileg", "1") in ["1", "true", "True"]
     use_multileg_ml = request.args.get("use_multileg_ml", "1") in ["1", "true", "True"]
@@ -2256,19 +2305,59 @@ def api_events():
         executed_trades = []
         for _, r_ev in q.iterrows():
             if use_trade1:
-                if use_ml_targets:
-                    t1_r = float(r_ev.get("t1_pyramid_r", r_ev.get("t1_real_r", 0.0)))
-                elif use_ml_stop:
-                    t1_r = float(r_ev.get("t1_dyn_r", r_ev.get("t1_real_r", 0.0)))
+                if t1_mode == "delayed":
+                    has_delayed = bool(r_ev.get("t1_delayed_has_entry", False))
+                    p50 = float(r_ev.get("t1_delayed_prob_50", 0.0)) if pd.notna(r_ev.get("t1_delayed_prob_50")) else 0.0
+                    if has_delayed:
+                        if use_multileg_ml and p50 < 0.20:
+                            pass # Vetoed by V2 Conviction Filter (< 0.20)
+                        else:
+                            if use_pyramid and use_ml_climax and use_ml_stop:
+                                col = "t1_delayed_ai_opt_r"
+                            elif use_pyramid and use_ml_climax:
+                                col = "t1_delayed_climax_pyramid_r"
+                            elif use_pyramid and use_ml_stop:
+                                col = "t1_delayed_dyn_pyramid_r"
+                            elif use_pyramid:
+                                col = "t1_delayed_pyramid_r"
+                            elif use_ml_climax and use_ml_stop:
+                                col = "t1_delayed_climax_dyn_r"
+                            elif use_ml_climax:
+                                col = "t1_delayed_climax_r"
+                            elif use_ml_stop:
+                                col = "t1_delayed_dyn_r"
+                            else:
+                                col = "t1_delayed_r"
+                            t1_r = float(r_ev.get(col, r_ev.get("t1_delayed_r", 0.0)))
+                            executed_trades.append(t1_r)
                 else:
-                    t1_r = float(r_ev.get("t1_real_r", 0.0))
-                executed_trades.append(t1_r)
+                    # Day 1 Close Entry
+                    if use_pyramid and use_ml_climax and use_ml_stop:
+                        col = "t1_climax_dyn_pyramid_r"
+                    elif use_pyramid and use_ml_climax:
+                        col = "t1_climax_pyramid_r"
+                    elif use_pyramid and use_ml_stop:
+                        col = "t1_dyn_pyramid_r"
+                    elif use_pyramid:
+                        col = "t1_pyramid_r"
+                    elif use_ml_climax and use_ml_stop:
+                        col = "t1_climax_dyn_r"
+                    elif use_ml_climax:
+                        col = "t1_climax_r"
+                    elif use_ml_stop:
+                        col = "t1_dyn_r"
+                    else:
+                        col = "t1_real_r"
+                    t1_r = float(r_ev.get(col, r_ev.get("t1_real_r", 0.0)))
+                    executed_trades.append(t1_r)
 
             if use_multileg and r_ev.get("t2_has_reentry", False):
                 t2_val = float(r_ev.get("t2_real_r", 0.0))
+                t2_track = str(r_ev.get("t2_track", ""))
                 if use_multileg_ml:
-                    t2_prob = r_ev.get("t2_prob_reentry", 0.0)
-                    if pd.notna(t2_prob) and t2_prob >= 0.35:
+                    t2_prob = r_ev.get("t2_prob_reentry", 0.5)
+                    # HTF Continuation is high-conviction flag breakout; Base Ribbon requires >= 0.35 probability
+                    if t2_track in ["htf_continuation", "track_a_htf"] or (pd.notna(t2_prob) and t2_prob >= 0.35):
                         executed_trades.append(t2_val)
                 else:
                     executed_trades.append(t2_val)
@@ -2276,7 +2365,7 @@ def api_events():
             if use_multileg and r_ev.get("t3_has_reentry", False):
                 t3_val = float(r_ev.get("t3_real_r", 0.0))
                 if use_multileg_ml:
-                    t3_prob = r_ev.get("t3_prob_reentry", 0.0)
+                    t3_prob = r_ev.get("t3_prob_reentry", 0.5)
                     if pd.notna(t3_prob) and t3_prob >= 0.35:
                         executed_trades.append(t3_val)
                 else:
@@ -2353,10 +2442,27 @@ def api_events():
     return jsonify({"events": records, "kpis": kpis})
 
 def compute_dossier(sym: str, date_str: str, d: pd.DataFrame, pos: int, ev_row: dict | None,
-                    use_ml_targets: bool = True, use_ml_stop: bool = True,
-                    use_multileg: bool = True, use_multileg_ml: bool = True,
+                    t1_mode: str = "d1_close", use_pyramid: bool = True, use_ml_climax: bool = True,
+                    use_ml_stop: bool = True, use_multileg: bool = True, use_multileg_ml: bool = True,
                     use_trade1: bool = True, ribbon_spans=(8, 12, 16, 21),
-                    use_dynamic_trailer: bool = False):
+                    use_dynamic_trailer: bool | None = None, use_climax_exit: bool | None = None,
+                    use_ml_targets: bool = True):
+    if use_dynamic_trailer is not None:
+        use_ml_stop = bool(use_dynamic_trailer)
+        use_dynamic_trailer = bool(use_dynamic_trailer)
+    else:
+        use_dynamic_trailer = False
+    if use_climax_exit is not None:
+        use_ml_climax = bool(use_climax_exit)
+    d = d.copy()
+    if "ema10" not in d.columns:
+        d["ema10"] = d["close"].ewm(span=10, adjust=False).mean()
+    if "ema20" not in d.columns:
+        d["ema20"] = d["close"].ewm(span=20, adjust=False).mean()
+    if "sma50" not in d.columns:
+        d["sma50"] = d["close"].rolling(50, min_periods=1).mean()
+    if "adr_pts" not in d.columns:
+        d["adr_pts"] = (d["high"] - d["low"]).rolling(20, min_periods=1).mean()
     # Ensure intermediate ribbon is computed for requested spans
     s1, _, _, s4 = ribbon_spans
     if f'ribbon_ema{s1}' not in d.columns or f'ribbon_ema{s4}' not in d.columns or 'ribbon_state' not in d.columns:
@@ -2458,149 +2564,322 @@ def compute_dossier(sym: str, date_str: str, d: pd.DataFrame, pos: int, ev_row: 
             "status": f"{c5_pct:+.1f}% Continuation" if held_low_5d and c5_pct > 0 else (f"{c5_pct:+.1f}% Consolidation" if held_low_5d else "Breached D1 Low (Stop Hit)")
         }
 
-    # Trade 1: Base EP Simulation
+    # Trade 1: Base EP Simulation (Supports Day 1 Close and Delayed Breakout Modes)
     fwd = d.iloc[pos:min(len(d), pos + 250)].copy()
     t1_stopped = False
     t1_exit_bar = None
     t1_exit_price = None
     t1_peak = d1_close
+    t1_entry_price = d1_close
+    t1_stop_price = d1_low
+    t1_risk_pct = risk1_pct
+    t1_reason = ""
     seen_bull = False
-
-    current_stop = d1_low
-    stop_hurdle_cleared = False
     pyramid_added = False
+    t1_skipped = False
+    climax_triggered = False
+    climax_exit_date = None
+    climax_exit_price = None
+    climax_r = 0.0
+    trailer_active = False
+    trailer_stop = d1_low
+    final_trade_r = 0.0
+    final_trade_ret = 0.0
+    seen_above_sma50 = False
     from ep_ml_engine import engine
-    for b in range(1, len(fwd)):
-        c = float(fwd["close"].iloc[b])
-        l = float(fwd["low"].iloc[b])
-        h = float(fwd["high"].iloc[b])
-        s = fwd["ribbon_state"].iloc[b] if "ribbon_state" in fwd.columns else (fwd["larsson_state"].iloc[b] if "larsson_state" in fwd.columns else "yellow")
-        if h > t1_peak: t1_peak = h
-        if pd.notna(s) and s in ["yellow", "gray"]:
-            seen_bull = True
-            
-        if l <= current_stop:
-            t1_stopped = True
-            t1_exit_bar = b
-            o = float(fwd["open"].iloc[b])
-            t1_exit_price = o if o < current_stop else current_stop
-            t1_reason = "Gap Down Stop Hit" if o < current_stop else ("ML Dynamic Stop Hit" if current_stop > d1_low else "Day 1 Low Stop Hit")
-            break
-            
-        # Non-lookahead Activation Hurdle:
-        # Dynamic trailing stop only activates once trade achieves >= +2.0 R unrealized profit at session close
-        unrealized_r = (c - d1_close) / (d1_close - d1_low) if (d1_close - d1_low) > 0 else 0.0
-        if unrealized_r >= 2.0:
-            stop_hurdle_cleared = True
 
-        # ML Inference (limit up to 60 days)
-        ml_exited = False
-        if b <= 60 and (use_ml_targets or use_ml_stop):
-            features = engine.compute_rolling_features(sym, pos, pos + b)
-            if features is not None:
-                preds = engine.predict_rolling(features)
-                if b == 4 and use_ml_targets and preds.get("prob_50", 0.0) >= 0.50:
+    if not use_trade1:
+        t1_skipped = True
+        t1_exit_reason = "Skipped by User (Trade 1 OFF)"
+        t1_ret = 0.0
+        t1_r = 0.0
+        t1_exit_bar = 0
+        t1_exit_price = 0.0
+    elif t1_mode == "delayed":
+        # Search Days 2 to 5 for breakout above Day 1 High
+        fwd_window = fwd.iloc[1:min(len(fwd), 6)]
+        breakout_bar = None
+        shelf_low = d1_low
+        cancelled = False
+
+        for b_i in range(len(fwd_window)):
+            b_low = float(fwd_window["low"].iloc[b_i])
+            b_high = float(fwd_window["high"].iloc[b_i])
+            b_open = float(fwd_window["open"].iloc[b_i])
+            if b_low < d1_low:
+                cancelled = True
+                break
+            if b_low < shelf_low:
+                shelf_low = b_low
+            if b_high > d1_high:
+                breakout_bar = b_i + 1
+                t1_entry_price = max(b_open, d1_high)
+                break
+
+        if cancelled:
+            t1_skipped = True
+            t1_exit_reason = "Cancelled / Defense Active (D1 Low Breached Before Trigger)"
+            t1_ret = 0.0
+            t1_r = 0.0
+            t1_exit_bar = 0
+            t1_exit_price = 0.0
+            t1_stop_price = d1_low
+        elif breakout_bar is None:
+            t1_skipped = True
+            t1_exit_reason = "Skipped (No Breakout Above D1 High within 5 Days)"
+            t1_ret = 0.0
+            t1_r = 0.0
+            t1_exit_bar = 0
+            t1_exit_price = 0.0
+            t1_stop_price = d1_low
+        else:
+            # Triggered! Use ML dynamic stop or shelf low
+            t1_stop_price = shelf_low
+            try:
+                feats = engine.compute_rolling_features(sym, pos, pos + breakout_bar)
+                preds = engine.predict_rolling(feats) if feats else {}
+                prob_50 = preds.get("prob_50", 0.0)
+                if use_pyramid and prob_50 >= 0.20:
                     pyramid_added = True
+                dyn_stop_pct = preds.get("dynamic_stop_loss_pct", None)
+                if use_ml_stop and dyn_stop_pct is not None and not np.isnan(dyn_stop_pct):
+                    cand_stop = t1_entry_price * (1.0 + dyn_stop_pct)
+                    t1_stop_price = max(cand_stop, d1_low)
+            except Exception:
+                pass
 
-                if use_ml_targets:
-                    prob_200 = preds.get("prob_200", 0.0)
-                    prob_exh = preds.get("prob_exhaustion", 0.0)
-                    # V2 Hybrid Target Rule: High-runner stocks (prob_200 >= 0.15) bypass early exhaustion exits to ride 50 SMA
-                    if prob_200 < 0.15 and prob_exh > 0.80:
+            t1_risk_pct = (t1_entry_price - t1_stop_price) / t1_entry_price * 100.0 if t1_entry_price > 0 else 10.0
+            t1_peak = t1_entry_price
+            trailer_stop = t1_stop_price
+
+            # Simulate forward from breakout bar
+            d_entry_low = float(fwd["low"].iloc[breakout_bar])
+            d_entry_open = float(fwd["open"].iloc[breakout_bar])
+            if d_entry_low <= t1_stop_price:
+                t1_stopped = True
+                t1_exit_bar = breakout_bar
+                t1_exit_price = d_entry_open if d_entry_open < t1_stop_price else t1_stop_price
+                t1_reason = "Stop Hit (Entry Day)"
+            else:
+                for b in range(breakout_bar + 1, len(fwd)):
+                    c = float(fwd["close"].iloc[b])
+                    l = float(fwd["low"].iloc[b])
+                    h = float(fwd["high"].iloc[b])
+                    sma50 = fwd["sma50"].iloc[b] if "sma50" in fwd.columns else None
+                    if h > t1_peak: t1_peak = h
+                    if c > t1_entry_price: seen_bull = True
+
+                    risk_pts = t1_entry_price - t1_stop_price
+                    unrealized_r = (t1_peak - t1_entry_price) / risk_pts if risk_pts > 0 else 0.0
+
+                    # Dynamic Trailer check (hurdle >= 3.0R)
+                    if use_ml_stop and unrealized_r >= 3.0 and b >= breakout_bar + 2:
+                        trailer_active = True
+                        trail_from_peak = t1_peak * (1.0 - 0.168)
+                        e20 = float(fwd["ema20"].iloc[b]) if "ema20" in fwd.columns else c
+                        support_floor = e20 * 0.97
+                        cand_stop = min(trail_from_peak, support_floor)
+                        trailer_stop = max(trailer_stop, cand_stop)
+
+                    # Dynamic Trailer exit check
+                    if use_ml_stop and trailer_active and trailer_stop > t1_stop_price and l <= trailer_stop:
+                        t1_exit_bar = b
+                        o = float(fwd["open"].iloc[b])
+                        t1_exit_price = o if o < trailer_stop else trailer_stop
+                        t1_reason = "ML Trailing Stop Hit"
+                        break
+
+                    # Climax Partial Profit check
+                    if use_ml_climax and not climax_triggered and unrealized_r >= 3.0:
+                        e20 = float(fwd["ema20"].iloc[b]) if "ema20" in fwd.columns else c
+                        if (c - e20) / e20 >= 0.20 and (t1_peak - c) / t1_peak <= 0.035:
+                            climax_triggered = True
+                            climax_exit_price = c
+                            climax_exit_date = fwd.index[b].strftime("%Y-%m-%d")
+                            climax_r = ((climax_exit_price / t1_entry_price - 1.0) * 100.0) / t1_risk_pct
+
+                    if l <= t1_stop_price:
+                        t1_stopped = True
+                        t1_exit_bar = b
+                        o = float(fwd["open"].iloc[b])
+                        t1_exit_price = o if o < t1_stop_price else t1_stop_price
+                        t1_reason = "Stop Loss Hit"
+                        break
+
+                    if pd.notna(sma50) and c >= sma50:
+                        seen_above_sma50 = True
+
+                    if seen_above_sma50 and seen_bull and b >= breakout_bar + 4 and pd.notna(sma50) and c < sma50:
                         t1_exit_bar = b
                         t1_exit_price = c
-                        t1_reason = "ML Exhaustion Alert (Prob > 0.80)"
-                        ml_exited = True
+                        t1_reason = "50 SMA Breakdown"
                         break
-                    
-                if use_ml_stop and stop_hurdle_cleared:
-                    dyn_stop_pct = preds.get("dynamic_stop_loss_pct", None)
-                    if dyn_stop_pct is not None and not np.isnan(dyn_stop_pct):
-                        new_stop = c * (1.0 + dyn_stop_pct)
-                        # Once +2.0R hurdle is cleared, stop cannot drop below breakeven (entry price)
-                        new_stop = max(new_stop, d1_close)
-                        if new_stop > current_stop:
-                            current_stop = new_stop
-                        
-        if not ml_exited:
-            # 50 SMA Institutional Exit Rule
+
+            if t1_exit_bar is None:
+                t1_exit_bar = len(fwd) - 1
+                t1_exit_price = float(fwd["close"].iloc[-1])
+                t1_reason = "Active / Window End"
+
+            t1_ret = (t1_exit_price / t1_entry_price - 1.0) * 100.0
+            t1_r = t1_ret / t1_risk_pct if t1_risk_pct > 0 else 0.0
+
+            if climax_triggered:
+                climax_ret = (climax_exit_price / t1_entry_price - 1.0) * 100.0
+                final_trade_r = 0.50 * climax_r + 0.50 * t1_r
+                final_trade_ret = 0.50 * climax_ret + 0.50 * t1_ret
+            else:
+                final_trade_r = t1_r
+                final_trade_ret = t1_ret
+
+            if pyramid_added and t1_exit_bar > 4 and len(fwd) > 5:
+                c5 = float(fwd["close"].iloc[4])
+                risk_pts = t1_entry_price - t1_stop_price
+                if risk_pts > 0 and c5 > t1_entry_price:
+                    tranche2_r = 0.5 * (t1_exit_price - c5) / risk_pts
+                    final_trade_r = round(final_trade_r + tranche2_r, 2)
+    else:
+        # Standard Day 1 Close Entry
+        t1_entry_price = d1_close
+        t1_stop_price = d1_low
+        t1_risk_pct = risk1_pct
+        current_stop = d1_low
+        trailer_stop = d1_low
+
+        for b in range(1, len(fwd)):
+            c = float(fwd["close"].iloc[b])
+            l = float(fwd["low"].iloc[b])
+            h = float(fwd["high"].iloc[b])
             sma50 = fwd["sma50"].iloc[b] if "sma50" in fwd.columns else None
-            if seen_bull and pd.notna(sma50) and c < sma50:
+            if h > t1_peak: t1_peak = h
+            if c > t1_entry_price: seen_bull = True
+
+            risk_pts = d1_close - d1_low
+            unrealized_r = (t1_peak - d1_close) / risk_pts if risk_pts > 0 else 0.0
+
+            # Dynamic Trailer check (hurdle >= 3.0R)
+            if use_ml_stop and unrealized_r >= 3.0 and b >= 3:
+                trailer_active = True
+                trail_from_peak = t1_peak * (1.0 - 0.168)
+                e20 = float(fwd["ema20"].iloc[b]) if "ema20" in fwd.columns else c
+                support_floor = e20 * 0.97
+                cand_stop = min(trail_from_peak, support_floor)
+                trailer_stop = max(trailer_stop, cand_stop)
+                current_stop = max(current_stop, trailer_stop)
+
+            # Dynamic Trailer exit check
+            if use_ml_stop and trailer_active and trailer_stop > d1_low and l <= trailer_stop:
+                t1_exit_bar = b
+                o = float(fwd["open"].iloc[b])
+                t1_exit_price = o if o < trailer_stop else trailer_stop
+                t1_reason = "ML Trailing Stop Hit"
+                break
+
+            # Climax Partial Profit check
+            if use_ml_climax and not climax_triggered and unrealized_r >= 3.0:
+                e20 = float(fwd["ema20"].iloc[b]) if "ema20" in fwd.columns else c
+                if (c - e20) / e20 >= 0.20 and (t1_peak - c) / t1_peak <= 0.035:
+                    climax_triggered = True
+                    climax_exit_price = c
+                    climax_exit_date = fwd.index[b].strftime("%Y-%m-%d")
+                    climax_r = ((climax_exit_price / d1_close - 1.0) * 100.0) / risk1_pct
+
+            if l <= current_stop:
+                t1_stopped = True
+                t1_exit_bar = b
+                o = float(fwd["open"].iloc[b])
+                t1_exit_price = o if o < current_stop else current_stop
+                t1_reason = "Day 1 Low Stop Hit" if current_stop == d1_low else "ML Trailing Stop Hit"
+                break
+
+            if b == 4 and use_pyramid:
+                try:
+                    features = engine.compute_rolling_features(sym, pos, pos + 4)
+                    if features is not None:
+                        preds = engine.predict_rolling(features)
+                        if preds.get("prob_50", 0.0) >= 0.20:
+                            pyramid_added = True
+                except Exception:
+                    pass
+
+            if pd.notna(sma50) and c >= sma50:
+                seen_above_sma50 = True
+
+            if seen_above_sma50 and seen_bull and pd.notna(sma50) and c < sma50 and b >= 10:
                 t1_exit_bar = b
                 t1_exit_price = c
                 t1_reason = "50 SMA Breakdown"
                 break
 
-    if t1_exit_bar is None:
-        t1_exit_bar = len(fwd) - 1
-        t1_exit_price = float(fwd["close"].iloc[-1])
-        t1_reason = "Active / Window End"
+        if t1_exit_bar is None:
+            t1_exit_bar = len(fwd) - 1
+            t1_exit_price = float(fwd["close"].iloc[-1])
+            t1_reason = "Active / Window End"
 
-    t1_ret = (t1_exit_price / d1_close - 1.0) * 100.0
-    t1_r = t1_ret / risk1_pct if risk1_pct > 0 else 0.0
-    if pyramid_added and t1_exit_bar > 4 and len(fwd) > 5:
-        c5 = float(fwd["close"].iloc[4]) # Day 5 close
-        risk1_dollars = d1_close - d1_low
-        if risk1_dollars > 0:
-            tranche2_r = 0.5 * (t1_exit_price - c5) / risk1_dollars
-            t1_r = round(t1_r + tranche2_r, 2)
+        t1_ret = (t1_exit_price / d1_close - 1.0) * 100.0
+        t1_r = t1_ret / risk1_pct if risk1_pct > 0 else 0.0
 
-    # 50-Day SMA Institutional Baseline adherence over the trade hold
+        if climax_triggered:
+            climax_ret = (climax_exit_price / d1_close - 1.0) * 100.0
+            final_trade_r = 0.50 * climax_r + 0.50 * t1_r
+            final_trade_ret = 0.50 * climax_ret + 0.50 * t1_ret
+        else:
+            final_trade_r = t1_r
+            final_trade_ret = t1_ret
+
+        if pyramid_added and t1_exit_bar > 4 and len(fwd) > 5:
+            c5 = float(fwd["close"].iloc[4])
+            risk1_dollars = d1_close - d1_low
+            if risk1_dollars > 0 and c5 > d1_close:
+                tranche2_r = 0.5 * (t1_exit_price - c5) / risk1_dollars
+                final_trade_r = round(final_trade_r + tranche2_r, 2)
+
+    # 50-Day SMA Institutional Baseline adherence
     sma50_adh = None
-    if "sma50" in fwd.columns and t1_exit_bar > 0:
+    if "sma50" in fwd.columns and t1_exit_bar and t1_exit_bar > 0:
         fwd_hold = fwd.iloc[1:t1_exit_bar + 1]
         valid_sma = fwd_hold.dropna(subset=["sma50"])
         if len(valid_sma) > 0:
             held_cnt = (valid_sma["close"] >= valid_sma["sma50"]).sum()
             sma50_adh = round(float(held_cnt) / len(valid_sma) * 100.0, 1)
 
-    if use_trade1:
-        trade_1 = {
-            "skipped": False,
-            "entry_price": round(d1_close, 2),
-            "stop_price": round(d1_low, 2),
-            "risk_pct": round(risk1_pct, 2),
-            "add_trigger_price": round(d1_high, 2),
-            "exit_date": fwd.index[t1_exit_bar].strftime("%Y-%m-%d"),
-            "exit_price": round(t1_exit_price, 2),
-            "exit_reason": t1_reason,
-            "stopped_out": bool(t1_stopped),
-            "hold_days": int(t1_exit_bar),
-            "return_pct": round(t1_ret, 1),
-            "r_mult": round(t1_r, 2),
-            "trade_return_pct": round(t1_ret, 1),
-            "trade_r": round(t1_r, 2),
-            "sma50_adherence_pct": sma50_adh,
-            "pyramid_added": bool(pyramid_added),
-            "pyramid_note": "AI Pyramid (+50% size on Day 5 V2 Conviction)" if pyramid_added else None
-        }
-    else:
-        trade_1 = {
-            "skipped": True,
-            "entry_price": round(d1_close, 2),
-            "stop_price": round(d1_low, 2),
-            "risk_pct": round(risk1_pct, 2),
-            "add_trigger_price": round(d1_high, 2),
-            "exit_date": "—",
-            "exit_price": 0.0,
-            "exit_reason": "Skipped (Trade 1 OFF — Continuation Legs Only)",
-            "stopped_out": False,
-            "hold_days": 0,
-            "return_pct": 0.0,
-            "r_mult": 0.0,
-            "trade_return_pct": 0.0,
-            "trade_r": 0.0,
-            "sma50_adherence_pct": None
-        }
-        t1_r = 0.0
+    trade_1 = {
+        "skipped": bool(t1_skipped),
+        "entry_price": round(t1_entry_price, 2),
+        "stop_price": round(t1_stop_price, 2),
+        "risk_pct": round(t1_risk_pct, 1),
+        "add_trigger_price": round(d1_high, 2),
+        "exit_date": fwd.index[t1_exit_bar].strftime("%Y-%m-%d") if t1_exit_bar and t1_exit_bar < len(fwd) else "—",
+        "exit_price": round(t1_exit_price, 2) if t1_exit_price else 0.0,
+        "exit_reason": t1_reason if not t1_skipped else t1_exit_reason,
+        "stopped_out": bool(t1_stopped),
+        "hold_days": int(t1_exit_bar) if t1_exit_bar else 0,
+        "return_pct": round(final_trade_ret, 1),
+        "r_mult": round(final_trade_r, 2),
+        "trade_return_pct": round(final_trade_ret, 1),
+        "trade_r": round(final_trade_r, 2),
+        "climax_exit_triggered": bool(climax_triggered),
+        "climax_exit_date": climax_exit_date,
+        "climax_exit_price": round(climax_exit_price, 2) if climax_exit_price else None,
+        "climax_partial_r": round(climax_r, 2) if climax_triggered else None,
+        "dynamic_trailer_active": bool(trailer_active),
+        "dynamic_trailer_stop": round(trailer_stop, 2) if trailer_active else None,
+        "sma50_adherence_pct": sma50_adh,
+        "pyramid_added": bool(pyramid_added),
+        "pyramid_note": "AI Pyramid (+50% size on Day 5 V2 Conviction)" if pyramid_added else None
+    }
 
-    if use_multileg:
-        # Trade 2: Dual-Track Continuation Architecture
-        trade_2 = {"has_reentry": False}
-        t2_exit_bar = None
-        t2_r = 0.0
-        t2_track = None
-    
+    t1_r = final_trade_r
+
+    trade_2 = {"has_reentry": False}
+    trade_3 = {"has_reentry": False}
+    t2_exit_bar = None
+    t2_r = 0.0
+    t2_track = None
+
+    if not use_multileg:
+        trade_2["skipped"] = True
+        trade_3["skipped"] = True
+    else:
         # Track 1 Evaluation: Institutional Undercut & Reclaim (U&R)
         # Triggered when Trade 1 stopped out at Day 1 Low within the first 10 trading sessions
         ur_signal_bar = None
@@ -3030,11 +3309,6 @@ def compute_dossier(sym: str, date_str: str, d: pd.DataFrame, pos: int, ev_row: 
                                     "dynamic_trailer_active": bool(dyn_active_3),
                                     "dynamic_trailer_stop": round(dyn_trail_3, 2) if dyn_active_3 else None,
                                 }
-    
-        
-    else:
-        trade_2 = {"has_reentry": False, "skipped": True}
-        trade_3 = {"has_reentry": False, "skipped": True}
 
     ai_scores = {}
     if ev_row:
@@ -3210,14 +3484,16 @@ def api_chart():
             return None
         return obj
 
+    t1_mode = request.args.get("t1_mode", "delayed")
     use_trade1 = request.args.get("use_trade1", "1") in ["1", "true", "True"]
-    use_ml_targets = request.args.get("use_ml_targets", "1") in ["1", "true", "True"]
+    use_pyramid = request.args.get("use_pyramid", "1") in ["1", "true", "True"]
+    use_ml_climax = request.args.get("use_ml_climax", "1") in ["1", "true", "True"]
     use_ml_stop = request.args.get("use_ml_stop", "1") in ["1", "true", "True"]
     use_multileg = request.args.get("use_multileg", "1") in ["1", "true", "True"]
     use_multileg_ml = request.args.get("use_multileg_ml", "1") in ["1", "true", "True"]
 
     use_dyn = request.args.get("dynamic_trailer", "0") in ["1", "true", "True"]
-    dossier = compute_dossier(sym, date_str, d, pos, ev_row_dict, use_ml_targets, use_ml_stop, use_multileg, use_multileg_ml, use_trade1, ribbon_spans=(8, 12, 16, 21), use_dynamic_trailer=use_dyn)
+    dossier = compute_dossier(sym, date_str, d, pos, ev_row_dict, t1_mode=t1_mode, use_pyramid=use_pyramid, use_ml_climax=use_ml_climax, use_ml_stop=use_ml_stop, use_multileg=use_multileg, use_multileg_ml=use_multileg_ml, use_trade1=use_trade1, ribbon_spans=(8, 12, 16, 21), use_dynamic_trailer=use_dyn)
 
     res = {
         "symbol": sym,

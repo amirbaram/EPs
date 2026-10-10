@@ -393,57 +393,95 @@ def scan_recent_eps(days_back: int = 14) -> list[dict]:
             seen_cons = False
             cons_days = 0
             reentry_bar = None
-            cons_low = float(fwd["low"].iloc[0])
+            t2_track_name = "base_ribbon"
 
-            for b in range(1, len(fwd)):
-                l_b = float(fwd["low"].iloc[b])
-                s_b = fwd["ribbon_state"].iloc[b]
-                if l_b < cons_low:
-                    cons_low = l_b
-                if pd.notna(s_b) and s_b in ["blue", "gray"]:
-                    seen_cons = True
-                    cons_days += 1
-                if seen_cons and pd.notna(s_b) and s_b == "yellow" and reentry_bar is None:
-                    reentry_bar = b
-                    break
+            # Track A: Early High Tight Flag (HTF) Check (Days 3 to 25)
+            htf_signal = None
+            htf_stop_px = None
+            pole_h = 0.0
+            pole_b = None
+            for b in range(1, min(len(fwd), 16)):
+                h = float(fwd["high"].iloc[b])
+                if (h / d1_close - 1.0) >= 0.12 and h > pole_h:
+                    pole_h = h
+                    pole_b = b
+            if pole_b is not None:
+                for b in range(pole_b + 1, min(len(fwd), pole_b + 16)):
+                    l = float(fwd["low"].iloc[b])
+                    c = float(fwd["close"].iloc[b])
+                    pullback = (pole_h - l) / pole_h * 100.0 if pole_h > 0 else 0.0
+                    if pullback > 18.0:
+                        break
+                    prev_h = float(fwd["high"].iloc[max(0, b - 4):b].max())
+                    if c > prev_h:
+                        htf_signal = b
+                        htf_stop_px = round(float(fwd["low"].iloc[max(pole_b, b - 4):b + 1].min()), 2)
+                        break
 
-            if reentry_bar is not None and cons_days <= 45:
-                drop_from_peak = round((t1_peak - cons_low) / t1_peak * 100.0, 1) if t1_peak > 0 else 0.0
-                if drop_from_peak <= 55.0:
-                    t2_has_reentry = True
-                    t2_entry_date = fwd.index[reentry_bar].strftime("%Y-%m-%d")
-                    t2_entry_price = round(float(fwd["close"].iloc[reentry_bar]), 2)
-                    swing5_low = round(float(fwd["low"].iloc[max(0, reentry_bar - 5):reentry_bar + 1].min()), 2)
-                    t2_stop_price = swing5_low
-                    t2_risk_pct = round((t2_entry_price - t2_stop_price) / t2_entry_price * 100.0, 1) if t2_entry_price > 0 else 5.0
+            if htf_signal is not None:
+                t2_has_reentry = True
+                t2_track_name = "htf_continuation"
+                t2_entry_date = fwd.index[htf_signal].strftime("%Y-%m-%d")
+                t2_entry_price = round(float(fwd["close"].iloc[htf_signal]), 2)
+                t2_stop_price = htf_stop_px
+                t2_risk_pct = round((t2_entry_price - t2_stop_price) / t2_entry_price * 100.0, 1) if t2_entry_price > 0 else 5.0
+                t2_cons_days = int(htf_signal - pole_b)
+                t2_drop_from_peak = round((pole_h - t2_stop_price) / pole_h * 100.0, 1)
+                if t2_risk_pct > 0:
+                    t2_curr_r = round((curr_px - t2_entry_price) / (t2_entry_price - t2_stop_price), 2)
+                t2_status_desc = f"Active HTF Flag Breakout (+{t2_curr_r:.2f} R)"
+            else:
+                # Track B: Secondary Base Ribbon Re-Entry
+                cons_low = float(fwd["low"].iloc[0])
+                for b in range(1, len(fwd)):
+                    l_b = float(fwd["low"].iloc[b])
+                    s_b = fwd["ribbon_state"].iloc[b]
+                    if l_b < cons_low:
+                        cons_low = l_b
+                    if pd.notna(s_b) and s_b in ["blue", "gray"]:
+                        seen_cons = True
+                        cons_days += 1
+                    if seen_cons and b >= 5 and pd.notna(s_b) and s_b == "yellow" and reentry_bar is None:
+                        reentry_bar = b
+                        break
+
+                if reentry_bar is not None and cons_days <= 45:
+                    drop_from_peak = round((t1_peak - cons_low) / t1_peak * 100.0, 1) if t1_peak > 0 else 0.0
+                    if drop_from_peak <= 45.0:
+                        t2_has_reentry = True
+                        t2_entry_date = fwd.index[reentry_bar].strftime("%Y-%m-%d")
+                        t2_entry_price = round(float(fwd["close"].iloc[reentry_bar]), 2)
+                        swing5_low = round(float(fwd["low"].iloc[max(0, reentry_bar - 5):reentry_bar + 1].min()), 2)
+                        t2_stop_price = swing5_low
+                        t2_risk_pct = round((t2_entry_price - t2_stop_price) / t2_entry_price * 100.0, 1) if t2_entry_price > 0 else 5.0
+                        t2_cons_days = cons_days
+                        t2_drop_from_peak = drop_from_peak
+                        if t2_risk_pct > 0:
+                            t2_curr_r = round((curr_px - t2_entry_price) / (t2_entry_price - t2_stop_price), 2)
+                        
+                        try:
+                            from ep_ml_engine import engine as ml_engine
+                            re_feats = ml_engine.compute_rolling_features(sym, i, i + reentry_bar)
+                            if re_feats is not None:
+                                re_preds = ml_engine.predict_rolling(re_feats)
+                                t2_prob_reentry = round(float(re_preds.get("prob_reentry", 0.0)), 3)
+                                if t2_prob_reentry < 0.35:
+                                    t2_ml_vetoed = True
+                        except Exception:
+                            pass
+
+                        if t2_ml_vetoed:
+                            t2_status_desc = f"ML Vetoed ({t2_prob_reentry*100:.1f}% < 35% threshold)"
+                        else:
+                            t2_status_desc = f"Active Base Ribbon Re-Entry (+{t2_curr_r:.2f} R)"
+                elif seen_cons and reentry_bar is None:
+                    drop_from_peak = round((t1_peak - cons_low) / t1_peak * 100.0, 1) if t1_peak > 0 else 0.0
+                    swing5_low = round(float(fwd["low"].iloc[max(0, len(fwd) - 5):].min()), 2)
+                    t2_in_pullback = True
                     t2_cons_days = cons_days
                     t2_drop_from_peak = drop_from_peak
-                    if t2_risk_pct > 0:
-                        t2_curr_r = round((curr_px - t2_entry_price) / (t2_entry_price - t2_stop_price), 2)
-                    
-                    try:
-                        from ep_ml_engine import engine as ml_engine
-                        re_feats = ml_engine.compute_rolling_features(sym, i, i + reentry_bar)
-                        if re_feats is not None:
-                            re_preds = ml_engine.predict_rolling(re_feats)
-                            t2_prob_reentry = round(float(re_preds.get("prob_reentry", 0.0)), 3)
-                            if t2_prob_reentry < 0.35:
-                                t2_ml_vetoed = True
-                    except Exception:
-                        pass
-
-                    if t2_ml_vetoed:
-                        t2_status_desc = f"ML Vetoed ({t2_prob_reentry*100:.1f}% < 35% threshold)"
-                    else:
-                        t2_status_desc = f"Active Trade 2 (+{t2_curr_r:.2f} R)"
-            elif seen_cons and reentry_bar is None:
-                drop_from_peak = round((t1_peak - cons_low) / t1_peak * 100.0, 1) if t1_peak > 0 else 0.0
-                swing5_low = round(float(fwd["low"].iloc[max(0, len(fwd) - 5):].min()), 2)
-                t2_in_pullback = True
-                t2_cons_days = cons_days
-                t2_drop_from_peak = drop_from_peak
-                t2_stop_price = swing5_low
-                t2_status_desc = f"Pullback in Progress (Day {cons_days}, Retraced {drop_from_peak}%, Shelf ${swing5_low:.2f})"
+                    t2_stop_price = swing5_low
+                    t2_status_desc = f"Pullback in Progress (Day {cons_days}, Retraced {drop_from_peak}%, Shelf ${swing5_low:.2f})"
 
             t2_info = {
                 "has_reentry": t2_has_reentry,

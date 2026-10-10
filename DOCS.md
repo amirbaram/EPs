@@ -1,12 +1,41 @@
-# Setup Scanner — Reference & Runbook
+# Episodic Pivot (EP) Strategy System & Scanner Reference
 
-A full-US-market EOD stock scanner with an interactive backtesting app, multi-timeframe + intraday
-EMA-Rider analysis, and a sector/theme classification layer. This document is the maintained
-reference: the app, the setups, the config variables, and the data-maintenance processes.
-(Quick-start lives in `README.md`; this is the deep reference.)
+This repository (`amirbaram/EPs`) contains the institutional **Episodic Pivot (EP)** trading system, live multi-quarter telemetry tracker, and machine learning models, alongside the underlying market scanning foundation.
 
-> The **Config reference** table near the bottom is generated — run `python gen_docs.py` after
-> editing `config.py`. Everything else is hand-maintained; keep it current when features change.
+## 0. Episodic Pivot (EP) Core Modules & Ports
+
+| Module / Script | Port / Path | Purpose |
+|---|---|---|
+| `serve_ep.py` | `http://127.0.0.1:8782` | Historical Review & Strategy Backtester (Delayed Breakout, Day 5 Pyramiding, ML Climax Exit, ML Trailing Stop, Multi-Leg Continuations). |
+| `serve_ep_tracker.py` | `http://127.0.0.1:8783` | Live Multi-Quarter EP Tracker & Real-Time Rolling Telemetry. |
+| `ep_ml_engine.py` | — | Feature engineering, rolling ordinal ML, 1-year climax exit classifier, and dynamic trailing stop quantile regressor. |
+| `generate_handbook_pdf.py` | `docs/EP_Pinnacle_Elite_Strategy_Handbook.pdf` | Automatic compiler for the Strategy Handbook PDF. |
+| `scripts/check.sh` | — | Non-negotiable fast CI gate (`tests/` regression suite). Run after every edit. |
+| `data/models/` | — | Pretrained XGBoost, ordinal, and quantile regression models. |
+
+---
+
+## 0.1 Machine Learning Exits & Trade Management Empirical Findings
+
+### A. Core Architecture
+1. **1-Year ML Climax Exit:** Trained up to 250 trading days using zero-lookahead confirmed TrendLab swings, swing volume accumulation vs. distribution, relative volume spikes at pivot highs, and consecutive gap-ups. Triggers a **50% partial profit take** when exhaustion $\ge 0.50$, locking in peak gains while retaining the remaining 50% runner on the 50 SMA baseline.
+2. **ML Dynamic Trailing Stop:** Activates once unrealized profit clears $\ge +3.0\text{ R}$ (or $5.0\times\text{ ADR}$). Uses a 30th percentile MAE quantile regression model ($\alpha = 0.30$, ~16.8% buffer) anchored below the rising 21 EMA and 5-day swing shelf.
+3. **Trade 1 Delayed Breakout Entry:** Stop-buy placed 0.05 above Day 1 High on Days 2–5 once 48-Hour absorption is confirmed, bypassing 535 gap-down distribution traps.
+4. **Day 5 V2 Pyramiding:** Adds +50% size if rolling $P(+50\%) \ge 0.20$.
+
+### B. Empirical Head-to-Head Findings (Pinnacle Elite, 252 Delayed Trades)
+
+| Strategy Configuration | Trades | Win Rate | Avg Win | Avg Loss | EV (R) | Total Net R | Profit Factor | Max Drawdown | Calmar Ratio |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| **Mechanical Baseline (50 SMA, No ML)** | 252 | 41.3% | +2.98 R | -0.97 R | **+0.665 R** | **+167.5 R** | 2.17 | -19.0 R | 8.83 |
+| **+ New ML Dynamic Trailing Stop** | 252 | **46.0%** | +1.39 R | **-0.54 R** | +0.350 R | +88.3 R | 2.21 | **-9.6 R (-49.5%)** | 9.17 |
+| **+ New ML Climax Exit (50% Partial)** | 252 | **47.2%** | +1.33 R | **-0.59 R** | +0.320 R | +80.5 R | 2.03 | **-9.9 R (-47.9%)** | 8.17 |
+| **+ Both New MLs (Climax + Trailer)** | 252 | **46.0%** | +1.40 R | **-0.54 R** | +0.357 R | +89.8 R | 2.23 | **-9.6 R (-49.5%)** | **9.33** |
+| **⚡ AI-Optimal (Pyramid + Both MLs)** | 252 | **44.4%** | +1.62 R | **-0.56 R** | +0.409 R | +103.1 R | **2.32** | **-11.2 R (-50.4%)**| 9.18 |
+
+### C. Key Insights: Old MLs vs. New MLs vs. Baseline
+- **Versus Old MLs:** The old Day 1 Close MLs provided **0% drawdown reduction** (-15.5 R Max DD vs. -15.2 R baseline) and lower win rates (36.8%–37.7%). The new models cut drawdown in half (-9.6 R) and raise win rate to 46.0%–47.2%.
+- **Versus Baseline (50 SMA):** Average losses are cut by 44% (-0.54 R vs. -0.97 R) and drawdowns are cut in half (-9.6 R vs. -19.0 R). While raw unconstrained EV is lower (+0.409 R vs. +0.665 R) due to capping rare 20R–30R mega-runners, the risk-adjusted Calmar ratio is superior (9.33 vs. 8.83).
 
 ---
 

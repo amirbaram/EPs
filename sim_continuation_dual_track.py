@@ -122,130 +122,115 @@ def run_dual_track_simulation(ribbon_spans=(8, 12, 16, 21), max_eps: int | None 
         t1_r = t1_ret / risk1_pct if risk1_pct > 0 else 0.0
 
         # --- SIMULATE TRADE 2 (DUAL-TRACK) ---
+        # --- SIMULATE TRADE 2 (UNIFIED CONTINUATION: HTF + BASE RIBBON) ---
         trade_2 = {"has_reentry": False}
         t2_exit_bar = None
         t2_r = 0.0
         t2_track = None
 
-        # Track 1 Evaluation: Institutional Undercut & Reclaim (U&R)
-        # Condition: Trade 1 stopped out at Day 1 Low within first 10 sessions
-        ur_signal_bar = None
-        ur_stop = None
+        # Track A: Early High Tight Flag (HTF) Continuation (Bars 2 to 25 post-EP)
+        htf_signal_bar = None
+        htf_stop = None
+        pole_high = 0.0
+        pole_bar = None
 
-        if t1_stopped and 1 <= t1_exit_bar <= 10:
-            shakeout_low = float(fwd["low"].iloc[t1_exit_bar])
-            controlled_ur = (shakeout_low >= d1_low * 0.85)
+        for b in range(1, min(len(fwd), 16)):
+            h = float(fwd["high"].iloc[b])
+            if (h / d1_close - 1.0) >= 0.12 and h > pole_high:
+                pole_high = h
+                pole_bar = b
 
-            # Scan subsequent sessions up to 15 sessions post stop-out
-            if controlled_ur:
-                ur_end_search = min(len(fwd), t1_exit_bar + 16)
-                for b in range(t1_exit_bar + 1, ur_end_search):
-                    l_b = float(fwd["low"].iloc[b])
-                    c_b = float(fwd["close"].iloc[b])
-                    if l_b < shakeout_low:
-                        shakeout_low = l_b
+        if pole_bar is not None:
+            for b in range(pole_bar + 1, min(len(fwd), pole_bar + 16)):
+                l = float(fwd["low"].iloc[b])
+                c = float(fwd["close"].iloc[b])
+                pullback = (pole_high - l) / pole_high * 100.0 if pole_high > 0 else 0.0
+                if pullback > 18.0:
+                    break # flag pulled back too deep
 
-                    # Controlled check: undercut low must stay within 15% of Day 1 Low
-                    if shakeout_low < d1_low * 0.85:
-                        controlled_ur = False
-                        break
+                prev_h = float(fwd["high"].iloc[max(0, b - 4):b].max())
+                if c > prev_h:
+                    htf_signal_bar = b
+                    htf_stop = round(float(fwd["low"].iloc[max(pole_bar, b - 4):b + 1].min()), 2)
+                    break
 
-                    # Entry trigger: close back ABOVE Day 1 Low
-                    if c_b >= d1_low:
-                        ur_signal_bar = b
-                        ur_stop = round(shakeout_low, 2)
-                        break
+        if htf_signal_bar is not None:
+            entry_bar = htf_signal_bar + 1
+            if entry_bar < len(fwd):
+                t2_entry = float(fwd["open"].iloc[entry_bar])
+                t2_risk_pct = (t2_entry - htf_stop) / t2_entry * 100.0
+                if 1.0 <= t2_risk_pct <= 25.0:
+                    t2_stopped = False
+                    t2_exit_price = None
 
-            if controlled_ur and ur_signal_bar is not None:
-                entry_bar = ur_signal_bar + 1
-                if entry_bar < len(fwd):
-                    t2_entry = float(fwd["open"].iloc[entry_bar])
-                    t2_risk_pct = (t2_entry - ur_stop) / t2_entry * 100.0
+                    day1_low = float(fwd["low"].iloc[entry_bar])
+                    day1_open = float(fwd["open"].iloc[entry_bar])
+                    if day1_low <= htf_stop:
+                        t2_stopped = True
+                        t2_exit_bar = entry_bar
+                        t2_exit_price = day1_open if day1_open < htf_stop else htf_stop
+                        t2_reason = "Swing Low Stop Hit (Day 1)"
+                    else:
+                        for b in range(entry_bar + 1, len(fwd)):
+                            c = float(fwd["close"].iloc[b])
+                            l = float(fwd["low"].iloc[b])
+                            b_open = float(fwd["open"].iloc[b])
+                            s = fwd["ribbon_state"].iloc[b]
+                            if l <= htf_stop:
+                                t2_stopped = True
+                                t2_exit_bar = b
+                                t2_exit_price = b_open if b_open < htf_stop else htf_stop
+                                t2_reason = "Swing Low Stop Hit"
+                                break
+                            if pd.notna(s) and s == "blue":
+                                t2_exit_bar = b
+                                t2_exit_price = c
+                                t2_reason = "Ribbon Reverse Flip Exit (Blue)"
+                                break
 
-                    if 1.0 <= t2_risk_pct <= 35.0:
-                        t2_stopped = False
-                        t2_exit_price = None
+                    if t2_exit_bar is None:
+                        t2_exit_bar = len(fwd) - 1
+                        t2_exit_price = float(fwd["close"].iloc[-1])
+                        t2_reason = "Active / Window End"
 
-                        # Zero-lookahead Day 1 check on entry bar
-                        day1_low = float(fwd["low"].iloc[entry_bar])
-                        day1_open = float(fwd["open"].iloc[entry_bar])
-                        if day1_low <= ur_stop:
-                            t2_stopped = True
-                            t2_exit_bar = entry_bar
-                            t2_exit_price = day1_open if day1_open < ur_stop else ur_stop
-                            t2_reason = "Undercut Low Stop Hit (Day 1)"
-                        else:
-                            for b in range(entry_bar + 1, len(fwd)):
-                                c = float(fwd["close"].iloc[b])
-                                l = float(fwd["low"].iloc[b])
-                                b_open = float(fwd["open"].iloc[b])
-                                s = fwd["ribbon_state"].iloc[b]
-                                sma50 = fwd["sma50"].iloc[b]
+                    t2_ret = (t2_exit_price / t2_entry - 1.0) * 100.0
+                    t2_r = t2_ret / t2_risk_pct if t2_risk_pct > 0 else 0.0
+                    t2_track = "htf_continuation"
+                    trade_2 = {
+                        "has_reentry": True,
+                        "track": t2_track,
+                        "signal_date": fwd.index[htf_signal_bar].strftime("%Y-%m-%d"),
+                        "entry_date": fwd.index[entry_bar].strftime("%Y-%m-%d"),
+                        "entry_price": round(t2_entry, 2),
+                        "stop_price": round(htf_stop, 2),
+                        "risk_pct": round(t2_risk_pct, 1),
+                        "cons_days": int(htf_signal_bar - pole_bar),
+                        "drop_from_peak": round(pullback, 1),
+                        "exit_date": fwd.index[t2_exit_bar].strftime("%Y-%m-%d"),
+                        "exit_price": round(t2_exit_price, 2),
+                        "exit_reason": t2_reason,
+                        "stopped_out": bool(t2_stopped),
+                        "hold_days": int(t2_exit_bar - entry_bar),
+                        "return_pct": round(t2_ret, 1),
+                        "r_mult": round(t2_r, 2),
+                        "combined_net_r": round(t1_r + t2_r, 2),
+                        "ribbon_spans": list(ribbon_spans),
+                    }
 
-                                if l <= ur_stop:
-                                    t2_stopped = True
-                                    t2_exit_bar = b
-                                    t2_exit_price = b_open if b_open < ur_stop else ur_stop
-                                    t2_reason = "Undercut Low Stop Hit"
-                                    break
-                                if pd.notna(s) and s == "blue":
-                                    t2_exit_bar = b
-                                    t2_exit_price = c
-                                    t2_reason = "Ribbon Reverse Flip Exit (Blue)"
-                                    break
-                                if pd.notna(sma50) and c < sma50:
-                                    t2_exit_bar = b
-                                    t2_exit_price = c
-                                    t2_reason = "50 SMA Breakdown"
-                                    break
-
-                        if t2_exit_bar is None:
-                            t2_exit_bar = len(fwd) - 1
-                            t2_exit_price = float(fwd["close"].iloc[-1])
-                            t2_reason = "Active / Window End"
-
-                        t2_ret = (t2_exit_price / t2_entry - 1.0) * 100.0
-                        t2_r = t2_ret / t2_risk_pct if t2_risk_pct > 0 else 0.0
-                        t2_track = "track_1_ur"
-                        trade_2 = {
-                            "has_reentry": True,
-                            "track": t2_track,
-                            "signal_date": fwd.index[ur_signal_bar].strftime("%Y-%m-%d"),
-                            "entry_date": fwd.index[entry_bar].strftime("%Y-%m-%d"),
-                            "entry_price": round(t2_entry, 2),
-                            "stop_price": round(ur_stop, 2),
-                            "risk_pct": round(t2_risk_pct, 1),
-                            "cons_days": int(ur_signal_bar - t1_exit_bar),
-                            "drop_from_peak": round((d1_low - ur_stop) / d1_low * 100.0, 1),
-                            "exit_date": fwd.index[t2_exit_bar].strftime("%Y-%m-%d"),
-                            "exit_price": round(t2_exit_price, 2),
-                            "exit_reason": t2_reason,
-                            "stopped_out": bool(t2_stopped),
-                            "hold_days": int(t2_exit_bar - entry_bar),
-                            "return_pct": round(t2_ret, 1),
-                            "r_mult": round(t2_r, 2),
-                            "combined_net_r": round(t1_r + t2_r, 2),
-                            "ribbon_spans": list(ribbon_spans),
-                        }
-
-        # Track 2 Evaluation: Corrected Dynamic Base Breakout / Intermediate Ribbon
-        # Evaluated if Track 1 did not take a trade
+        # Track B: Secondary Base Ribbon (8, 12, 16, 21) Re-entry (Bars 3 to 65 post-EP)
+        # Evaluated if HTF did not take a trade
         if not trade_2["has_reentry"]:
             seen_cons = False
             reentry_signal_bar = None
-            cons_low = float(fwd["low"].iloc[t1_exit_bar])
-            curr_peak = t1_peak
+            cons_low = d1_low
+            curr_peak = d1_close
 
-            search_end = min(len(fwd), t1_exit_bar + 66)
-            for b in range(t1_exit_bar, search_end):
+            search_end = min(len(fwd), 66)
+            for b in range(2, search_end):
                 l = float(fwd["low"].iloc[b])
                 h = float(fwd["high"].iloc[b])
-                c = float(fwd["close"].iloc[b])
                 s = fwd["ribbon_state"].iloc[b]
-                sma50 = fwd["sma50"].iloc[b]
 
-                # Dynamic peak-to-trough anchor fix:
-                # Reset cons_low dynamically whenever a new peak is reached
                 if h > curr_peak:
                     curr_peak = h
                     cons_low = l
@@ -255,110 +240,78 @@ def run_dual_track_simulation(ribbon_spans=(8, 12, 16, 21), max_eps: int | None 
                 if pd.notna(s) and s in ["blue", "gray"]:
                     seen_cons = True
 
-                # Retracement from current peak
-                pullback_pct = (curr_peak - cons_low) / curr_peak * 100.0 if curr_peak > 0 else 0.0
-
-                # Trigger 1: Classic Yellow Flip after Blue/Gray consolidation
-                if seen_cons and b > t1_exit_bar and pd.notna(s) and s == "yellow":
+                if seen_cons and pd.notna(s) and s == "yellow":
                     reentry_signal_bar = b
                     break
 
-                # Trigger 2: Persistent Yellow Shallow Pullback Re-entry (>=5% pullback, 5D high breakout or EMA8 reclaim)
-                if not seen_cons and b > t1_exit_bar + 2 and pullback_pct >= 5.0 and pd.notna(s) and s == "yellow":
-                    prev_5d_high = float(fwd["high"].iloc[max(0, b - 5):b].max())
-                    ema8 = float(fwd[f"ribbon_ema{ribbon_spans[0]}"].iloc[b]) if f"ribbon_ema{ribbon_spans[0]}" in fwd.columns else None
-                    prev_c = float(fwd["close"].iloc[b - 1])
-                    prev_ema8 = float(fwd[f"ribbon_ema{ribbon_spans[0]}"].iloc[b - 1]) if f"ribbon_ema{ribbon_spans[0]}" in fwd.columns else None
-
-                    reclaimed_ema8 = (ema8 is not None and prev_ema8 is not None and prev_c <= prev_ema8 and c > ema8)
-                    broke_5d_high = c > prev_5d_high
-
-                    if broke_5d_high or reclaimed_ema8:
-                        reentry_signal_bar = b
-                        break
-
             if reentry_signal_bar is not None:
-                c_sig = float(fwd["close"].iloc[reentry_signal_bar])
-                sma50_sig = fwd["sma50"].iloc[reentry_signal_bar] if "sma50" in fwd.columns else None
-                held_50 = pd.isna(sma50_sig) or c_sig >= sma50_sig
-                elapsed_days = int(reentry_signal_bar - t1_exit_bar)
-                allowed_cons = (elapsed_days <= 65 if held_50 else elapsed_days <= 45)
+                drop_from_peak = (curr_peak - cons_low) / curr_peak * 100.0 if curr_peak > 0 else 0.0
+                if drop_from_peak <= 45.0:
+                    swing5_low = float(fwd["low"].iloc[max(0, reentry_signal_bar - 4):reentry_signal_bar + 1].min())
+                    t2_stop = round(swing5_low, 2)
+                    entry_bar = reentry_signal_bar + 1
 
-                if allowed_cons:
-                    drop_from_peak = (curr_peak - cons_low) / curr_peak * 100.0 if curr_peak > 0 else 0.0
-                    if drop_from_peak <= 55.0:
-                        swing5_low = float(fwd["low"].iloc[max(0, reentry_signal_bar - 4):reentry_signal_bar + 1].min())
-                        t2_stop = round(swing5_low, 2)
-                        entry_bar = reentry_signal_bar + 1
+                    if entry_bar < len(fwd):
+                        t2_entry = float(fwd["open"].iloc[entry_bar])
+                        t2_risk_pct = (t2_entry - t2_stop) / t2_entry * 100.0
 
-                        if entry_bar < len(fwd):
-                            t2_entry = float(fwd["open"].iloc[entry_bar])
-                            t2_risk_pct = (t2_entry - t2_stop) / t2_entry * 100.0
+                        if 1.0 <= t2_risk_pct <= 25.0:
+                            t2_stopped = False
+                            t2_exit_price = None
 
-                            if 1.0 <= t2_risk_pct <= 35.0:
-                                t2_stopped = False
-                                t2_exit_price = None
+                            day1_low = float(fwd["low"].iloc[entry_bar])
+                            day1_open = float(fwd["open"].iloc[entry_bar])
+                            if day1_low <= t2_stop:
+                                t2_stopped = True
+                                t2_exit_bar = entry_bar
+                                t2_exit_price = day1_open if day1_open < t2_stop else t2_stop
+                                t2_reason = "Swing Low Stop Hit (Day 1)"
+                            else:
+                                for b in range(entry_bar + 1, len(fwd)):
+                                    c = float(fwd["close"].iloc[b])
+                                    l = float(fwd["low"].iloc[b])
+                                    b_open = float(fwd["open"].iloc[b])
+                                    s = fwd["ribbon_state"].iloc[b]
+                                    if l <= t2_stop:
+                                        t2_stopped = True
+                                        t2_exit_bar = b
+                                        t2_exit_price = b_open if b_open < t2_stop else t2_stop
+                                        t2_reason = "Swing Low Stop Hit"
+                                        break
+                                    if pd.notna(s) and s == "blue":
+                                        t2_exit_bar = b
+                                        t2_exit_price = c
+                                        t2_reason = "Ribbon Reverse Flip Exit (Blue)"
+                                        break
 
-                                day1_low = float(fwd["low"].iloc[entry_bar])
-                                day1_open = float(fwd["open"].iloc[entry_bar])
-                                if day1_low <= t2_stop:
-                                    t2_stopped = True
-                                    t2_exit_bar = entry_bar
-                                    t2_exit_price = day1_open if day1_open < t2_stop else t2_stop
-                                    t2_reason = "Swing Low Stop Hit (Day 1)"
-                                else:
-                                    for b in range(entry_bar + 1, len(fwd)):
-                                        c = float(fwd["close"].iloc[b])
-                                        l = float(fwd["low"].iloc[b])
-                                        b_open = float(fwd["open"].iloc[b])
-                                        s = fwd["ribbon_state"].iloc[b]
-                                        sma50 = fwd["sma50"].iloc[b]
-                                        if l <= t2_stop:
-                                            t2_stopped = True
-                                            t2_exit_bar = b
-                                            t2_exit_price = b_open if b_open < t2_stop else t2_stop
-                                            t2_reason = "Swing Low Stop Hit"
-                                            break
-                                        if pd.notna(s) and s == "blue":
-                                            t2_exit_bar = b
-                                            t2_exit_price = c
-                                            t2_reason = "Ribbon Reverse Flip Exit (Blue)"
-                                            break
-                                        if pd.notna(sma50) and c < sma50:
-                                            t2_exit_bar = b
-                                            t2_exit_price = c
-                                            t2_reason = "50 SMA Breakdown"
-                                            break
+                            if t2_exit_bar is None:
+                                t2_exit_bar = len(fwd) - 1
+                                t2_exit_price = float(fwd["close"].iloc[-1])
+                                t2_reason = "Active / Window End"
 
-                                if t2_exit_bar is None:
-                                    t2_exit_bar = len(fwd) - 1
-                                    t2_exit_price = float(fwd["close"].iloc[-1])
-                                    t2_reason = "Active / Window End"
-
-                                t2_ret = (t2_exit_price / t2_entry - 1.0) * 100.0
-                                t2_r = t2_ret / t2_risk_pct if t2_risk_pct > 0 else 0.0
-                                t2_track = "track_2_ribbon"
-
-                                trade_2 = {
-                                    "has_reentry": True,
-                                    "track": t2_track,
-                                    "signal_date": fwd.index[reentry_signal_bar].strftime("%Y-%m-%d"),
-                                    "entry_date": fwd.index[entry_bar].strftime("%Y-%m-%d"),
-                                    "entry_price": round(t2_entry, 2),
-                                    "stop_price": round(t2_stop, 2),
-                                    "risk_pct": round(t2_risk_pct, 1),
-                                    "cons_days": elapsed_days,
-                                    "drop_from_peak": round(drop_from_peak, 1),
-                                    "exit_date": fwd.index[t2_exit_bar].strftime("%Y-%m-%d"),
-                                    "exit_price": round(t2_exit_price, 2),
-                                    "exit_reason": t2_reason,
-                                    "stopped_out": bool(t2_stopped),
-                                    "hold_days": int(t2_exit_bar - entry_bar),
-                                    "return_pct": round(t2_ret, 1),
-                                    "r_mult": round(t2_r, 2),
-                                    "combined_net_r": round(t1_r + t2_r, 2),
-                                    "ribbon_spans": list(ribbon_spans),
-                                }
+                            t2_ret = (t2_exit_price / t2_entry - 1.0) * 100.0
+                            t2_r = t2_ret / t2_risk_pct if t2_risk_pct > 0 else 0.0
+                            t2_track = "base_ribbon"
+                            trade_2 = {
+                                "has_reentry": True,
+                                "track": t2_track,
+                                "signal_date": fwd.index[reentry_signal_bar].strftime("%Y-%m-%d"),
+                                "entry_date": fwd.index[entry_bar].strftime("%Y-%m-%d"),
+                                "entry_price": round(t2_entry, 2),
+                                "stop_price": round(t2_stop, 2),
+                                "risk_pct": round(t2_risk_pct, 1),
+                                "cons_days": int(reentry_signal_bar - 1),
+                                "drop_from_peak": round(drop_from_peak, 1),
+                                "exit_date": fwd.index[t2_exit_bar].strftime("%Y-%m-%d"),
+                                "exit_price": round(t2_exit_price, 2),
+                                "exit_reason": t2_reason,
+                                "stopped_out": bool(t2_stopped),
+                                "hold_days": int(t2_exit_bar - entry_bar),
+                                "return_pct": round(t2_ret, 1),
+                                "r_mult": round(t2_r, 2),
+                                "combined_net_r": round(t1_r + t2_r, 2),
+                                "ribbon_spans": list(ribbon_spans),
+                            }
 
         # --- SIMULATE TRADE 3 (LEG 3 CONTINUATION) ---
         trade_3 = {"has_reentry": False}

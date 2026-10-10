@@ -183,21 +183,21 @@ def build_rolling_dataset():
                 c_data = c_data_full.iloc[t_idx]
                     
                 # --- FORWARD MAE & EXHAUSTION LABELS ---
+                # --- FORWARD MAE & EXHAUSTION LABELS ---
                 f_5d = df.iloc[t_idx+1:min(len(df), t_idx+6)]
                 forward_mae_pct = float('nan')
-                if hit_target_50 and len(f_5d) > 0:
-                    forward_mae_pct = (f_5d["low"].min() - t_close) / t_close
-                    
                 label_exhaustion = 0
-                if len(f_5d) > 0 and f_5d["low"].min() < t_close * 0.85: # 15% drop
-                    label_exhaustion = 1
+                if len(f_5d) > 0:
+                    forward_mae_pct = (f_5d["low"].min() - t_close) / t_close
+                    if forward_mae_pct <= -0.15: # 15% drop
+                        label_exhaustion = 1
 
                 record = {
-                    "forward_mae_pct": forward_mae_pct,
-                    "label_exhaustion": label_exhaustion,
                     "symbol": sym,
                     "date": str(df.index[t_idx].date()),
                     "entry_date": str(df.index[idx].date()),
+                    "forward_mae_pct": forward_mae_pct,
+                    "label_exhaustion": label_exhaustion,
                     "feature_days_since_ep": days_since_ep,
                     "feature_tightness_1m": tightness_1m,
                     "feature_gap_pct": gap_pct,

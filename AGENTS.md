@@ -1,72 +1,53 @@
-# AGENTS.md — Setup Scanner (`amirbaram/scanner`)
+# AGENTS.md — Episodic Pivot (EP) Strategy System (`amirbaram/EPs`)
 
-Full-US-market **EOD** stock scanner (Python 3.13). Detects ~10 setups (gappers, HVC,
-delayed-HVC, flat base, high tight flag, higher-low@MA, undercut & rally, plus MTF
-backburner & stairstep), each with a 0–100 quality score. Primary app is an
-interactive dashboard + point-in-time backtester. Data: yfinance daily (adjusted).
+Institutional **Episodic Pivot (EP)** trading system, machine learning models, and real-time dashboard suite (Python 3.13).
+Located at `/Users/amirbaram/Documents/code/EPs`.
 
-## Run
+## Primary Applications & Ports
 ```bash
-.venv/bin/python serve.py          # PRIMARY app → http://127.0.0.1:8780 (loads bars to RAM, ~30-60s)
-.venv/bin/python scan.py daily     # nightly: pull missing bars, scan, write output/
-.venv/bin/python scan.py scan      # re-scan cached data, no download
-.venv/bin/python scan.py init --max-tickers 300   # small first run (full init is ~30-60 min)
+.venv/bin/python serve_ep.py          # Historical Review & Strategy Backtester → http://127.0.0.1:8782
+.venv/bin/python serve_ep_tracker.py  # Live Multi-Quarter EP Tracker & Telemetry → http://127.0.0.1:8783
 ```
-Deps: `pip install -r requirements.txt`. Use the `.venv/` interpreter for everything.
+Deps: Python 3.13 virtual environment located at `.venv/`. Use `.venv/bin/python` for all execution.
 
-## The gate — run after EVERY change (non-negotiable)
+## The Gate — Run After EVERY Change (Non-Negotiable)
 ```bash
-bash scripts/check.sh              # byte-compiles core modules + runs tests/ (fast, offline, no deps)
+bash scripts/check.sh                 # Byte-compiles core EP modules + runs tests/ (fast, offline, zero deps)
 ```
-- Green gate is required before calling any change done. It exits non-zero on first failure.
-- **Every bug you fix adds a permanent regression test** in `tests/` — one that fails before your
-  fix and passes after. Name the seed + date in the test's docstring.
-- `tests/` is stdlib `unittest`, synthetic data only. `/api/*` endpoint smoke needs a live `:8780`
-  server and is NOT in the fast gate — run it separately if you touch the server routes.
+- Green gate is required before calling any change done. It exits non-zero on the first failure.
+- Every bug fix adds a permanent regression test in `tests/`.
 
-## How to work here (Amir's rules — follow them)
-- **Discuss before implementing.** Propose any logic/algorithm/fix change and get approval BEFORE
-  editing. Don't just start coding.
-- **Ask before choosing an algorithm/method** (e.g. pivot vs zigzag). Don't default silently.
-- **Answer questions first.** If Amir asks a question, answer it before deciding to change code.
-- **Chart-first validation.** A new/changed *setup* must be verified on the chart BEFORE any long
-  data/validation run. Don't kick off big runs on unvalidated detections.
-- **Version file for wide-blast-radius changes.** For a change touching many call sites, create a
-  new *versioned copy* of the file rather than editing in place.
-- **Be specific.** Cite exact timestamps / prices / bar-counts in any chart or data claim — never
-  "a few bars later". Gloss any codename (ST-4, SIG-9, …) in plain English on first use.
-- **Plain-English UI.** Every surface states meaning + suggested action; no unexplained jargon.
-- After a change that affects the running server, tell Amir whether he must **restart `serve.py`**
-  or can just **reload the page**.
-- Log bugs you find in `BUGS.md`; read it at the start of a work session.
-- A validated/changed setup also needs: chart anatomy check → `build_setup_registry.py` rebuild →
-  blindness check → docs update (the "setup graduation" checklist).
+## Core System Architecture & Trade Execution Rules
+1. **Trade 1 Execution — Delayed Breakout Only (No Day 1 Close Entry):**
+   - Entering on Day 1 Close is fundamentally **invalid** for live Pinnacle Elite trading because critical criteria (the 48-Hour Upper Body Absorption rule and Day 5 V2 rolling model) cannot be known on Day 1 without lookahead bias.
+   - The strategy deploys **Delayed Breakout Entry** on Days 2 to 5: stop-buy order placed 0.05 above Day 1 High once 48H holding is verified.
+   - If price breaches Day 1 Low before breakout, the order is cancelled immediately with **zero capital risked** (bypasses 535 gap-down traps).
+2. **Day 5 V2 Conviction Pyramiding:**
+   - Adds +50% position size on Day 5 if the rolling ordinal model conviction holds ($P(+50\%) \ge 0.20$) and price holds above initial breakout level.
+3. **1-Year ML Climax Partial Profit Take:**
+   - Trained up to 250 trading days (1 full calendar year) using zero-lookahead confirmed TrendLab swings, retracement ratios, up/down swing volume, pivot RVOL spikes, and consecutive gap-ups.
+   - Triggers a **50% partial profit take** when exhaustion probability reaches $\ge 0.50$, locking in peak R while retaining the remaining 50% runner on the 50 SMA baseline.
+4. **ML Dynamic Trailing Stop:**
+   - Activates once unrealized profit clears $\ge +3.0\text{ R}$ (or $5.0\times\text{ ADR}$).
+   - Trails using a 30th percentile MAE quantile regression buffer ($\alpha = 0.30$, ~16.8% buffer) anchored below the rising 21 EMA and 5-day swing shelf.
+5. **Trade 2 & 3 Multi-Leg Continuations:**
+   - **Track 1 / Track A:** Institutional Undercut & Reclaim (U&R) and High Tight Flag (HTF) 10 EMA pullbacks holding $\le 18\%$ consolidation.
+   - **Track 2 / Track B:** Secondary Base Intermediate Ribbon (8, 12, 16, 21) breakout after Blue/Gray digestion.
 
-## Git discipline
-- Branch is `main`, remote `origin`. **Do NOT merge or push to `main`.** Commit your work to your
-  own branch only. Merging/pushing is the integrator's job, not a worker session's.
-- Commit/push only when Amir asks.
-
-## Architecture map
+## Directory & File Map
 | Concern | File |
 |---|---|
-| CLI entry (init/daily/scan) | `scan.py` |
-| Interactive server + backtester | `serve.py` |
-| All default thresholds | `config.py` (runtime overrides → `data/settings.json` via `settings.py`) |
-| Pivots + structure/regime (SwingsTimes port) | `trendlab.py` (ATR_FRACTION=0.7 daily) |
-| Quality score (0–100) | `quality.py` (weights `Q_*` in config.py) |
-| Consolidation shape classifier | `patterns.py` |
-| Setup registry | `build_setup_registry.py` |
-| Regression suite | `tests/` (see `tests/README.md`) |
+| Historical Review Server & Strategy Engine | `serve_ep.py` (port 8782) |
+| Live Multi-Quarter Tracker Server | `serve_ep_tracker.py` (port 8783) |
+| Machine Learning Engine & Feature Extractors | `ep_ml_engine.py` |
+| Technical Indicators & Intermediate Ribbons | `scanner_core.py`, `indicators.py` |
+| Local Datastore Bar Loading | `datastore.py` |
+| Sector & Theme Classifications | `labels.py`, `thematic_engine.py` |
+| Playbook Handbook PDF Generator | `generate_handbook_pdf.py` |
+| Model Weights (`data/models/`) | `ep_exhaustion_classifier.pkl`, `ep_dynamic_trailer.pkl`, `ep_ur_reentry_classifier.pkl`, `ep_continuation_dynamic_trailer.pkl`, `amir_rolling_xgboost_ordinal.pkl` |
+| Scored Historical Dataset | `data/simulations/ep_combined_study_scored.parquet` |
+| Regression Test Suite | `tests/` |
 
-## Config & data gotchas
-- Thresholds live in `config.py`. The ⚙ settings panel overrides the **cache-safe** ones live and
-  saves to `data/settings.json` (the nightly run honors them). `ATR_FRACTION` is intentionally NOT
-  in the panel — it changes the cached pivot pass; edit `config.py` and reload.
-- Liquidity is deliberately NOT filtered at scan time — filter in the dashboard (min $vol/price/ADR).
-- `make_test_data.py` **OVERWRITES the data dir** — always run it isolated:
-  `SCAN_DATA_DIR=/tmp/scan_t SCAN_OUTPUT_DIR=/tmp/scan_t .venv/bin/python make_test_data.py`
-- Point `SCAN_DATA_DIR` / `SCAN_OUTPUT_DIR` at a throwaway dir to run an isolated instance without
-  touching the primary cache. `NOTEST` must always stay clean (flag nothing).
-
-See `README.md` (setups, scoring, regime gating in depth) and `DOCS.md` for detail.
+## Git Discipline
+- Repository is `amirbaram/EPs` located at `/Users/amirbaram/Documents/code/EPs`.
+- Do not commit or push to `main`. Commit only to your working branch when explicitly requested by Amir.
