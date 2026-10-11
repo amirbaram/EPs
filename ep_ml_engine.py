@@ -40,6 +40,30 @@ class EPMLEngine:
         cont_stop_path = base / "ep_continuation_dynamic_trailer.pkl"
         self.continuation_trailer = joblib.load(cont_stop_path) if cont_stop_path.exists() else None
 
+        exc_path = base / "ep_forward_excursion_regressor.pkl"
+        self.forward_excursion_model = joblib.load(exc_path) if exc_path.exists() else None
+
+        next_bar_path = base / "ep_next_bar_excursion_model.pkl"
+        self.next_bar_model = joblib.load(next_bar_path) if next_bar_path.exists() else None
+
+        self._cont_scaler_mean = None
+        self._cont_scaler_scale = None
+        self._cont_booster = None
+        self._cont_cols = None
+        if self.continuation_trailer is not None:
+            try:
+                if hasattr(self.continuation_trailer, "named_steps"):
+                    scaler = self.continuation_trailer.named_steps.get("scaler")
+                    if scaler is not None and hasattr(scaler, "mean_"):
+                        self._cont_scaler_mean = scaler.mean_
+                        self._cont_scaler_scale = scaler.scale_
+                        self._cont_cols = list(scaler.feature_names_in_)
+                    reg = self.continuation_trailer.named_steps.get("regressor")
+                    if reg is not None and hasattr(reg, "booster_"):
+                        self._cont_booster = reg.booster_
+            except Exception:
+                pass
+
         self.spy_df = datastore.load_bars("SPY")
         
         # [FIX]: Load Context Cache EXACTLY ONCE into an O(1) Lookup Dictionary
@@ -115,17 +139,20 @@ class EPMLEngine:
             "feature_strongest_theme": c_data["strongest_theme"]
         }
 
-    def compute_rolling_features(self, sym: str, d1_idx: int, t_idx: int, df: pd.DataFrame | None = None) -> dict | None:
+    def compute_rolling_features(self, sym: str, d1_idx: int, t_idx: int, df: pd.DataFrame | None = None, allow_stopped: bool = False) -> dict | None:
         if df is None:
             df = datastore.load_bars(sym)
         if df is None or t_idx >= len(df) or t_idx < d1_idx: return None
         
-        df = df.copy()
-        if 'rvol' not in df.columns: df = indicators.add_indicators(df)
-        df = df.loc[:, ~df.columns.duplicated()]
-        df["ema10"] = df["close"].ewm(span=10, adjust=False).mean()
-        df["ema20"] = df["close"].ewm(span=20, adjust=False).mean()
-        df["ema50"] = df["close"].ewm(span=50, adjust=False).mean()
+        if 'rvol' not in df.columns:
+            df = indicators.add_indicators(df.copy())
+        if 'ema10' not in df.columns or 'ema20' not in df.columns or 'ema50' not in df.columns:
+            df = df.copy()
+            df["ema10"] = df["close"].ewm(span=10, adjust=False).mean()
+            df["ema20"] = df["close"].ewm(span=20, adjust=False).mean()
+            df["ema50"] = df["close"].ewm(span=50, adjust=False).mean()
+        if df.columns.duplicated().any():
+            df = df.loc[:, ~df.columns.duplicated()]
 
         d1_low = float(df["low"].iloc[d1_idx])
         d1_close = float(df["close"].iloc[d1_idx])
@@ -134,7 +161,8 @@ class EPMLEngine:
         rvol = float(df["rvol"].iloc[d1_idx]) if "rvol" in df.columns else 1.0
         close_pos = float(df["close_pos"].iloc[d1_idx]) if "close_pos" in df.columns else 0.5
         
-        if df["low"].iloc[d1_idx:t_idx+1].min() < d1_low: return None
+        is_stopped_out = bool(df["low"].iloc[d1_idx:t_idx+1].min() < d1_low)
+        if not allow_stopped and is_stopped_out: return None
         
         t_close = float(df["close"].iloc[t_idx])
         days_since_ep = t_idx - d1_idx
@@ -299,10 +327,11 @@ class EPMLEngine:
             "feature_thrust_accel": thrust_accel,
             "feature_consecutive_gaps": consecutive_gaps,
             "feature_gap_count_5d": gap_count_5d,
+            "is_stopped_out": is_stopped_out,
         }
 
     def _execute_predictions(self, model, features: dict, is_v1: bool = False) -> dict:
-        if not model: return {"prob_50": 0.0, "prob_100": 0.0, "prob_150": 0.0, "prob_200": 0.0}
+        if not model: return {"prob_50": 0.0, "prob_100": 0.0, "prob_150": 0.0, "prob_200": 0.0, "is_stopped_out": False}
         
         if hasattr(model, 'feature_names_in_'):
             cols = [c for c in model.feature_names_in_ if c in features]
@@ -319,7 +348,8 @@ class EPMLEngine:
             "prob_50": 1.0 if curr_ret >= 0.50 else min(1.0, float(probs[1:].sum())),
             "prob_100": 1.0 if curr_ret >= 1.00 else min(1.0, float(probs[2:].sum())),
             "prob_150": 1.0 if curr_ret >= 1.50 else min(1.0, float(probs[3:].sum())),
-            "prob_200": 1.0 if curr_ret >= 2.00 else min(1.0, float(probs[4]))
+            "prob_200": 1.0 if curr_ret >= 2.00 else min(1.0, float(probs[4])),
+            "is_stopped_out": bool(features.get("is_stopped_out", False)),
         }
         
         if self.toxicity_filter:
@@ -358,8 +388,139 @@ class EPMLEngine:
                     res["is_climax_exhaustion"] = bool(p_val >= 0.50)
             except Exception:
                 pass
+
+        if hasattr(self, 'forward_excursion_model') and self.forward_excursion_model:
+            try:
+                exc = self.predict_forward_excursion(features)
+                res["forward_mfe_20d"] = exc.get("pred_mfe_20d")
+                res["forward_mae_20d"] = exc.get("pred_mae_20d")
+                res["prob_mfe_first"] = exc.get("prob_mfe_first")
+                res["prob_barrier_2r"] = exc.get("prob_barrier_2r")
+            except Exception:
+                pass
+
+        if hasattr(self, 'next_bar_model') and self.next_bar_model:
+            try:
+                if any(k in features for k in ("feat_close_pos", "feat_ret_1d", "feat_atr14_pct")):
+                    exc_nb = self.predict_next_bar_excursion(features)
+                    res["next_bar_mfe"] = exc_nb.get("pred_next_mfe")
+                    res["next_bar_mae"] = exc_nb.get("pred_next_mae")
+                    res["next_bar_prob_mfe_first"] = exc_nb.get("prob_mfe_first")
+                    res["next_bar_first_extreme"] = exc_nb.get("pred_first_extreme")
+            except Exception:
+                pass
                 
         return res
+
+    def predict_forward_excursion(self, features: dict) -> dict:
+        if not hasattr(self, 'forward_excursion_model') or not self.forward_excursion_model:
+            return {"pred_mfe_20d": None, "pred_mae_20d": None, "prob_mfe_first": None, "prob_barrier_2r": None}
+        try:
+            mfe_model = self.forward_excursion_model.get("mfe_model")
+            mae_model = self.forward_excursion_model.get("mae_model")
+            seq_model = self.forward_excursion_model.get("seq_model")
+            barrier_model = self.forward_excursion_model.get("barrier_model")
+            cols = self.forward_excursion_model.get("feature_cols", [])
+            df_feat = pd.DataFrame([features]).reindex(columns=cols, fill_value=0.0)
+            p_mfe = float(mfe_model.predict(df_feat)[0]) if mfe_model else None
+            p_mae = float(mae_model.predict(df_feat)[0]) if mae_model else None
+            p_seq = float(seq_model.predict_proba(df_feat)[0][1]) if seq_model else None
+            p_barrier = float(barrier_model.predict_proba(df_feat)[0][1]) if barrier_model else None
+            return {
+                "pred_mfe_20d": round(p_mfe, 1) if p_mfe is not None else None,
+                "pred_mae_20d": round(p_mae, 1) if p_mae is not None else None,
+                "prob_mfe_first": round(p_seq, 3) if p_seq is not None else None,
+                "prob_barrier_2r": round(p_barrier, 3) if p_barrier is not None else None,
+            }
+        except Exception:
+            return {"pred_mfe_20d": None, "pred_mae_20d": None, "prob_mfe_first": None, "prob_barrier_2r": None}
+
+    def compute_next_bar_features(self, sym: str, bar_idx: int = -1, b5: pd.DataFrame | None = None) -> dict | None:
+        """Computes zero-lookahead next-bar feature vector for a symbol at a given bar close index."""
+        try:
+            import train_next_bar_excursion_model as nbm
+            df_feats = nbm.extract_ticker_features_and_targets(sym, b5=b5, drop_unlabeled=False)
+            if df_feats is None or len(df_feats) == 0:
+                df_feats = nbm.extract_ticker_features_from_daily(sym, drop_unlabeled=False)
+            if df_feats is None or len(df_feats) == 0:
+                return None
+            idx = bar_idx if bar_idx >= 0 else len(df_feats) + bar_idx
+            if idx < 0 or idx >= len(df_feats):
+                return None
+            row = df_feats.iloc[idx]
+            feat_dict = {c: float(row[c]) for c in nbm.FEATURE_COLS if c in row}
+            return feat_dict
+        except Exception:
+            return None
+
+    def predict_next_bar_excursion(self, features: dict) -> dict:
+        """Infers next-bar expected MFE %, MAE %, and probability of High hit first."""
+        if not hasattr(self, 'next_bar_model') or not self.next_bar_model:
+            return {
+                "pred_next_mfe": None,
+                "pred_next_mae": None,
+                "prob_mfe_first": None,
+                "pred_first_extreme": None
+            }
+        try:
+            mfe_model = self.next_bar_model.get("mfe_model")
+            mae_model = self.next_bar_model.get("mae_model")
+            seq_model = self.next_bar_model.get("seq_model")
+            cols = self.next_bar_model.get("feature_cols", [])
+            df_feat = pd.DataFrame([features]).reindex(columns=cols, fill_value=0.0)
+            df_feat = df_feat.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+            p_mfe = float(mfe_model.predict(df_feat)[0]) if mfe_model else None
+            p_mae = float(mae_model.predict(df_feat)[0]) if mae_model else None
+            p_seq = float(seq_model.predict_proba(df_feat)[0][1]) if seq_model else None
+
+            first_extreme = "HIGH" if (p_seq is not None and p_seq >= 0.50) else ("LOW" if p_seq is not None else None)
+            return {
+                "pred_next_mfe": round(p_mfe, 2) if p_mfe is not None else None,
+                "pred_next_mae": round(p_mae, 2) if p_mae is not None else None,
+                "prob_mfe_first": round(p_seq, 3) if p_seq is not None else None,
+                "pred_first_extreme": first_extreme
+            }
+        except Exception:
+            return {
+                "pred_next_mfe": None,
+                "pred_next_mae": None,
+                "prob_mfe_first": None,
+                "pred_first_extreme": None
+            }
+
+    def predict_next_bar_excursion_batch(self, df_features: pd.DataFrame) -> pd.DataFrame:
+        """Vectorized batch prediction for next-bar excursions and first-hit probabilities."""
+        cols = self.next_bar_model.get("feature_cols", []) if (hasattr(self, 'next_bar_model') and self.next_bar_model) else []
+        n_rows = len(df_features)
+        if not hasattr(self, 'next_bar_model') or not self.next_bar_model or n_rows == 0:
+            return pd.DataFrame({
+                "pred_next_mfe": [None] * n_rows,
+                "pred_next_mae": [None] * n_rows,
+                "prob_mfe_first": [None] * n_rows,
+                "pred_first_extreme": [None] * n_rows
+            }, index=df_features.index)
+        try:
+            mfe_model = self.next_bar_model.get("mfe_model")
+            mae_model = self.next_bar_model.get("mae_model")
+            seq_model = self.next_bar_model.get("seq_model")
+            X = df_features.reindex(columns=cols, fill_value=0.0).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+            preds_mfe = np.round(mfe_model.predict(X), 2) if mfe_model else np.full(n_rows, np.nan)
+            preds_mae = np.round(mae_model.predict(X), 2) if mae_model else np.full(n_rows, np.nan)
+            probs_seq = np.round(seq_model.predict_proba(X)[:, 1], 3) if seq_model else np.full(n_rows, np.nan)
+            extremes = np.where(probs_seq >= 0.50, "HIGH", "LOW")
+            return pd.DataFrame({
+                "pred_next_mfe": preds_mfe,
+                "pred_next_mae": preds_mae,
+                "prob_mfe_first": probs_seq,
+                "pred_first_extreme": extremes
+            }, index=df_features.index)
+        except Exception:
+            return pd.DataFrame({
+                "pred_next_mfe": [None] * n_rows,
+                "pred_next_mae": [None] * n_rows,
+                "prob_mfe_first": [None] * n_rows,
+                "pred_first_extreme": [None] * n_rows
+            }, index=df_features.index)
 
     def predict(self, features: dict) -> dict:
         return self._execute_predictions(self.v1_ordinal, features, is_v1=True)
@@ -591,14 +752,53 @@ class EPMLEngine:
     def predict_continuation_trailer(self, features: dict) -> float:
         if not hasattr(self, 'continuation_trailer') or self.continuation_trailer is None:
             return 12.0
-        df_feat = pd.DataFrame([features])
-        if hasattr(self.continuation_trailer, "named_steps") and "scaler" in self.continuation_trailer.named_steps:
-            cols = list(self.continuation_trailer.named_steps["scaler"].feature_names_in_)
-            df_feat = df_feat.reindex(columns=cols, fill_value=0.0)
         try:
+            if (
+                hasattr(self, '_cont_booster')
+                and self._cont_booster is not None
+                and self._cont_cols is not None
+                and self._cont_scaler_mean is not None
+                and self._cont_scaler_scale is not None
+            ):
+                row_vals = []
+                for c in self._cont_cols:
+                    v = features.get(c, 0.0)
+                    row_vals.append(0.0 if v is None or (isinstance(v, float) and np.isnan(v)) else float(v))
+                row_vec = np.array([row_vals], dtype=np.float64)
+                x_scaled = (row_vec - self._cont_scaler_mean) / self._cont_scaler_scale
+                pred = float(self._cont_booster.predict(x_scaled)[0])
+                return round(max(3.0, min(35.0, pred)), 2)
+
+            df_feat = pd.DataFrame([features])
+            if hasattr(self.continuation_trailer, "named_steps") and "scaler" in self.continuation_trailer.named_steps:
+                cols = list(self.continuation_trailer.named_steps["scaler"].feature_names_in_)
+                df_feat = df_feat.reindex(columns=cols, fill_value=0.0)
             pred = float(self.continuation_trailer.predict(df_feat)[0])
             return round(max(3.0, min(35.0, pred)), 2)
         except Exception:
             return 12.0
 
+    def predict_continuation_trailer_batch(self, X: np.ndarray) -> np.ndarray:
+        """Vectorized batch prediction for continuation dynamic trailer.
+        Input X has shape (N, 7) corresponding to _cont_cols.
+        Returns 1D array of predicted buffer percentages.
+        """
+        if (
+            not hasattr(self, '_cont_booster')
+            or self._cont_booster is None
+            or self._cont_scaler_mean is None
+            or self._cont_scaler_scale is None
+        ):
+            return np.full(len(X), 12.0)
+        if len(X) == 0:
+            return np.empty(0, dtype=np.float64)
+        try:
+            X_clean = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+            x_scaled = (X_clean - self._cont_scaler_mean) / self._cont_scaler_scale
+            preds = self._cont_booster.predict(x_scaled)
+            return np.clip(preds, 3.0, 35.0).round(2)
+        except Exception:
+            return np.full(len(X), 12.0)
+
 engine = EPMLEngine()
+

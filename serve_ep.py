@@ -54,11 +54,22 @@ def get_df():
             DF["rvol"] = DF["rvol"].fillna(0.0)
             DF["dvol_m"] = DF["dvol_m"].fillna(0.0)
             DF["close_pos"] = DF["close_pos"].fillna(0.5)
+            if "prev_day_gap_pct" in DF.columns:
+                DF["prev_day_gap_pct"] = DF["prev_day_gap_pct"].fillna(0.0)
+            if "prev_day_gap_up" in DF.columns:
+                DF["prev_day_gap_up"] = DF["prev_day_gap_up"].fillna(False)
             print(f"Loaded {len(DF)} EP events.")
         else:
             print(f"Error: {DATA_PATH} not found!")
             DF = pd.DataFrame()
     return DF
+
+@app.route("/api/reload_dataset", methods=["GET", "POST"])
+def api_reload_dataset():
+    global DF
+    DF = None
+    df = get_df()
+    return jsonify({"status": "ok", "rows": len(df), "max_date": str(df["date"].max()) if not df.empty else None})
 
 HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="en">
@@ -204,13 +215,126 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
   /* Center Pane: Full-Height Chart */
   .chart-pane { flex: 1.4; min-width: 500px; min-height: 0; display: flex; flex-direction: column; background: #0c0f16; border-right: 1px solid var(--border); position: relative; overflow: hidden; }
+
+  /* Fullscreen Enlarge View: Massive Chart on Left + Info Panel on Right */
+  .workspace.fullscreen-chart-mode {
+    position: fixed !important;
+    inset: 0 !important;
+    z-index: 9999 !important;
+    width: 100vw !important;
+    height: 100vh !important;
+    background: #0b0e14 !important;
+    overflow: hidden !important;
+  }
+  .workspace.fullscreen-chart-mode .table-pane {
+    display: none !important;
+  }
+  .workspace.fullscreen-chart-mode .chart-pane {
+    flex: 1 !important;
+    min-width: 0 !important;
+    height: 100vh !important;
+    border-right: 1px solid var(--border) !important;
+    position: relative !important;
+  }
+  .workspace.fullscreen-chart-mode .dossier-pane {
+    flex: 0 0 440px !important;
+    width: 440px !important;
+    max-width: 480px !important;
+    height: 100vh !important;
+    overflow-y: auto !important;
+    display: flex !important;
+    border-left: 1px solid var(--border) !important;
+    box-shadow: -4px 0 20px rgba(0, 0, 0, 0.5) !important;
+    z-index: 25 !important;
+  }
   .chart-header {
     padding: 8px 16px; background: var(--surface); border-bottom: 1px solid var(--border);
     display: flex; justify-content: space-between; align-items: center; flex-shrink: 0;
   }
   .chart-sym { font-size: 16px; font-weight: 700; color: #fff; }
   .chart-details { font-size: 12px; color: var(--muted); }
+  .btn-chart-enlarge {
+    background: #1e293b; color: #38bdf8; border: 1px solid #0284c7;
+    padding: 3px 8px; border-radius: 4px; font-size: 11px; font-weight: 700;
+    cursor: pointer; display: inline-flex; align-items: center; gap: 4px;
+    transition: all 0.15s ease;
+  }
+  .btn-chart-enlarge:hover {
+    background: #0284c7; color: #fff;
+  }
+  .btn-chart-enlarge.active {
+    background: #0284c7; color: #fff; border-color: #38bdf8;
+    box-shadow: 0 0 8px rgba(56, 189, 248, 0.4);
+  }
+
+  /* Chart header controls and badges: always visible with clean flex spacing */
+  .chart-enlarged-only-controls {
+    display: flex !important;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: nowrap;
+  }
+  .workspace.fullscreen-chart-mode .chart-enlarged-only-controls {
+    display: flex !important;
+    align-items: center;
+    gap: 8px;
+  }
+
+  /* Chart Settings Floating Panel */
+  .chart-settings-panel {
+    position: absolute; top: 10px; right: 14px; z-index: 60;
+    width: 290px; background: rgba(15, 23, 42, 0.95); border: 1px solid #334155;
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.7); border-radius: 8px;
+    backdrop-filter: blur(10px); overflow: hidden; display: flex; flex-direction: column;
+    animation: fadeIn 0.15s ease-out;
+  }
+  .settings-panel-header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 8px 12px; background: #111827; border-bottom: 1px solid #1f2937;
+  }
+  .panel-close-btn {
+    background: transparent; border: none; color: #94a3b8; font-size: 16px;
+    font-weight: 700; cursor: pointer; line-height: 1; padding: 2px 6px; border-radius: 4px;
+  }
+  .panel-close-btn:hover { color: #fff; background: #334155; }
+  .settings-panel-body {
+    padding: 10px 12px; display: flex; flex-direction: column; gap: 10px;
+    max-height: 480px; overflow-y: auto;
+  }
+  .settings-section {
+    border-bottom: 1px solid #1e293b; padding-bottom: 8px;
+  }
+  .settings-section:last-child { border-bottom: none; padding-bottom: 0; }
+  .settings-sec-title {
+    font-size: 9.5px; font-weight: 800; color: #64748b; letter-spacing: 0.5px;
+    margin-bottom: 6px; text-transform: uppercase;
+  }
+  .settings-row {
+    display: flex; align-items: center; margin-bottom: 4px;
+  }
+  .settings-row:last-child { margin-bottom: 0; }
   
+  /* Chart Drawing Toolbar & SVG Canvas */
+  .chart-draw-toolbar {
+    position: absolute; top: 10px; left: 10px; z-index: 50;
+    background: rgba(15, 23, 42, 0.92); border: 1px solid #334155;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.6); border-radius: 6px;
+    padding: 3px 6px; display: flex; align-items: center; gap: 4px;
+    backdrop-filter: blur(8px);
+  }
+  .draw-btn {
+    background: #1e293b; color: #cbd5e1; border: 1px solid #334155;
+    padding: 3px 8px; border-radius: 4px; font-size: 11px; font-weight: 600;
+    cursor: pointer; display: inline-flex; align-items: center; gap: 4px;
+    transition: all 0.15s ease;
+  }
+  .draw-btn:hover { background: #334155; color: #fff; }
+  .draw-btn.active {
+    background: #0284c7; color: #fff; border-color: #38bdf8;
+    box-shadow: 0 0 8px rgba(56, 189, 248, 0.5);
+  }
+  .draw-btn-danger:hover { background: #991b1b; border-color: #ef4444; color: #fff; }
+
   /* Ticker History Bar */
   .ticker-history-bar {
     background: #0f172a; border-bottom: 2px solid #0284c7;
@@ -229,7 +353,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     background: #0284c7; color: #fff; border-color: #38bdf8; box-shadow: 0 0 10px rgba(56,189,248,0.6);
   }
   .hist-chip-gain { font-size: 10px; font-weight: 700; color: #34d399; }
-  #chart-container { flex: 1; min-height: 0; width: 100%; height: 100%; position: relative; overflow: hidden; }
+  #chart-container { flex: 1; min-height: 0; width: 100%; position: relative; overflow: hidden; }
 
   /* Right Pane: Dedicated Info & Trade Dossier Panel */
   .dossier-pane {
@@ -396,6 +520,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <span>🔥 5D Support (Held D1 Low)</span>
     <span class="booster-pill">+1.76 R Exp</span>
   </div>
+  <div class="booster-chip" id="b_no_prev_gap" onclick="toggleBooster('no_prev_gap')" title="Filters out EPs that already gapped up on Day -1 (prior session) before the catalyst">
+    <span>🛡️ Clean Pivot (No Prior Gap)</span>
+    <span class="booster-pill">Trap Avoidance</span>
+  </div>
   <button class="booster-reset" onclick="resetBoosters()">Clear Boosters</button>
 </div>
 
@@ -462,6 +590,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       <option value="classic">Classic Catalyst Gap (&ge;6%)</option>
       <option value="bigmove">Big Move Intraday Surge</option>
       <option value="ep9m">EP-9M (9M+ Shares)</option>
+      <option value="dre">DRE (Delayed Reaction EP)</option>
     </select>
   </div>
 
@@ -473,6 +602,45 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   <div class="filter-group">
     <label>Year</label>
     <select id="f_year"><option value="">All Years</option></select>
+  </div>
+
+  <div class="filter-group">
+    <label title="Filter to EPs that occurred within the recent N days">Recent</label>
+    <select id="f_recent_days" style="color:#38bdf8; font-weight:700;">
+      <option value="">All History (10 Yrs)</option>
+      <option value="5">Recent 5 Days (Past Wk)</option>
+      <option value="10">Recent 10 Days (2 Wks)</option>
+      <option value="20">Recent 20 Days (~1 Mo)</option>
+      <option value="30">Recent 30 Days</option>
+      <option value="45">Recent 45 Days (~6 Wk)</option>
+      <option value="60">Recent 60 Days (Quarter)</option>
+      <option value="90">Recent 90 Days</option>
+      <option value="180">Recent 180 Days (Half-Year)</option>
+      <option value="365">Recent 365 Days (1 Year)</option>
+      <option value="custom">Custom N Days...</option>
+    </select>
+    <input type="number" id="f_recent_days_custom" placeholder="N days" min="1" max="3650" style="display:none; width:65px; background:#11151f; border:1px solid #0284c7; color:#38bdf8; padding:3px 6px; border-radius:4px; font-size:11px; font-weight:700;">
+  </div>
+
+  <div class="filter-group">
+    <label title="Filter by V2 Machine Learning Conviction Probability P(+50%)">V2 Score</label>
+    <select id="f_v2" style="color:var(--green); font-weight:700;">
+      <option value="">All V2 Scores</option>
+      <option value="20">⚡ &ge; 20% (Pyramid Qualified)</option>
+      <option value="30">🔥 &ge; 30% (High Conviction)</option>
+      <option value="40">🏆 &ge; 40% (Elite Conviction)</option>
+      <option value="50">💎 &ge; 50% (Ultra Conviction)</option>
+      <option value="sub20">⚠️ &lt; 20% (Unqualified)</option>
+    </select>
+  </div>
+
+  <div class="filter-group">
+    <label title="Filter out EPs that gapped up on Day -1 (prior session) before catalyst">Prior Day Gap</label>
+    <select id="f_prev_gap">
+      <option value="">All</option>
+      <option value="no_gap">🛡️ Clean (No Prior Gap)</option>
+      <option value="gap_up">⚠️ Prior Day Gapped Up</option>
+    </select>
   </div>
 
 </div>
@@ -517,6 +685,29 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       <input type="checkbox" id="cfg_ml_stop" checked onchange="onStrategyConfigChange()">
       <span class="toggle-label">🛑 ML Trailing Stop</span>
     </label>
+
+    <!-- Config: Climax Partial Profit % -->
+    <div id="cfg_climax_pct_container" style="display:flex; align-items:center; gap:5px; background:#0f172a; padding:2px 7px; border-radius:6px; border:1px solid #1e293b;" title="Partial profit percentage to lock in when ML Climax triggers">
+      <label style="color:#94a3b8; font-size:11px; font-weight:700;">🎯 Climax %:</label>
+      <select id="cfg_climax_pct" onchange="onStrategyConfigChange()" style="background:#1e293b; color:var(--gold); border:1px solid #f59e0b; padding:2px 4px; border-radius:4px; font-size:11px; font-weight:700; cursor:pointer;">
+        <option value="0.25">25%</option>
+        <option value="0.33">33%</option>
+        <option value="0.50" selected>50%</option>
+        <option value="0.66">66%</option>
+        <option value="0.75">75%</option>
+      </select>
+    </div>
+
+    <!-- Config: Climax & Trailer R-Hurdle -->
+    <div id="cfg_climax_hurdle_container" style="display:flex; align-items:center; gap:5px; background:#0f172a; padding:2px 7px; border-radius:6px; border:1px solid #1e293b;" title="Exhaustion &amp; Trailing activation hurdle (minimum unrealized R required)">
+      <label style="color:#94a3b8; font-size:11px; font-weight:700;">⚡ Exhaustion / Hurdle:</label>
+      <select id="cfg_climax_hurdle" onchange="onStrategyConfigChange()" style="background:#1e293b; color:var(--cyan); border:1px solid #0284c7; padding:2px 4px; border-radius:4px; font-size:11px; font-weight:700; cursor:pointer;">
+        <option value="2.0">2.0 R</option>
+        <option value="3.0" selected>3.0 R</option>
+        <option value="4.0">4.0 R</option>
+        <option value="5.0">5.0 R</option>
+      </select>
+    </div>
 
     <!-- Toggle 4: Multi-Leg (Trade 2 & 3) -->
     <label class="toggle-control" title="When ON: monitors for Dual-Window continuation setups (Track A HTF Days 3–25 + Track B Base Ribbon Days 10–65), compounding multi-leg R.">
@@ -585,13 +776,14 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           <th onclick="sortBy('ret_20d')" title="20-day return %">20D %</th>
           <th onclick="sortBy('ret_60d')" title="60-day return %">60D %</th>
           <th onclick="sortBy('max_gain')" title="Peak favorable excursion within 180 days">Max Gain %</th>
-                    <th class="tl" onclick="sortBy('outcome')" title="Structural classification">Outcome</th>
+          <th onclick="sortBy('strat_r')" title="Active Strategy Return and R-Multiple for Selected Mode">Strategy R</th>
+          <th class="tl" onclick="sortBy('outcome')" title="Structural classification">Outcome</th>
           <th onclick="sortBy('ml_50')" title="AI Probability for +50% target">AI 50</th>
           <th onclick="sortBy('ml_150')" title="AI Probability for +150% target">AI 150</th>
         </tr>
       </thead>
       <tbody id="table-body">
-        <tr><td colspan="14" style="text-align:center; padding:30px; color:var(--muted);">Loading events...</td></tr>
+        <tr><td colspan="15" style="text-align:center; padding:30px; color:var(--muted);">Loading events...</td></tr>
       </tbody>
     </table>
   </div>
@@ -599,17 +791,208 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   <!-- 2. Center Pane: Interactive Chart (Full Height) -->
   <div class="chart-pane">
     <div class="chart-header">
-      <div>
+      <div style="min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; padding-right:8px;">
         <span class="chart-sym" id="chart_sym">Select an event</span>
-        <span class="chart-details" id="chart_sub">Click any row on the left to inspect chart &amp; dossier</span>
+        <span class="chart-details" id="chart_sub" style="margin-left:6px;">Click any row on the left to inspect chart &amp; dossier</span>
       </div>
-      <div id="chart_tags"></div>
+      <div style="display:flex; align-items:center; gap:8px; flex-shrink:0;">
+        <div class="chart-enlarged-only-controls">
+          <!-- Hidden inputs for programmatic compatibility -->
+          <input type="checkbox" id="chk_ema10" checked style="display:none;" onchange="toggleEma10()">
+          <input type="checkbox" id="chk_ema20" checked style="display:none;" onchange="toggleEma20()">
+          <input type="checkbox" id="chk_sma50" checked style="display:none;" onchange="toggleSma50()">
+          <input type="checkbox" id="chk_larsson" checked style="display:none;" onchange="toggleLarsson()">
+
+          <div id="lbl_hover_adr" style="display:inline-flex; align-items:center; gap:4px; background:rgba(56,189,248,0.12); border:1px solid #0284c7; padding:2px 8px; border-radius:4px; font-size:11px;" title="ADR(14) 14-Day Average Daily Range on Hover">
+            <span style="color:#38bdf8; font-weight:700;">📊 ADR(14):</span>
+            <span id="val_hover_adr" style="color:#38bdf8; font-weight:700;">—</span>
+          </div>
+
+          <div id="lbl_hover_exhaustion" style="display:inline-flex; align-items:center; gap:5px; background:rgba(244,63,94,0.12); border:1px solid #f43f5e; padding:2px 8px; border-radius:4px; font-size:11px;" title="ML Climax Exhaustion Probability &amp; Level on Hover">
+            <span style="color:#f43f5e; font-weight:700;">🔥 Exhaustion:</span>
+            <span id="val_hover_exhaustion" style="color:#f43f5e; font-weight:700;">—</span>
+          </div>
+
+          <div id="chart_tags"></div>
+          <button id="btn_chart_settings" class="btn-chart-enlarge" onclick="toggleChartSettings()" title="Configure Chart Displays, Markers, and Parameters">⚙️ Settings</button>
+          <button id="btn_toggle_draw" class="btn-chart-enlarge" onclick="toggleDrawToolbar()" title="Toggle on-chart drawing tools (Measure, Line, Text, Arrow)">✏️ Tools</button>
+        </div>
+        <button id="btn_chart_fullscreen" class="btn-chart-enlarge" onclick="toggleChartFullscreen()" title="Toggle full-screen chart display (Esc to exit)" style="flex-shrink:0;">⛶ Enlarge</button>
+      </div>
     </div>
     <div class="ticker-history-bar" id="ticker_history_bar" style="display:none;">
       <span class="hist-label">📅 Historical EPs for <b id="hist_ticker_name">SYM</b> (<span id="hist_count">0</span>):</span>
       <div class="hist-chips" id="hist_chips"></div>
     </div>
-    <div id="chart-container"></div>
+    <div id="chart-container">
+      <!-- Floating Hover HUD Badge on Chart Canvas -->
+      <div id="chart_hover_hud" style="display:none; position:absolute; top:12px; left:12px; z-index:45; background:rgba(15,23,42,0.92); backdrop-filter:blur(8px); border:1px solid #334155; border-radius:6px; padding:4px 10px; font-size:11px; color:#e2e8f0; pointer-events:none; box-shadow:0 4px 14px rgba(0,0,0,0.6);">
+        <span id="hud_date" style="color:#94a3b8; font-weight:600; margin-right:8px;">—</span>
+        <span id="hud_adr" style="color:#38bdf8; font-weight:700; margin-right:8px;">📊 ADR(14): —</span>
+        <span id="hud_exhaustion" style="color:#f43f5e; font-weight:700;">🔥 Exhaustion: —</span>
+        <span id="hud_ep_reason" style="display:none; margin-left:8px; padding-left:8px; border-left:1px solid #334155;"></span>
+      </div>
+
+      <!-- Floating Chart & Marker Settings Panel -->
+      <div id="chart_settings_panel" class="chart-settings-panel" style="display:none;">
+        <div class="settings-panel-header">
+          <span style="font-weight:700; color:#f8fafc; font-size:12px; display:flex; align-items:center; gap:6px;">
+            <span>⚙️</span> Chart &amp; Marker Settings
+          </span>
+          <button type="button" class="panel-close-btn" onclick="toggleChartSettings()" title="Close Settings">&times;</button>
+        </div>
+        <div class="settings-panel-body">
+          <div class="settings-section">
+            <div class="settings-sec-title">📈 MOVING AVERAGES &amp; RIBBONS</div>
+            <div class="settings-row">
+              <label class="toggle-control" style="margin:0; font-size:11px;">
+                <input type="checkbox" id="chk_settings_ema10" checked onchange="syncSettingCheckbox('chk_ema10', this.checked); toggleEma10()">
+                <span class="toggle-label" style="color:#f97316;">10 EMA (Momentum)</span>
+              </label>
+            </div>
+            <div class="settings-row">
+              <label class="toggle-control" style="margin:0; font-size:11px;">
+                <input type="checkbox" id="chk_settings_ema20" checked onchange="syncSettingCheckbox('chk_ema20', this.checked); toggleEma20()">
+                <span class="toggle-label" style="color:#3b82f6;">20 EMA (Swing baseline)</span>
+              </label>
+            </div>
+            <div class="settings-row">
+              <label class="toggle-control" style="margin:0; font-size:11px;">
+                <input type="checkbox" id="chk_settings_sma50" checked onchange="syncSettingCheckbox('chk_sma50', this.checked); toggleSma50()">
+                <span class="toggle-label" style="color:#8b5cf6;">50 SMA (Institutional trend)</span>
+              </label>
+            </div>
+            <div class="settings-row">
+              <label class="toggle-control" style="margin:0; font-size:11px;">
+                <input type="checkbox" id="chk_settings_vol_ma20" checked onchange="toggleVolMa20()">
+                <span class="toggle-label" style="color:#38bdf8;">20 Day Volume MA</span>
+              </label>
+            </div>
+            <div class="settings-row" style="margin-top:2px;">
+              <label class="toggle-control" style="margin:0; font-size:11px;">
+                <input type="checkbox" id="chk_settings_larsson" checked onchange="syncSettingCheckbox('chk_larsson', this.checked); toggleLarsson()">
+                <span class="toggle-label" style="color:#eab308; font-weight:700;">Larsson Line Ribbon</span>
+              </label>
+            </div>
+            <div class="settings-row" style="margin-top:6px; justify-content:space-between; align-items:center; background:#111827; padding:4px 8px; border-radius:4px; border:1px solid #1f2937;">
+              <div style="display:flex; align-items:center; gap:6px;">
+                <span style="font-size:11px; color:#cbd5e1; font-weight:600;">Fastest EMA:</span>
+                <input type="number" id="cfg_larsson_fastest" value="32" min="3" max="80" style="width:42px; background:#1e293b; color:#38bdf8; border:1px solid #334155; border-radius:3px; padding:2px 4px; font-size:11px; text-align:center; font-weight:700;" onchange="onLarssonFastestChange()">
+              </div>
+              <div style="display:flex; align-items:center; gap:6px;">
+                <span id="lbl_larsson_spans" style="color:#64748b; font-size:10px; font-weight:600;">(32, 35, 50, 58)</span>
+                <span id="lbl_larsson_vals" style="font-size:11px; font-weight:700; display:inline-flex; gap:6px;">
+                  <span id="larsson_val_fast" style="color:#facc15;">—</span>
+                  <span id="larsson_val_slow" style="color:#38bdf8;">—</span>
+                </span>
+              </div>
+            </div>
+          </div>
+
+          <div class="settings-section">
+            <div class="settings-sec-title">🔥 MOMENTUM &amp; EXHAUSTION</div>
+            <div class="settings-row">
+              <label class="toggle-control" style="margin:0; font-size:11px;" title="Display day-by-day ML Climax Exhaustion probability &amp; level under mouse crosshair">
+                <input type="checkbox" id="chk_settings_show_exhaustion" checked onchange="toggleShowExhaustion()">
+                <span class="toggle-label" style="color:#f43f5e; font-weight:700;">Show Exhaustion on Hover</span>
+              </label>
+            </div>
+          </div>
+
+          <div class="settings-section">
+            <div class="settings-sec-title">🎯 TRADE MARKINGS &amp; PRICE LINES</div>
+            <div class="settings-row">
+              <label class="toggle-control" style="margin:0; font-size:11px;" title="Show/hide Trade 1 Base EP entry arrow, stop loss, trigger, climax, and trailing stop lines">
+                <input type="checkbox" id="chk_mark_t1" checked onchange="onChartDisplaySettingChange()">
+                <span class="toggle-label" style="color:#10b981;">Trade 1 Markers &amp; Stops</span>
+              </label>
+            </div>
+            <div class="settings-row">
+              <label class="toggle-control" style="margin:0; font-size:11px;" title="Show/hide Trade 2 Undercut &amp; Reclaim / Base Breakout entry arrow and stop loss">
+                <input type="checkbox" id="chk_mark_t2" checked onchange="onChartDisplaySettingChange()">
+                <span class="toggle-label" style="color:#fbbf24;">Trade 2 Re-Entry Markers</span>
+              </label>
+            </div>
+            <div class="settings-row">
+              <label class="toggle-control" style="margin:0; font-size:11px;" title="Show/hide Trade 3 continuation entry arrow and stop loss">
+                <input type="checkbox" id="chk_mark_t3" checked onchange="onChartDisplaySettingChange()">
+                <span class="toggle-label" style="color:#a855f7;">Trade 3 Continuation Markers</span>
+              </label>
+            </div>
+          </div>
+
+          <div class="settings-section">
+            <div class="settings-sec-title">⚡ EP CATALYST EVENTS</div>
+            <div class="settings-row">
+              <label class="toggle-control" style="margin:0; font-size:11px;" title="Plot visual markers across the chart for all historical EP events of this ticker">
+                <input type="checkbox" id="chk_mark_all_eps" checked onchange="onToggleAllEpsChange()">
+                <span class="toggle-label" style="color:#38bdf8; font-weight:700;">Show All Historical EPs</span>
+              </label>
+            </div>
+            <div class="settings-row">
+              <label class="toggle-control" style="margin:0; font-size:11px;" title="Plot visual markers only for EP events that match active table filters (V2 score, Prev Gap, etc.)">
+                <input type="checkbox" id="chk_mark_filt_eps" onchange="onToggleFiltEpsChange()">
+                <span class="toggle-label" style="color:#c084fc; font-weight:700;">Show Filtered EPs Only</span>
+              </label>
+            </div>
+            <div class="settings-row" style="margin-top:4px;">
+              <label class="toggle-control" style="margin:0; font-size:11px;" title="Display specific disqualification reasons on filtered EP markers and hover HUD (e.g. Violated 48H, Sub-8% Gap, Low V2)">
+                <input type="checkbox" id="chk_settings_show_reasons" onchange="toggleShowFilterReasons()">
+                <span class="toggle-label" style="color:#f87171; font-weight:700;">Show Disqualification Reasons</span>
+              </label>
+            </div>
+            <input type="checkbox" id="chk_mark_eps" checked style="display:none;" onchange="onChartDisplaySettingChange()">
+          </div>
+
+          <div class="settings-section">
+            <div class="settings-sec-title">⚙️ STRATEGY EXIT PARAMS</div>
+            <div class="settings-row" style="justify-content:space-between;">
+              <span style="font-size:11px; color:#cbd5e1;">Climax Partial %:</span>
+              <select id="cfg_settings_climax_pct" onchange="onSettingsClimaxChange()" style="background:#1e293b; color:var(--gold); border:1px solid #f59e0b; padding:2px 4px; border-radius:4px; font-size:11px; font-weight:700; cursor:pointer;">
+                <option value="0.25">25% Lock</option>
+                <option value="0.33">33% Lock</option>
+                <option value="0.50" selected>50% Lock</option>
+                <option value="0.66">66% Lock</option>
+                <option value="0.75">75% Lock</option>
+              </select>
+            </div>
+            <div class="settings-row" style="justify-content:space-between; margin-top:4px;">
+              <span style="font-size:11px; color:#cbd5e1;">Exhaustion Hurdle:</span>
+              <select id="cfg_settings_climax_hurdle" onchange="onSettingsClimaxChange()" style="background:#1e293b; color:#38bdf8; border:1px solid #0284c7; padding:2px 4px; border-radius:4px; font-size:11px; font-weight:700; cursor:pointer;">
+                <option value="2.0">&ge; 2.0 R</option>
+                <option value="3.0" selected>&ge; 3.0 R</option>
+                <option value="4.0">&ge; 4.0 R</option>
+                <option value="5.0">&ge; 5.0 R</option>
+              </select>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div id="chart_draw_toolbar" class="chart-draw-toolbar" style="display:none;">
+        <button type="button" class="draw-btn active" id="btn_tool_cursor" onclick="setDrawTool('cursor')" title="Pan &amp; Zoom Chart (Normal Mode)"><span style="font-size:12px;">🖐️</span> Pan</button>
+        <button type="button" class="draw-btn" id="btn_tool_measure" onclick="setDrawTool('measure')" title="Measure Price % &amp; Bars (Click 2 points)"><span style="font-size:12px;">📏</span> Measure</button>
+        <button type="button" class="draw-btn" id="btn_tool_line" onclick="setDrawTool('line')" title="Trendline (Click start &amp; end)"><span style="font-size:12px;">📈</span> Line</button>
+        <button type="button" class="draw-btn" id="btn_tool_text" onclick="setDrawTool('text')" title="Text Annotation (Click to place note)"><span style="font-size:12px;">🔤</span> Text</button>
+        <button type="button" class="draw-btn" id="btn_tool_arrow" onclick="setDrawTool('arrow')" title="Arrow Pointer (Click tail &amp; head)"><span style="font-size:12px;">↗️</span> Arrow</button>
+        <div style="width:1px; height:18px; background:#334155; margin:0 2px;"></div>
+        <button type="button" class="draw-btn" id="btn_tool_settings" onclick="toggleChartSettings()" title="Configure Chart Displays, Markings &amp; Parameters"><span style="font-size:12px;">⚙️</span> Settings</button>
+        <div style="width:1px; height:18px; background:#334155; margin:0 2px;"></div>
+        <button type="button" class="draw-btn draw-btn-danger" onclick="clearAllDrawings()" title="Clear all drawings on chart"><span style="font-size:12px;">🗑️</span> Clear</button>
+      </div>
+      <svg id="draw_canvas" style="position:absolute; inset:0; width:100%; height:100%; pointer-events:none; z-index:20; overflow:hidden;">
+        <defs>
+          <marker id="arrowhead" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto">
+            <polygon points="0 0, 9 3.5, 0 7" fill="#38bdf8" />
+          </marker>
+        </defs>
+        <g id="draw_elements"></g>
+        <g id="draw_preview"></g>
+      </svg>
+      <svg id="larsson_ribbon_svg" style="position:absolute; inset:0; width:100%; height:100%; pointer-events:none; z-index:12; overflow:hidden;">
+        <g id="larsson_ribbon_group"></g>
+      </svg>
+    </div>
   </div>
 
   <!-- 3. Right Pane: Dedicated Info & Trade Dossier Panel -->
@@ -707,6 +1090,23 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                  <span style="color:#94a3b8;">+200% Target:</span>
                  <span id="ai_v2_200" style="color:#a855f7; font-weight:700;">--%</span>
              </div>
+             <div style="border-top:1px dashed #334155; margin: 5px 0 3px 0;"></div>
+             <div style="display:flex; justify-content:space-between; font-size:11.5px;" title="ML point-in-time predicted 20-session forward Maximum Favorable Excursion (peak upside % over next 20 bars)">
+                 <span style="color:#94a3b8;">🎯 20D MFE (Peak):</span>
+                 <span id="ai_v2_mfe" style="color:#10b981; font-weight:700;">--%</span>
+             </div>
+             <div style="display:flex; justify-content:space-between; font-size:11.5px; margin-top:2px;" title="ML point-in-time predicted 20-session forward Maximum Adverse Excursion (drawdown cushion % over next 20 bars)">
+                 <span style="color:#94a3b8;">🛑 20D MAE (Cushion):</span>
+                 <span id="ai_v2_mae" style="color:#ef4444; font-weight:700;">--%</span>
+             </div>
+             <div style="display:flex; justify-content:space-between; font-size:11.5px; margin-top:2px;" title="ML predicted sequence: whether 20-session peak high (MFE) or trough low (MAE) is more likely to arrive first">
+                 <span style="color:#94a3b8;">⚡ First Arrival:</span>
+                 <span id="ai_v2_seq" style="color:#38bdf8; font-weight:700;">--</span>
+             </div>
+             <div style="display:flex; justify-content:space-between; font-size:11.5px; margin-top:2px;" title="Option B: Probability of price reaching +2.0R institutional target before hitting -1.0R stop loss within 20 sessions">
+                 <span style="color:#94a3b8;">🎯 2R Before Stop:</span>
+                 <span id="ai_v2_barrier" style="color:#38bdf8; font-weight:700;">--</span>
+             </div>
          </div>
 
          <div id="ai_adv_warnings" style="margin-top: 5px; font-weight: bold; font-size: 11px; display: none;">
@@ -777,16 +1177,72 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <span id="tr_exec_status" style="color:var(--gold); font-size:10px;">+1.88 R</span>
       </div>
       <div class="trade-plan-grid">
-        <div class="tp-row"><span class="tp-lbl">Entry (D1 Close):</span><span class="tp-val" id="tr_entry">$0.00</span></div>
+        <div class="tp-row"><span class="tp-lbl" id="lbl_tr_entry">Entry:</span><span class="tp-val" id="tr_entry">$0.00</span></div>
         <div class="tp-row"><span class="tp-lbl">Initial Stop (D1 Low):</span><span class="tp-val" id="tr_stop" style="color:var(--red);">$0.00 (-0.0% risk)</span></div>
-        <div class="tp-row"><span class="tp-lbl">Secondary Add (D1 High):</span><span class="tp-val" id="tr_add" style="color:var(--green);">$0.00</span></div>
+        <div class="tp-row"><span class="tp-lbl" id="lbl_tr_add">Pyramid Add:</span><span class="tp-val" id="tr_add" style="color:var(--green);">$0.00</span></div>
         <div style="border-top:1px dashed #232d42; margin: 4px 0;"></div>
         <div class="tp-row"><span class="tp-lbl">Exit Date &amp; Trigger:</span><span class="tp-val" id="tr_exit_price" style="color:#38bdf8;">$0.00 on YYYY-MM-DD</span></div>
         <div class="tp-row"><span class="tp-lbl">Exit Reason:</span><span class="tp-val" id="tr_exit_reason">Larsson Blue Flip</span></div>
         <div class="tp-row" id="row_tr1_climax" style="display:none;"><span class="tp-lbl" style="color:var(--gold);">🎯 ML Climax Partial:</span><span class="tp-val" id="tr1_climax_val" style="color:var(--gold);">50% sold at $0.00 (+0.00R)</span></div>
+        <div class="tp-row" id="row_tr1_trailer" style="display:none;"><span class="tp-lbl" style="color:#f59e0b;">🤖 ML Trailing Stop:</span><span class="tp-val" id="tr1_trailer_val" style="color:#f59e0b;">16.8% buffer ($0.00)</span></div>
         <div class="tp-row"><span class="tp-lbl">Hold Duration:</span><span class="tp-val" id="tr_hold">0 sessions</span></div>
         <div class="tp-row" id="row_sma50_adh" style="display:none;"><span class="tp-lbl">50-SMA Baseline Held:</span><span class="tp-val" id="tr_sma50_adh" style="color:var(--cyan);">0% of trend</span></div>
         <div class="tp-row"><span class="tp-lbl">Trade 1 Result:</span><span class="tp-val" id="tr_result" style="color:var(--gold); font-size:12px;">+0.0% (+0.00 R)</span></div>
+      </div>
+    </div>
+
+    <!-- Card 4b: Day 5 V2 Machine Learning Intelligence -->
+    <div class="panel-card" id="card_v2_ml" style="display:none; background:#0f172a; border:1px solid #1e293b;">
+      <div class="panel-card-title">
+        <span>🤖 Day 5 V2 ML Conviction &amp; Tail Targets</span>
+        <span id="v2_status_badge" class="pctile-badge pctile-high" style="font-size:10px;">P(+50%): 0.0%</span>
+      </div>
+      <div class="trade-plan-grid">
+        <div class="tp-row">
+          <span class="tp-lbl">Target &ge; +50% Move:</span>
+          <span class="tp-val" id="v2_prob_50" style="font-weight:700; color:var(--green);">0.0%</span>
+        </div>
+        <div class="tp-row">
+          <span class="tp-lbl">Target &ge; +100% (Doubler):</span>
+          <span class="tp-val" id="v2_prob_100" style="font-weight:700; color:#38bdf8;">0.0%</span>
+        </div>
+        <div class="tp-row">
+          <span class="tp-lbl">Target &ge; +150% Move:</span>
+          <span class="tp-val" id="v2_prob_150" style="font-weight:700; color:var(--purple);">0.0%</span>
+        </div>
+        <div class="tp-row">
+          <span class="tp-lbl">Target &ge; +200% (Triple):</span>
+          <span class="tp-val" id="v2_prob_200" style="font-weight:700; color:var(--gold);">0.0%</span>
+        </div>
+        <div style="border-top:1px dashed #232d42; margin: 4px 0;"></div>
+        <div class="tp-row">
+          <span class="tp-lbl">Day 5 Pyramid Conviction:</span>
+          <span class="tp-val" id="v2_pyramid_verdict" style="font-weight:700;">--</span>
+        </div>
+        <div class="tp-row">
+          <span class="tp-lbl">Toxicity Filter:</span>
+          <span class="tp-val" id="v2_toxicity_verdict">--</span>
+        </div>
+        <div class="tp-row" id="row_v2_dyn_stop">
+          <span class="tp-lbl">Dynamic Quantile Stop:</span>
+          <span class="tp-val" id="v2_dyn_stop_val" style="color:#f59e0b;">--</span>
+        </div>
+        <div class="tp-row" id="row_v2_mfe_20d" title="ML point-in-time predicted 20-session forward Maximum Favorable Excursion (peak upside % over next 20 bars)">
+          <span class="tp-lbl">🎯 20D Max Excursion (MFE):</span>
+          <span class="tp-val" id="v2_mfe_20d_val" style="color:#10b981; font-weight:700;">--</span>
+        </div>
+        <div class="tp-row" id="row_v2_mae_20d" title="ML point-in-time predicted 20-session forward Maximum Adverse Excursion (drawdown cushion % over next 20 bars)">
+          <span class="tp-lbl">🛑 20D Adverse Cushion (MAE):</span>
+          <span class="tp-val" id="v2_mae_20d_val" style="color:#ef4444; font-weight:700;">--</span>
+        </div>
+        <div class="tp-row" id="row_v2_seq_20d" title="ML predicted sequence: whether 20-session peak high (MFE) or trough low (MAE) is more likely to arrive first">
+          <span class="tp-lbl">⚡ 20D First Arrival:</span>
+          <span class="tp-val" id="v2_seq_20d_val" style="color:#38bdf8; font-weight:700;">--</span>
+        </div>
+        <div class="tp-row" id="row_v2_barrier_20d" title="Option B Barrier Model: ML predicted probability of touching +2.0R target before touching -1.0R Day 1 Low stop loss in next 20 sessions (AUC 0.772, Acc 86.6%)">
+          <span class="tp-lbl">🎯 2R Target vs Stop:</span>
+          <span class="tp-val" id="v2_barrier_20d_val" style="color:#38bdf8; font-weight:700;">--</span>
+        </div>
       </div>
     </div>
 
@@ -1131,8 +1587,274 @@ let stratConfig = {
   use_ml_climax: true,
   use_ml_stop: true,
   use_multileg: true,
-  use_multileg_ml: true
+  use_multileg_ml: true,
+  climax_partial_pct: 0.50,
+  climax_r_hurdle: 3.0
 };
+
+/* --- On-Chart Drawing Tools (Measure, Line, Text, Arrow) --- */
+let currentDrawTool = 'cursor';
+let drawings = [];
+let drawStart = null;
+
+function toggleDrawToolbar() {
+  const tb = document.getElementById('chart_draw_toolbar');
+  if (!tb) return;
+  tb.style.display = (tb.style.display === 'none' || !tb.style.display) ? 'flex' : 'none';
+}
+
+function setDrawTool(tool) {
+  currentDrawTool = tool;
+  document.querySelectorAll('.draw-btn').forEach(b => b.classList.remove('active'));
+  const btn = document.getElementById('btn_tool_' + tool);
+  if (btn) btn.classList.add('active');
+
+  const canvas = document.getElementById('draw_canvas');
+  if (!canvas) return;
+  if (tool === 'cursor') {
+    canvas.style.pointerEvents = 'none';
+    canvas.style.cursor = 'default';
+    drawStart = null;
+    clearDrawPreview();
+  } else {
+    canvas.style.pointerEvents = 'auto';
+    canvas.style.cursor = 'crosshair';
+  }
+}
+
+function clearAllDrawings() {
+  drawings = [];
+  drawStart = null;
+  clearDrawPreview();
+  renderAllDrawings();
+}
+
+function clearDrawPreview() {
+  const prev = document.getElementById('draw_preview');
+  if (prev) prev.innerHTML = '';
+}
+
+function getCanvasCoords(e) {
+  const canvas = document.getElementById('draw_canvas');
+  if (!canvas) return { x: 0, y: 0, price: null, time: null, w: 1, h: 1 };
+  const rect = canvas.getBoundingClientRect();
+  const x = e.clientX - rect.left;
+  const y = e.clientY - rect.top;
+  const price = candleSeries ? candleSeries.coordinateToPrice(y) : null;
+  let time = chart ? chart.timeScale().coordinateToTime(x) : null;
+  if (time && typeof time === 'object' && time.year) {
+    const mm = String(time.month).padStart(2, '0');
+    const dd = String(time.day).padStart(2, '0');
+    time = `${time.year}-${mm}-${dd}`;
+  }
+  return { x, y, price, time, w: rect.width || 1, h: rect.height || 1 };
+}
+
+function coordForTime(t, fallbackX) {
+  if (!chart || !t) return fallbackX;
+  try {
+    const cx = chart.timeScale().timeToCoordinate(t);
+    return cx != null ? cx : fallbackX;
+  } catch(e) {
+    return fallbackX;
+  }
+}
+
+function coordForPrice(p, fallbackY) {
+  if (!candleSeries || p == null) return fallbackY;
+  try {
+    const cy = candleSeries.priceToCoordinate(p);
+    return cy != null ? cy : fallbackY;
+  } catch(e) {
+    return fallbackY;
+  }
+}
+
+function onCanvasMouseDown(e) {
+  if (currentDrawTool === 'cursor') return;
+  const pt = getCanvasCoords(e);
+
+  if (currentDrawTool === 'text') {
+    const note = prompt('Enter chart note / annotation:');
+    if (note && note.trim()) {
+      drawings.push({
+        type: 'text',
+        time: pt.time,
+        price: pt.price,
+        x_rel: pt.w > 0 ? pt.x / pt.w : 0.5,
+        y_rel: pt.h > 0 ? pt.y / pt.h : 0.5,
+        text: note.trim()
+      });
+      renderAllDrawings();
+    }
+    setDrawTool('cursor');
+    return;
+  }
+
+  if (!drawStart) {
+    drawStart = pt;
+  } else {
+    // Second click commits drawing
+    commitDrawing(drawStart, pt, currentDrawTool);
+    drawStart = null;
+    clearDrawPreview();
+    setDrawTool('cursor');
+  }
+}
+
+function onCanvasMouseMove(e) {
+  if (currentDrawTool === 'cursor' || !drawStart) return;
+  const pt = getCanvasCoords(e);
+  renderPreviewDrawing(drawStart, pt, currentDrawTool);
+}
+
+function commitDrawing(p1, p2, tool) {
+  const w = p1.w || 1000;
+  const h = p1.h || 600;
+  drawings.push({
+    type: tool,
+    t1: p1.time,
+    p1: p1.price,
+    t2: p2.time,
+    p2: p2.price,
+    x1_rel: p1.x / w,
+    y1_rel: p1.y / h,
+    x2_rel: p2.x / w,
+    y2_rel: p2.y / h
+  });
+  renderAllDrawings();
+}
+
+function renderPreviewDrawing(p1, p2, tool) {
+  const prevG = document.getElementById('draw_preview');
+  if (!prevG) return;
+  prevG.innerHTML = buildDrawingSvg(tool, p1.x, p1.y, p2.x, p2.y, p1.price, p2.price, true);
+}
+
+function buildDrawingSvg(tool, x1, y1, x2, y2, price1, price2, isPreview) {
+  if (tool === 'line') {
+    return `<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="#38bdf8" stroke-width="2" stroke-dasharray="${isPreview?'4 4':'none'}"/>
+            <circle cx="${x1}" cy="${y1}" r="3.5" fill="#38bdf8"/>
+            <circle cx="${x2}" cy="${y2}" r="3.5" fill="#38bdf8"/>`;
+  }
+  if (tool === 'arrow') {
+    return `<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="#38bdf8" stroke-width="2.5" marker-end="url(#arrowhead)"/>
+            <circle cx="${x1}" cy="${y1}" r="3" fill="#38bdf8"/>`;
+  }
+  if (tool === 'measure') {
+    const rx = Math.min(x1, x2);
+    const ry = Math.min(y1, y2);
+    const rw = Math.abs(x2 - x1);
+    const rh = Math.abs(y2 - y1);
+    const deltaP = (price1 != null && price2 != null) ? (price2 - price1) : 0;
+    const pct = (price1 != null && price1 > 0 && price2 != null) ? ((price2 - price1) / price1 * 100) : 0;
+    const isUp = deltaP >= 0;
+    const boxColor = isUp ? 'rgba(16, 185, 129, 0.2)' : 'rgba(239, 68, 68, 0.2)';
+    const strokeColor = isUp ? '#10b981' : '#ef4444';
+    const tagBg = isUp ? '#065f46' : '#991b1b';
+    const tagX = rx + rw / 2;
+    const tagY = ry + rh / 2;
+    const sign = isUp ? '+' : '';
+    const label = `${sign}${pct.toFixed(2)}% (${sign}$${deltaP.toFixed(2)})`;
+
+    return `<rect x="${rx}" y="${ry}" width="${rw}" height="${rh}" fill="${boxColor}" stroke="${strokeColor}" stroke-dasharray="3 3" stroke-width="1.5"/>
+            <line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="${strokeColor}" stroke-width="1.5"/>
+            <circle cx="${x1}" cy="${y1}" r="3.5" fill="${strokeColor}"/>
+            <circle cx="${x2}" cy="${y2}" r="3.5" fill="${strokeColor}"/>
+            <g transform="translate(${tagX}, ${tagY})">
+              <rect x="-75" y="-13" width="150" height="24" rx="4" fill="${tagBg}" stroke="${strokeColor}" stroke-width="1"/>
+              <text x="0" y="3" text-anchor="middle" fill="#ffffff" font-size="11" font-weight="700" font-family="sans-serif">${label}</text>
+            </g>`;
+  }
+  return '';
+}
+
+function renderAllDrawings() {
+  const container = document.getElementById('draw_elements');
+  const canvas = document.getElementById('draw_canvas');
+  if (!container || !canvas) return;
+  const rect = canvas.getBoundingClientRect();
+  const w = rect.width, h = rect.height;
+  if (w <= 0 || h <= 0) return;
+
+  let html = '';
+  drawings.forEach(d => {
+    if (d.type === 'text') {
+      const x = coordForTime(d.time, d.x_rel * w);
+      const y = coordForPrice(d.price, d.y_rel * h);
+      const textLen = (d.text || '').length;
+      const boxW = Math.max(70, textLen * 7 + 16);
+      html += `<g transform="translate(${x}, ${y})">
+                 <rect x="0" y="-20" width="${boxW}" height="24" rx="4" fill="#0f172a" stroke="#38bdf8" stroke-width="1.5"/>
+                 <text x="8" y="-4" fill="#f8fafc" font-size="11" font-weight="600" font-family="sans-serif">${d.text}</text>
+                 <circle cx="0" cy="0" r="3" fill="#38bdf8"/>
+               </g>`;
+    } else {
+      const x1 = coordForTime(d.t1, d.x1_rel * w);
+      const y1 = coordForPrice(d.p1, d.y1_rel * h);
+      const x2 = coordForTime(d.t2, d.x2_rel * w);
+      const y2 = coordForPrice(d.p2, d.y2_rel * h);
+      html += buildDrawingSvg(d.type, x1, y1, x2, y2, d.p1, d.p2, false);
+    }
+  });
+  container.innerHTML = html;
+}
+
+function toggleChartFullscreen() {
+  const ws = document.querySelector('.workspace');
+  const btn = document.getElementById('btn_chart_fullscreen');
+  if (!ws) return;
+  const isFull = ws.classList.toggle('fullscreen-chart-mode');
+  if (btn) {
+    btn.innerHTML = isFull ? '🗗 Minimize' : '⛶ Enlarge';
+  }
+  const drawToolbar = document.getElementById('chart_draw_toolbar');
+  if (drawToolbar) {
+    drawToolbar.style.display = isFull ? 'flex' : 'none';
+  }
+  if (!isFull) {
+    const p = document.getElementById('chart_settings_panel');
+    if (p) p.style.display = 'none';
+    const b = document.getElementById('btn_chart_settings');
+    if (b) b.classList.remove('active');
+    const bTool = document.getElementById('btn_tool_settings');
+    if (bTool) bTool.classList.remove('active');
+  }
+  const updateLayoutAndRibbon = () => {
+    const container = document.getElementById('chart-container');
+    if (chart && container) {
+      chart.applyOptions({ width: container.clientWidth, height: container.clientHeight });
+    }
+    requestAnimationFrame(() => {
+      renderAllDrawings();
+      scheduleLarssonRender();
+    });
+  };
+  setTimeout(updateLayoutAndRibbon, 50);
+  setTimeout(updateLayoutAndRibbon, 200);
+}
+
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') {
+    const p = document.getElementById('chart_settings_panel');
+    if (p && p.style.display !== 'none') {
+      p.style.display = 'none';
+      const b = document.getElementById('btn_chart_settings');
+      if (b) b.classList.remove('active');
+      const bTool = document.getElementById('btn_tool_settings');
+      if (bTool) bTool.classList.remove('active');
+      return;
+    }
+    if (currentDrawTool !== 'cursor') {
+      setDrawTool('cursor');
+      return;
+    }
+    const ws = document.querySelector('.workspace');
+    if (ws && ws.classList.contains('fullscreen-chart-mode')) {
+      toggleChartFullscreen();
+    }
+  }
+});
 
 function updateStrategyBadge() {
   const badge = document.getElementById('strategy_mode_badge');
@@ -1193,6 +1915,11 @@ function onStrategyConfigChange() {
   stratConfig.use_multileg = document.getElementById('cfg_multileg').checked;
   stratConfig.use_multileg_ml = document.getElementById('cfg_multileg_ml').checked;
 
+  const cPctEl = document.getElementById('cfg_climax_pct');
+  if (cPctEl) stratConfig.climax_partial_pct = parseFloat(cPctEl.value) || 0.50;
+  const cHurdleEl = document.getElementById('cfg_climax_hurdle');
+  if (cHurdleEl) stratConfig.climax_r_hurdle = parseFloat(cHurdleEl.value) || 3.0;
+
   // Prevent both Trade 1 and Multi-Leg from being unchecked
   if (!stratConfig.use_trade1 && !stratConfig.use_multileg) {
     stratConfig.use_multileg = true;
@@ -1209,6 +1936,19 @@ function onStrategyConfigChange() {
   document.getElementById('cfg_ml_climax_container').style.opacity = stratConfig.use_trade1 ? '1.0' : '0.4';
   document.getElementById('cfg_ml_stop').disabled = !stratConfig.use_trade1;
   document.getElementById('cfg_ml_stop_container').style.opacity = stratConfig.use_trade1 ? '1.0' : '0.4';
+
+  const climaxActive = stratConfig.use_trade1 && stratConfig.use_ml_climax;
+  const cPctCont = document.getElementById('cfg_climax_pct_container');
+  if (cPctCont) {
+    document.getElementById('cfg_climax_pct').disabled = !climaxActive;
+    cPctCont.style.opacity = climaxActive ? '1.0' : '0.4';
+  }
+  const hurdleActive = stratConfig.use_trade1 && (stratConfig.use_ml_climax || stratConfig.use_ml_stop);
+  const cHurdleCont = document.getElementById('cfg_climax_hurdle_container');
+  if (cHurdleCont) {
+    document.getElementById('cfg_climax_hurdle').disabled = !hurdleActive;
+    cHurdleCont.style.opacity = hurdleActive ? '1.0' : '0.4';
+  }
 
   updateStrategyBadge();
   fetchEvents();
@@ -1268,26 +2008,74 @@ function onSliderMove(days) {
     document.getElementById('ai_v2_100').textContent = '...';
     document.getElementById('ai_v2_150').textContent = '...';
     document.getElementById('ai_v2_200').textContent = '...';
+    if (document.getElementById('ai_v2_mfe')) document.getElementById('ai_v2_mfe').textContent = '...';
+    if (document.getElementById('ai_v2_mae')) document.getElementById('ai_v2_mae').textContent = '...';
+    if (document.getElementById('ai_v2_seq')) document.getElementById('ai_v2_seq').textContent = '...';
+    if (document.getElementById('ai_v2_barrier')) document.getElementById('ai_v2_barrier').textContent = '...';
     
     const offset = parseInt(days) - 1;
     
     fetch(`/api/ml_rolling?symbol=${selectedSym}&event_date=${selectedDate}&days_forward=${offset}`)
     .then(r => r.json())
     .then(data => {
-        if (data.stopped_out || data.error) {
-            document.getElementById('ai_v2_50').textContent = 'STOP';
-            document.getElementById('ai_v2_100').textContent = 'STOP';
-            document.getElementById('ai_v2_150').textContent = 'STOP';
-            document.getElementById('ai_v2_200').textContent = 'STOP';
+        if (data.error && !data.probs) {
+            document.getElementById('ai_v2_50').textContent = 'N/A';
+            document.getElementById('ai_v2_100').textContent = 'N/A';
+            document.getElementById('ai_v2_150').textContent = 'N/A';
+            document.getElementById('ai_v2_200').textContent = 'N/A';
+            if (document.getElementById('ai_v2_mfe')) document.getElementById('ai_v2_mfe').textContent = 'N/A';
+            if (document.getElementById('ai_v2_mae')) document.getElementById('ai_v2_mae').textContent = 'N/A';
+            if (document.getElementById('ai_v2_seq')) document.getElementById('ai_v2_seq').textContent = 'N/A';
+            if (document.getElementById('ai_v2_barrier')) document.getElementById('ai_v2_barrier').textContent = 'N/A';
             return;
         }
         if (data.probs) {
+            const isStopped = data.is_stopped || (data.probs && data.probs.is_stopped_out);
+            const badge = document.getElementById('epDaysValBadge');
+            if (badge) {
+                if (isStopped) {
+                    badge.innerHTML = `Day ${days} <span style="background:#ef4444; color:#fff; padding:1px 5px; border-radius:4px; font-size:9px; margin-left:4px; font-weight:bold;">STOPPED</span>`;
+                } else {
+                    badge.innerHTML = `Day ${days}`;
+                }
+            }
             const formatProb = (p) => p >= 1.0 ? '<span style="color:#10b981; font-weight:800;">MET ✓</span>' : (p * 100).toFixed(1) + '%';
             document.getElementById('ai_v2_50').innerHTML = formatProb(data.probs.prob_50);
             document.getElementById('ai_v2_100').innerHTML = formatProb(data.probs.prob_100);
             document.getElementById('ai_v2_150').innerHTML = formatProb(data.probs.prob_150);
             document.getElementById('ai_v2_200').innerHTML = formatProb(data.probs.prob_200);
             
+            if (data.probs.forward_mfe_20d != null) {
+                const mfeStr = `+${Number(data.probs.forward_mfe_20d).toFixed(1)}%`;
+                if (document.getElementById('ai_v2_mfe')) document.getElementById('ai_v2_mfe').textContent = mfeStr;
+                if (document.getElementById('v2_mfe_20d_val')) document.getElementById('v2_mfe_20d_val').textContent = mfeStr;
+            }
+            if (data.probs.forward_mae_20d != null) {
+                const maeStr = `-${Math.abs(Number(data.probs.forward_mae_20d)).toFixed(1)}%`;
+                if (document.getElementById('ai_v2_mae')) document.getElementById('ai_v2_mae').textContent = maeStr;
+                if (document.getElementById('v2_mae_20d_val')) document.getElementById('v2_mae_20d_val').textContent = maeStr;
+            }
+            if (data.probs.prob_mfe_first != null) {
+                const p = Number(data.probs.prob_mfe_first);
+                const isMfe = p >= 0.50;
+                const winPct = isMfe ? (p * 100).toFixed(1) : ((1 - p) * 100).toFixed(1);
+                const seqText = isMfe ? `MFE First (${winPct}%)` : `MAE First (${winPct}%)`;
+                const seqColor = isMfe ? '#10b981' : '#f59e0b';
+                const html = `<span style="color:${seqColor}; font-weight:700;">${seqText}</span>`;
+                if (document.getElementById('ai_v2_seq')) document.getElementById('ai_v2_seq').innerHTML = html;
+                if (document.getElementById('v2_seq_20d_val')) document.getElementById('v2_seq_20d_val').innerHTML = html;
+            }
+            if (data.probs.prob_barrier_2r != null) {
+                const pb = Number(data.probs.prob_barrier_2r);
+                const pbPct = (pb * 100).toFixed(1) + '%';
+                const isHigh = pb >= 0.25;
+                const color = isHigh ? '#34d399' : (pb >= 0.15 ? '#38bdf8' : '#94a3b8');
+                const badge = isHigh ? ' <span style="font-size:9.5px; background:rgba(16,185,129,0.2); border:1px solid #10b981; border-radius:3px; padding:1px 4px; color:#34d399; font-weight:700;">HIGH EDGE</span>' : '';
+                const html = `<span style="color:${color}; font-weight:700;">${pbPct}${badge}</span>`;
+                if (document.getElementById('ai_v2_barrier')) document.getElementById('ai_v2_barrier').innerHTML = html;
+                if (document.getElementById('v2_barrier_20d_val')) document.getElementById('v2_barrier_20d_val').innerHTML = html;
+            }
+
             if (data.probs.prob_reentry != null && data.probs.prob_reentry > 0.40) {
                 document.getElementById('ai_reentry').style.display = 'block';
                 let reProb = (data.probs.prob_reentry * 100).toFixed(1) + '%';
@@ -1311,7 +2099,8 @@ function onSliderMove(days) {
     }).catch(e => console.error(e));
 }
 
-let chart = null, candleSeries = null, volSeries = null, ema20Series = null, sma50Series = null;
+let chart = null, candleSeries = null, volSeries = null, volMa20Series = null, ema10Series = null, ema20Series = null, sma50Series = null;
+let larssonFastSeries = null, larssonSlowSeries = null;
 let currentPreset = 'pinnacle';
 let activePriceLines = [];
 
@@ -1321,7 +2110,8 @@ let activeBoosters = {
   tailwind: false,
   '48h': false,
   elite_close: false,
-  held_5d: false
+  held_5d: false,
+  no_prev_gap: false
 };
 
 const INSIGHT_PRESETS = {
@@ -1494,6 +2284,9 @@ function toggleBooster(key) {
   activeBoosters[key] = !activeBoosters[key];
   const el = document.getElementById('b_' + key);
   if (el) el.classList.toggle('active', activeBoosters[key]);
+  if (key === 'no_prev_gap' && document.getElementById('f_prev_gap')) {
+    document.getElementById('f_prev_gap').value = activeBoosters[key] ? 'no_gap' : '';
+  }
   fetchEvents();
 }
 
@@ -1503,6 +2296,7 @@ function resetBoosters() {
     const el = document.getElementById('b_' + k);
     if (el) el.classList.remove('active');
   }
+  if (document.getElementById('f_prev_gap')) document.getElementById('f_prev_gap').value = '';
   fetchEvents();
 }
 
@@ -1521,6 +2315,12 @@ function setPreset(p) {
   document.getElementById('f_subtype').value = '';
   document.getElementById('f_year').value = '';
   document.getElementById('f_search').value = '';
+  if (document.getElementById('f_prev_gap')) document.getElementById('f_prev_gap').value = '';
+  if (document.getElementById('f_recent_days')) {
+    document.getElementById('f_recent_days').value = '';
+    const cEl = document.getElementById('f_recent_days_custom');
+    if (cEl) { cEl.value = ''; cEl.style.display = 'none'; }
+  }
 
   fetchEvents();
 }
@@ -1530,7 +2330,9 @@ function initChart() {
     setTimeout(initChart, 200);
     return;
   }
+  if (chart) return;
   const container = document.getElementById('chart-container');
+  Array.from(container.querySelectorAll('.tv-lightweight-charts')).forEach(el => el.remove());
   chart = LightweightCharts.createChart(container, {
     layout: { background: { color: '#0c0f16' }, textColor: '#94a3b8' },
     grid: { vertLines: { color: '#171b26' }, horzLines: { color: '#171b26' } },
@@ -1543,9 +2345,40 @@ function initChart() {
     wickUpColor: '#10b981', wickDownColor: '#ef4444'
   });
   volSeries = chart.addHistogramSeries({
-    priceScaleId: 'vol', priceFormat: { type: 'volume' }, priceLineVisible: false
+    priceFormat: { type: 'volume' },
+    priceScaleId: 'volume',
+    priceLineVisible: false,
+    lastValueVisible: false
   });
-  chart.priceScale('vol').applyOptions({ scaleMargins: { top: 0.84, bottom: 0.0 } });
+  volMa20Series = chart.addLineSeries({
+    priceFormat: { type: 'volume' },
+    priceScaleId: 'volume',
+    color: '#38bdf8',
+    lineWidth: 1.5,
+    title: 'Vol 20 MA',
+    priceLineVisible: false,
+    lastValueVisible: false
+  });
+  chart.priceScale('volume').applyOptions({
+    scaleMargins: { top: 0.82, bottom: 0.0 }
+  });
+  larssonFastSeries = chart.addLineSeries({
+    lineWidth: 1,
+    color: 'rgba(250, 204, 21, 0.001)',
+    title: 'Larsson Fast',
+    priceLineVisible: false,
+    lastValueVisible: true,
+    crosshairMarkerVisible: false
+  });
+  larssonSlowSeries = chart.addLineSeries({
+    lineWidth: 1,
+    color: 'rgba(56, 189, 248, 0.001)',
+    title: 'Larsson Slow',
+    priceLineVisible: false,
+    lastValueVisible: true,
+    crosshairMarkerVisible: false
+  });
+  ema10Series = chart.addLineSeries({ color: '#f97316', lineWidth: 1, title: '10 EMA', priceLineVisible: false });
   ema20Series = chart.addLineSeries({ color: '#3b82f6', lineWidth: 1, title: '20 EMA', priceLineVisible: false });
   sma50Series = chart.addLineSeries({ color: '#8b5cf6', lineWidth: 1, title: '50 SMA', priceLineVisible: false });
 
@@ -1555,13 +2388,466 @@ function initChart() {
       const { width, height } = entries[0].contentRect;
       if (width > 0 && height > 0) {
         chart.applyOptions({ width: Math.floor(width), height: Math.floor(height) });
+        renderAllDrawings();
+        scheduleLarssonRender();
       }
     });
     ro.observe(container);
   } else {
     window.addEventListener('resize', () => {
       chart.applyOptions({ width: container.clientWidth, height: container.clientHeight });
+      renderAllDrawings();
+      scheduleLarssonRender();
     });
+  }
+
+  container.addEventListener('wheel', () => scheduleLarssonRender(), { passive: true });
+  container.addEventListener('touchmove', () => scheduleLarssonRender(), { passive: true });
+  container.addEventListener('mousemove', (e) => {
+    if (e.buttons > 0) scheduleLarssonRender();
+  });
+  container.addEventListener('mouseup', () => scheduleLarssonRender());
+
+  const canvas = document.getElementById('draw_canvas');
+  if (canvas) {
+    canvas.addEventListener('mousedown', onCanvasMouseDown);
+    canvas.addEventListener('mousemove', onCanvasMouseMove);
+  }
+  chart.timeScale().subscribeVisibleLogicalRangeChange(() => {
+    renderAllDrawings();
+    scheduleLarssonRender();
+  });
+  chart.timeScale().subscribeVisibleTimeRangeChange(() => {
+    scheduleLarssonRender();
+  });
+  chart.subscribeCrosshairMove(onChartCrosshairMove);
+}
+
+let _larssonRaf = null;
+function scheduleLarssonRender() {
+  if (_larssonRaf) cancelAnimationFrame(_larssonRaf);
+  _larssonRaf = requestAnimationFrame(() => {
+    _larssonRaf = null;
+    renderLarssonRibbon();
+  });
+}
+
+function updateNativeLarssonSeries(larssonData) {
+  if (!larssonFastSeries || !larssonSlowSeries) return;
+  const isEnabled = document.getElementById('chk_settings_larsson') ? document.getElementById('chk_settings_larsson').checked : (document.getElementById('chk_larsson') ? document.getElementById('chk_larsson').checked : true);
+  if (!isEnabled || !larssonData || !larssonData.length) {
+    larssonFastSeries.setData([]);
+    larssonSlowSeries.setData([]);
+    return;
+  }
+  const fastData = [];
+  const slowData = [];
+  for (let i = 0; i < larssonData.length; i++) {
+    const item = larssonData[i];
+    if (item.fast != null) {
+      fastData.push({ time: item.time, value: item.fast });
+    }
+    if (item.slow != null) {
+      slowData.push({ time: item.time, value: item.slow });
+    }
+  }
+  larssonFastSeries.setData(fastData);
+  larssonSlowSeries.setData(slowData);
+}
+
+function renderLarssonRibbon(larssonData) {
+  if (larssonData) {
+    window._lastLarssonData = larssonData;
+  } else {
+    larssonData = window._lastLarssonData;
+  }
+  const group = document.getElementById('larsson_ribbon_group');
+  if (!group) return;
+  const isEnabled = document.getElementById('chk_settings_larsson') ? document.getElementById('chk_settings_larsson').checked : (document.getElementById('chk_larsson') ? document.getElementById('chk_larsson').checked : true);
+  if (!isEnabled || !larssonData || !larssonData.length || !chart || !candleSeries) {
+    group.innerHTML = '';
+    return;
+  }
+
+  const container = document.getElementById('chart-container');
+  const svg = document.getElementById('larsson_ribbon_svg');
+  if (svg && container) {
+    svg.setAttribute('width', container.clientWidth);
+    svg.setAttribute('height', container.clientHeight);
+    svg.style.width = container.clientWidth + 'px';
+    svg.style.height = container.clientHeight + 'px';
+  }
+
+  const logicalRange = chart.timeScale().getVisibleLogicalRange();
+  const fromIdx = logicalRange ? Math.max(0, Math.floor(logicalRange.from) - 8) : 0;
+  const toIdx = logicalRange ? Math.min(larssonData.length - 1, Math.ceil(logicalRange.to) + 8) : larssonData.length - 1;
+
+  let segments = [];
+  let currentSeg = null;
+
+  for (let i = fromIdx; i <= toIdx; i++) {
+    const item = larssonData[i];
+    if (!item || item.fast == null || item.slow == null) {
+      if (currentSeg && currentSeg.pts.length >= 2) segments.push(currentSeg);
+      currentSeg = null;
+      continue;
+    }
+    const x = chart.timeScale().timeToCoordinate(item.time);
+    const yFast = candleSeries.priceToCoordinate(item.fast);
+    const ySlow = candleSeries.priceToCoordinate(item.slow);
+    if (x == null || yFast == null || ySlow == null) continue;
+
+    const pt = { x, yFast, ySlow, state: item.state };
+
+    if (!currentSeg) {
+      currentSeg = { state: item.state, pts: [pt] };
+    } else if (currentSeg.state === item.state) {
+      currentSeg.pts.push(pt);
+    } else {
+      currentSeg.pts.push(pt);
+      if (currentSeg.pts.length >= 2) segments.push(currentSeg);
+      const prevPt = currentSeg.pts[currentSeg.pts.length - 2];
+      currentSeg = { state: item.state, pts: [prevPt, pt] };
+    }
+  }
+  if (currentSeg && currentSeg.pts.length >= 2) {
+    segments.push(currentSeg);
+  }
+
+  const styleConfig = {
+    yellow: { fill: 'rgba(250, 204, 21, 0.35)', strokeFast: '#facc15', strokeSlow: '#ca8a04', strokeWidth: '2.0' },
+    blue:   { fill: 'rgba(56, 189, 248, 0.30)', strokeFast: '#38bdf8', strokeSlow: '#0284c7', strokeWidth: '2.0' },
+    gray:   { fill: 'rgba(148, 163, 184, 0.20)', strokeFast: '#94a3b8', strokeSlow: '#64748b', strokeWidth: '1.5' }
+  };
+
+  let svgHtml = '';
+  segments.forEach(seg => {
+    const cfg = styleConfig[seg.state] || styleConfig.gray;
+    const pts = seg.pts;
+    if (pts.length < 2) return;
+
+    let pathD = `M ${pts[0].x.toFixed(1)} ${pts[0].yFast.toFixed(1)}`;
+    for (let j = 1; j < pts.length; j++) {
+      pathD += ` L ${pts[j].x.toFixed(1)} ${pts[j].yFast.toFixed(1)}`;
+    }
+    pathD += ` L ${pts[pts.length - 1].x.toFixed(1)} ${pts[pts.length - 1].ySlow.toFixed(1)}`;
+    for (let j = pts.length - 2; j >= 0; j--) {
+      pathD += ` L ${pts[j].x.toFixed(1)} ${pts[j].ySlow.toFixed(1)}`;
+    }
+    pathD += ' Z';
+
+    let fastLineD = `M ${pts[0].x.toFixed(1)} ${pts[0].yFast.toFixed(1)}`;
+    let slowLineD = `M ${pts[0].x.toFixed(1)} ${pts[0].ySlow.toFixed(1)}`;
+    for (let j = 1; j < pts.length; j++) {
+      fastLineD += ` L ${pts[j].x.toFixed(1)} ${pts[j].yFast.toFixed(1)}`;
+      slowLineD += ` L ${pts[j].x.toFixed(1)} ${pts[j].ySlow.toFixed(1)}`;
+    }
+
+    svgHtml += `<path d="${pathD}" fill="${cfg.fill}" />`;
+    svgHtml += `<path d="${fastLineD}" fill="none" stroke="${cfg.strokeFast}" stroke-width="${cfg.strokeWidth}" stroke-linejoin="round" stroke-linecap="round" />`;
+    svgHtml += `<path d="${slowLineD}" fill="none" stroke="${cfg.strokeSlow}" stroke-width="${cfg.strokeWidth}" stroke-linejoin="round" stroke-linecap="round" />`;
+  });
+
+  group.innerHTML = svgHtml;
+}
+
+function updateLarssonLegendValues(item) {
+  const elFast = document.getElementById('larsson_val_fast');
+  const elSlow = document.getElementById('larsson_val_slow');
+  if (!elFast || !elSlow) return;
+  if (!item && window._lastLarssonData && window._lastLarssonData.length) {
+    for (let i = window._lastLarssonData.length - 1; i >= 0; i--) {
+      if (window._lastLarssonData[i].fast != null && window._lastLarssonData[i].slow != null) {
+        item = window._lastLarssonData[i];
+        break;
+      }
+    }
+  }
+  if (item && item.fast != null && item.slow != null) {
+    elFast.textContent = item.fast.toFixed(2);
+    elSlow.textContent = item.slow.toFixed(2);
+    if (item.state === 'yellow') {
+      elFast.style.color = '#facc15';
+      elSlow.style.color = '#facc15';
+    } else if (item.state === 'blue') {
+      elFast.style.color = '#38bdf8';
+      elSlow.style.color = '#38bdf8';
+    } else {
+      elFast.style.color = '#94a3b8';
+      elSlow.style.color = '#94a3b8';
+    }
+  } else {
+    elFast.textContent = '—';
+    elSlow.textContent = '—';
+  }
+}
+
+function onChartCrosshairMove(param) {
+  if (!param || !param.time) {
+    window._lastHoverTime = null;
+    updateLarssonLegendValues(null);
+    updateExhaustionHover(null);
+    updateAdnHover(null);
+    return;
+  }
+  let timeStr = param.time;
+  if (timeStr && typeof timeStr === 'object' && timeStr.year) {
+    const mm = String(timeStr.month).padStart(2, '0');
+    const dd = String(timeStr.day).padStart(2, '0');
+    timeStr = `${timeStr.year}-${mm}-${dd}`;
+  }
+  window._lastHoverTime = timeStr;
+  if (window._lastLarssonData && window._lastLarssonData.length) {
+    const item = window._lastLarssonData.find(d => d.time === timeStr);
+    updateLarssonLegendValues(item);
+  } else {
+    updateLarssonLegendValues(null);
+  }
+  updateExhaustionHover(timeStr);
+  updateAdnHover(timeStr);
+}
+
+function updateAdnHover(timeStr) {
+  const lbl = document.getElementById('lbl_hover_adr');
+  const val = document.getElementById('val_hover_adr');
+  const hudAdr = document.getElementById('hud_adr');
+  if (!timeStr || !window._lastAdrData || !window._lastAdrData[timeStr]) {
+    if (val) val.textContent = '—';
+    if (hudAdr) hudAdr.textContent = '📊 ADR(14): —';
+    return;
+  }
+  const adr = window._lastAdrData[timeStr];
+  const text = `$${adr.pts.toFixed(2)} (${adr.pct.toFixed(1)}%)`;
+  if (val) val.textContent = text;
+  if (hudAdr) hudAdr.textContent = `📊 ADR(14): ${text}`;
+}
+
+function toggleShowExhaustion() {
+  const chk = document.getElementById('chk_settings_show_exhaustion');
+  const isChecked = chk ? chk.checked : true;
+  const lbl = document.getElementById('lbl_hover_exhaustion');
+  const hud = document.getElementById('chart_hover_hud');
+  if (lbl) lbl.style.display = isChecked ? 'inline-flex' : 'none';
+  if (hud && !isChecked) hud.style.display = 'none';
+}
+
+function toggleShowFilterReasons() {
+  renderChartMarkersAndLines();
+  if (window._lastHoverTime) {
+    updateExhaustionHover(window._lastHoverTime);
+  }
+}
+
+function updateExhaustionHover(timeStr) {
+  const lbl = document.getElementById('lbl_hover_exhaustion');
+  const val = document.getElementById('val_hover_exhaustion');
+  const hud = document.getElementById('chart_hover_hud');
+  const hudDate = document.getElementById('hud_date');
+  const hudExh = document.getElementById('hud_exhaustion');
+  const hudEp = document.getElementById('hud_ep_reason');
+  const chk = document.getElementById('chk_settings_show_exhaustion');
+  const isEnabled = chk ? chk.checked : true;
+
+  const chkReasons = document.getElementById('chk_settings_show_reasons');
+  const showReasons = chkReasons ? chkReasons.checked : false;
+
+  if (!isEnabled && !showReasons) {
+    if (lbl) lbl.style.display = 'none';
+    if (hud) hud.style.display = 'none';
+    return;
+  }
+  if (lbl) lbl.style.display = isEnabled ? 'inline-flex' : 'none';
+
+  if (!timeStr) {
+    if (val) { val.textContent = '—'; val.style.color = '#f43f5e'; }
+    if (hud) hud.style.display = 'none';
+    return;
+  }
+
+  // Exhaustion logic
+  let exhText = '—';
+  let exhColor = '#94a3b8';
+  if (window._lastExhaustionData) {
+    const exh = window._lastExhaustionData[timeStr];
+    if (!exh) {
+      exhText = 'N/A (Pre-EP)';
+      exhColor = '#94a3b8';
+    } else {
+      const stopTag = exh.is_stopped ? ' [Stopped]' : '';
+      if (exh.level === 'Stopped') {
+        exhText = `Inactive (Stopped)`;
+        exhColor = '#ef4444';
+      } else {
+        exhText = `${exh.pct.toFixed(1)}% (${exh.level})${stopTag}`;
+        if (exh.prob >= 0.50) exhColor = '#ef4444'; // Red (Climax Trigger)
+        else if (exh.prob >= 0.35) exhColor = '#f97316'; // Orange (High)
+        else if (exh.prob >= 0.20) exhColor = '#f59e0b'; // Gold (Elevated)
+        else exhColor = '#10b981'; // Green (Low)
+      }
+    }
+  }
+
+  if (val) {
+    val.textContent = exhText;
+    val.style.color = exhColor;
+  }
+
+  // EP Disqualification Reason logic on hover (only if toggled in settings)
+  let hasEpInfo = false;
+  if (hudEp) {
+    if (showReasons && timeStr && window._allTickerEvents) {
+      const epEv = window._allTickerEvents.find(e => e.date === timeStr);
+      if (epEv) {
+        hasEpInfo = true;
+        if (epEv.is_qualified) {
+          hudEp.innerHTML = `<span style="color:#10b981; font-weight:700;">⚡ Qualified EP</span> (+${epEv.gap_pct}%, RVOL ${epEv.rvol}x)`;
+        } else {
+          const reasonStr = epEv.disqualifications && epEv.disqualifications.length ? epEv.disqualifications.join(' · ') : 'Filtered';
+          hudEp.innerHTML = `<span style="color:#f87171; font-weight:700;">🚫 Filtered:</span> <span style="color:#fca5a5; font-weight:600;">${reasonStr}</span> (+${epEv.gap_pct}%, ${epEv.rvol}x)`;
+        }
+        hudEp.style.display = 'inline-block';
+      } else {
+        hudEp.style.display = 'none';
+      }
+    } else {
+      hudEp.style.display = 'none';
+    }
+  }
+
+  if (hud && hudDate) {
+    hudDate.textContent = timeStr;
+    if (hudExh) {
+      hudExh.textContent = `🔥 Exhaustion: ${exhText}`;
+      hudExh.style.color = exhColor;
+      hudExh.style.display = isEnabled ? 'inline' : 'none';
+    }
+    hud.style.display = (isEnabled || hasEpInfo) ? 'block' : 'none';
+  }
+}
+
+function toggleChartSettings() {
+  const p = document.getElementById('chart_settings_panel');
+  if (!p) return;
+  const isHidden = (p.style.display === 'none' || !p.style.display);
+  p.style.display = isHidden ? 'flex' : 'none';
+  const b = document.getElementById('btn_chart_settings');
+  if (b) b.classList.toggle('active', isHidden);
+  const bTool = document.getElementById('btn_tool_settings');
+  if (bTool) bTool.classList.toggle('active', isHidden);
+}
+
+function syncSettingCheckbox(targetId, val) {
+  const el = document.getElementById(targetId);
+  if (el) el.checked = val;
+}
+
+function toggleLarsson() {
+  const sEl = document.getElementById('chk_settings_larsson');
+  const topEl = document.getElementById('chk_larsson');
+  const isChecked = sEl ? sEl.checked : (topEl ? topEl.checked : true);
+  if (topEl) topEl.checked = isChecked;
+  if (sEl) sEl.checked = isChecked;
+  updateNativeLarssonSeries(window._lastLarssonData);
+  scheduleLarssonRender();
+}
+
+function toggleEma10() {
+  if (!ema10Series) return;
+  const sEl = document.getElementById('chk_settings_ema10');
+  const topEl = document.getElementById('chk_ema10');
+  const isChecked = sEl ? sEl.checked : (topEl ? topEl.checked : true);
+  if (topEl) topEl.checked = isChecked;
+  if (sEl) sEl.checked = isChecked;
+  if (isChecked && window._lastEma10Data) {
+    ema10Series.setData(window._lastEma10Data);
+  } else {
+    ema10Series.setData([]);
+  }
+}
+
+function toggleEma20() {
+  if (!ema20Series) return;
+  const sEl = document.getElementById('chk_settings_ema20');
+  const topEl = document.getElementById('chk_ema20');
+  const isChecked = sEl ? sEl.checked : (topEl ? topEl.checked : true);
+  if (topEl) topEl.checked = isChecked;
+  if (sEl) sEl.checked = isChecked;
+  if (isChecked && window._lastEma20Data) {
+    ema20Series.setData(window._lastEma20Data);
+  } else {
+    ema20Series.setData([]);
+  }
+}
+
+function toggleSma50() {
+  if (!sma50Series) return;
+  const sEl = document.getElementById('chk_settings_sma50');
+  const topEl = document.getElementById('chk_sma50');
+  const isChecked = sEl ? sEl.checked : (topEl ? topEl.checked : true);
+  if (topEl) topEl.checked = isChecked;
+  if (sEl) sEl.checked = isChecked;
+  if (isChecked && window._lastSma50Data) {
+    sma50Series.setData(window._lastSma50Data);
+  } else {
+    sma50Series.setData([]);
+  }
+}
+
+function toggleVolMa20() {
+  if (!volMa20Series) return;
+  const sEl = document.getElementById('chk_settings_vol_ma20');
+  const isChecked = sEl ? sEl.checked : true;
+  if (isChecked && window._lastVolMa20Data) {
+    volMa20Series.setData(window._lastVolMa20Data);
+  } else {
+    volMa20Series.setData([]);
+  }
+}
+
+function onChartDisplaySettingChange() {
+  renderChartMarkersAndLines();
+}
+
+function onToggleAllEpsChange() {
+  const allEl = document.getElementById('chk_mark_all_eps');
+  const filtEl = document.getElementById('chk_mark_filt_eps');
+  if (allEl && allEl.checked && filtEl) {
+    filtEl.checked = false;
+  }
+  const epsEl = document.getElementById('chk_mark_eps');
+  if (epsEl) epsEl.checked = !!(allEl && allEl.checked);
+  onChartDisplaySettingChange();
+}
+
+function onToggleFiltEpsChange() {
+  const allEl = document.getElementById('chk_mark_all_eps');
+  const filtEl = document.getElementById('chk_mark_filt_eps');
+  if (filtEl && filtEl.checked && allEl) {
+    allEl.checked = false;
+  }
+  const epsEl = document.getElementById('chk_mark_eps');
+  if (epsEl) epsEl.checked = !!(filtEl && filtEl.checked);
+  onChartDisplaySettingChange();
+}
+
+function onSettingsClimaxChange() {
+  const pVal = document.getElementById('cfg_settings_climax_pct').value;
+  const hVal = document.getElementById('cfg_settings_climax_hurdle').value;
+  const topP = document.getElementById('cfg_climax_pct');
+  const topH = document.getElementById('cfg_climax_hurdle');
+  if (topP) topP.value = pVal;
+  if (topH) topH.value = hVal;
+  onStrategyConfigChange();
+}
+
+function onLarssonFastestChange() {
+  const el = document.getElementById('cfg_larsson_fastest');
+  let val = parseInt(el.value, 10);
+  if (isNaN(val) || val < 2) val = 32;
+  if (val > 100) val = 100;
+  el.value = val;
+  if (window._currentChartEvent) {
+    loadChart(window._currentChartEvent);
   }
 }
 
@@ -1599,6 +2885,17 @@ function fetchEvents() {
     cpos: document.getElementById('f_cpos').value,
     subtype: document.getElementById('f_subtype').value,
     year: document.getElementById('f_year').value,
+    recent_days: (() => {
+      const el = document.getElementById('f_recent_days');
+      if (!el) return '';
+      if (el.value === 'custom') {
+        const c = document.getElementById('f_recent_days_custom');
+        return c ? c.value.trim() : '';
+      }
+      return el.value;
+    })(),
+    v2: document.getElementById('f_v2') ? document.getElementById('f_v2').value : '',
+    prev_gap: document.getElementById('f_prev_gap') ? document.getElementById('f_prev_gap').value : '',
     search: document.getElementById('f_search').value.trim().toUpperCase(),
     cond_veto_headwind: activeBoosters.veto_headwind ? '1' : '0',
     cond_win_sectors: activeBoosters.win_sectors ? '1' : '0',
@@ -1606,6 +2903,7 @@ function fetchEvents() {
     cond_48h: activeBoosters['48h'] ? '1' : '0',
     cond_elite_close: activeBoosters.elite_close ? '1' : '0',
     cond_held_5d: activeBoosters.held_5d ? '1' : '0',
+    cond_no_prev_gap: activeBoosters.no_prev_gap ? '1' : '0',
     t1_mode: stratConfig.t1_mode,
     use_trade1: stratConfig.use_trade1 ? '1' : '0',
     use_pyramid: stratConfig.use_pyramid ? '1' : '0',
@@ -1613,6 +2911,8 @@ function fetchEvents() {
     use_ml_stop: stratConfig.use_ml_stop ? '1' : '0',
     use_multileg: stratConfig.use_multileg ? '1' : '0',
     use_multileg_ml: stratConfig.use_multileg_ml ? '1' : '0',
+    climax_partial_pct: stratConfig.climax_partial_pct,
+    climax_r_hurdle: stratConfig.climax_r_hurdle,
   });
 
   fetch('/api/events?' + p.toString())
@@ -1635,7 +2935,7 @@ function fetchEvents() {
     })
     .catch(err => {
       console.error('Failed to load events:', err);
-      document.getElementById('table-body').innerHTML = `<tr><td colspan="14" style="text-align:center; padding:30px; color:var(--red);">Error loading events: ${err.message}</td></tr>`;
+      document.getElementById('table-body').innerHTML = `<tr><td colspan="15" style="text-align:center; padding:30px; color:var(--red);">Error loading events: ${err.message}</td></tr>`;
     });
 }
 
@@ -1693,7 +2993,7 @@ function updateKPIs(k) {
 function renderTable() {
   const tbody = document.getElementById('table-body');
   if (!filteredEvents.length) {
-    tbody.innerHTML = '<tr><td colspan="14" style="text-align:center; padding:30px; color:var(--muted);">No matching EP events.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="15" style="text-align:center; padding:30px; color:var(--muted);">No matching EP events.</td></tr>';
     return;
   }
 
@@ -1713,18 +3013,28 @@ function renderTable() {
     const c20 = (e.ret_20d != null && e.ret_20d >= 0 ? 'style="color:var(--green);"' : 'style="color:var(--red);"');
     const c60 = (e.ret_60d != null && e.ret_60d >= 0 ? 'style="color:var(--green);"' : 'style="color:var(--red);"');
 
+    const stratColor = e.strat_r != null ? (e.strat_r > 0 ? 'var(--green)' : (e.strat_r < 0 ? 'var(--red)' : 'var(--muted)')) : 'var(--muted)';
+    const stratDisp = e.strat_r != null
+      ? `${e.strat_r >= 0 ? '+' : ''}${e.strat_r.toFixed(2)} R <span style="font-size:10px; opacity:0.8;">(${e.strat_ret != null && e.strat_ret >= 0 ? '+' : ''}${(e.strat_ret || 0).toFixed(1)}%)</span>`
+      : '·';
+
+    const prevGapBadge = e.prev_day_gap_up
+      ? `<br><span style="color:#f59e0b; font-size:9.5px; font-weight:600;" title="Prior day (D-1) gapped up by ${e.prev_day_gap_pct}%">⚠️ P-Gap +${Number(e.prev_day_gap_pct || 0).toFixed(0)}%</span>`
+      : `<br><span style="color:#10b981; font-size:9.5px;" title="Clean pivot: no prior day gap-up">✓ Clean</span>`;
+
     return `<tr class="${isSel ? 'selected' : ''}" onclick="onRowClick('${e.symbol}','${e.date}')">
       <td class="tl">${e.date}</td>
       <td class="tl" style="font-weight:700; color:#fff;">${e.symbol}</td>
       <td class="tl" style="max-width:130px; overflow:hidden; text-overflow:ellipsis;"><span style="color:#38bdf8; cursor:pointer; text-decoration:underline dotted;" title="Click to view ${e.sector} Stock Leaderboard" onclick="event.stopPropagation(); openGroupStocksModal('${e.sector}', 'sector')">${e.sector || '·'}</span></td>
       <td class="tl" style="max-width:130px; overflow:hidden; text-overflow:ellipsis;"><span style="color:#c084fc; cursor:pointer; text-decoration:underline dotted;" title="Click to view ${e.theme} Stock Leaderboard" onclick="event.stopPropagation(); openGroupStocksModal('${e.theme}', 'theme')">${e.theme || '·'}</span></td>
-      <td>${e.gap_pct != null ? e.gap_pct.toFixed(1) + '%' : '·'}</td>
+      <td>${e.gap_pct != null ? e.gap_pct.toFixed(1) + '%' + prevGapBadge : '·'}</td>
       <td>${e.rvol != null ? e.rvol.toFixed(1) + 'x' : '·'}</td>
       <td>${e.close_pos != null ? e.close_pos.toFixed(2) : '·'}</td>
       <td class="tl">${retraceDisp}</td>
       <td ${c20}>${e.ret_20d != null ? (e.ret_20d >= 0 ? '+' : '') + e.ret_20d.toFixed(1) + '%' : '·'}</td>
       <td ${c60}>${e.ret_60d != null ? (e.ret_60d >= 0 ? '+' : '') + e.ret_60d.toFixed(1) + '%' : '·'}</td>
       <td style="font-weight:700; color:var(--gold);">${e.max_gain != null ? e.max_gain.toFixed(1) + '%' : '·'}</td>
+      <td style="font-weight:700; color:${stratColor};">${stratDisp}</td>
       <td class="tl"><span class="tag ${tagCls}">${e.outcome || '·'}</span></td>
       <td style="${e.ml_50 > 0.40 ? 'background-color:rgba(34, 197, 94, 0.2); font-weight:bold; color:#22c55e;' : ''}">${e.ml_50 != null ? (e.ml_50 * 100).toFixed(1) + '%' : '·'}</td>
       <td style="${e.ml_150 > 0.15 ? 'background-color:rgba(34, 197, 94, 0.2); font-weight:bold; color:#22c55e;' : ''}">${e.ml_150 != null ? (e.ml_150 * 100).toFixed(1) + '%' : '·'}</td>
@@ -1748,37 +3058,162 @@ function sortBy(col) {
 }
 
 function loadChart(ev) {
-  document.getElementById('chart_sym').textContent = `${ev.symbol} — ${ev.date} (${ev.subtype.toUpperCase()})`;
+  window._currentChartEvent = ev;
+  document.getElementById('chart_sym').textContent = `${ev.symbol} — ${ev.date} (${(ev.subtype||'ep').toUpperCase()})`;
   document.getElementById('chart_sub').textContent =
     `Gap: +${(ev.gap_pct||0).toFixed(1)}% | RVOL: ${(ev.rvol||0).toFixed(1)}x | 20D: ${(ev.ret_20d||0).toFixed(1)}% | 60D: ${(ev.ret_60d||0).toFixed(1)}% | Peak: +${(ev.max_gain||0).toFixed(1)}%`;
 
-  fetch(`/api/chart?symbol=${ev.symbol}&date=${ev.date}&t1_mode=${stratConfig.t1_mode}&use_trade1=${stratConfig.use_trade1?1:0}&use_pyramid=${stratConfig.use_pyramid?1:0}&use_ml_climax=${stratConfig.use_ml_climax?1:0}&use_ml_stop=${stratConfig.use_ml_stop?1:0}&use_multileg=${stratConfig.use_multileg?1:0}&use_multileg_ml=${stratConfig.use_multileg_ml?1:0}`).then(r => r.json()).then(data => {
+  const lFastest = document.getElementById('cfg_larsson_fastest') ? document.getElementById('cfg_larsson_fastest').value : '32';
+  const v2Val = document.getElementById('f_v2') ? document.getElementById('f_v2').value : '';
+  const prevGapVal = document.getElementById('f_prev_gap') ? document.getElementById('f_prev_gap').value : '';
+  const chartUrl = `/api/chart?symbol=${ev.symbol}&date=${ev.date}&t1_mode=${stratConfig.t1_mode}&use_trade1=${stratConfig.use_trade1?1:0}&use_pyramid=${stratConfig.use_pyramid?1:0}&use_ml_climax=${stratConfig.use_ml_climax?1:0}&use_ml_stop=${stratConfig.use_ml_stop?1:0}&use_multileg=${stratConfig.use_multileg?1:0}&use_multileg_ml=${stratConfig.use_multileg_ml?1:0}&climax_partial_pct=${stratConfig.climax_partial_pct}&climax_r_hurdle=${stratConfig.climax_r_hurdle}&larsson_fastest=${lFastest}&v2=${v2Val}&prev_gap=${prevGapVal}`;
+
+  fetch(chartUrl).then(r => r.json()).then(data => {
     if (!data || !data.bars || !data.bars.length) return;
+
+    window._currentTickerHistory = data.ticker_history || [];
+    window._allTickerEvents = data.all_ticker_events || [];
+    window._lastEma10Data = data.ema10 || [];
+    window._lastLarssonData = data.larsson || [];
+    window._lastExhaustionData = data.exhaustion || {};
+    window._lastAdrData = data.adr14 || {};
+    updateExhaustionHover(null);
+    updateAdnHover(null);
+    if (data.larsson_spans) {
+      const lbl = document.getElementById('lbl_larsson_spans');
+      if (lbl) lbl.textContent = `(${data.larsson_spans.join(', ')})`;
+    }
+
+    // Definitive server metrics update for chart header (cures any 0.0% chip click issue)
+    if (data.gap_pct != null || data.rvol != null) {
+      document.getElementById('chart_sym').textContent = `${data.symbol} — ${data.date} (${(data.subtype || 'EP').toUpperCase()})`;
+      const mfeVal = data.forward_mfe_20d != null ? data.forward_mfe_20d : (data.dossier && data.dossier.ai_scores && data.dossier.ai_scores.forward_mfe_20d != null ? data.dossier.ai_scores.forward_mfe_20d : null);
+      const mfeSub = mfeVal != null ? ` | 🎯 20D MFE: +${Number(mfeVal).toFixed(1)}%` : '';
+      document.getElementById('chart_sub').textContent =
+        `Gap: +${(data.gap_pct || 0).toFixed(1)}% | RVOL: ${(data.rvol || 0).toFixed(1)}x | 20D: ${(data.ret_20d || 0).toFixed(1)}% | 60D: ${(data.ret_60d || 0).toFixed(1)}% | Peak: +${(data.max_gain != null ? data.max_gain : 0).toFixed(1)}%${mfeSub}`;
+    }
 
     // 1. Sector / Theme Context (Right Pane)
     const d = data.dossier;
     
+    // Day 5 V2 ML Intelligence Card
     if (d && d.ai_scores) {
-        if (d.ai_scores.dynamic_stop_loss_pct != null) {
-            document.getElementById('ai_dynamic_stop').style.display = 'block';
-            document.getElementById('ai_stop_val').textContent = (d.ai_scores.dynamic_stop_loss_pct * 100).toFixed(1) + '%';
-            document.getElementById('ai_adv_warnings').style.display = 'block';
+      const v2Card = document.getElementById('card_v2_ml');
+      const s = d.ai_scores;
+      if (v2Card && (s.ml_50 != null || s.ml_100 != null)) {
+        v2Card.style.display = 'flex';
+        const p50 = s.ml_50 != null ? (s.ml_50 * 100).toFixed(1) : '·';
+        const p100 = s.ml_100 != null ? (s.ml_100 * 100).toFixed(1) : '·';
+        const p150 = s.ml_150 != null ? (s.ml_150 * 100).toFixed(1) : '·';
+        const p200 = s.ml_200 != null ? (s.ml_200 * 100).toFixed(1) : '·';
+        
+        document.getElementById('v2_prob_50').textContent = p50 !== '·' ? `${p50}%` : '·';
+        document.getElementById('v2_prob_100').textContent = p100 !== '·' ? `${p100}%` : '·';
+        document.getElementById('v2_prob_150').textContent = p150 !== '·' ? `${p150}%` : '·';
+        document.getElementById('v2_prob_200').textContent = p200 !== '·' ? `${p200}%` : '·';
+
+        const p50Val = s.ml_50 || 0;
+        const badge = document.getElementById('v2_status_badge');
+        badge.textContent = `P(+50%): ${p50}%`;
+        badge.className = 'pctile-badge ' + (p50Val >= 0.40 ? 'pctile-high' : (p50Val >= 0.20 ? 'pctile-mid' : 'pctile-low'));
+
+        const verdictEl = document.getElementById('v2_pyramid_verdict');
+        if (p50Val >= 0.20) {
+          verdictEl.textContent = '✅ Qualified (+50% Add on Day 5)';
+          verdictEl.style.color = 'var(--green)';
         } else {
-            document.getElementById('ai_dynamic_stop').style.display = 'none';
+          verdictEl.textContent = '❌ Unqualified (P < 20%)';
+          verdictEl.style.color = 'var(--muted)';
         }
+
+        const toxEl = document.getElementById('v2_toxicity_verdict');
+        if (s.is_toxic) {
+          toxEl.textContent = '⚠️ Toxic Footprint (High Fail Risk)';
+          toxEl.style.color = 'var(--red)';
+        } else {
+          toxEl.textContent = '🛡️ Clean Institutional Absorption';
+          toxEl.style.color = 'var(--green)';
+        }
+
+        const stopRow = document.getElementById('row_v2_dyn_stop');
+        if (s.dynamic_stop_loss_pct != null) {
+          stopRow.style.display = 'flex';
+          document.getElementById('v2_dyn_stop_val').textContent = `${(Math.abs(s.dynamic_stop_loss_pct) * 100).toFixed(1)}% buffer`;
+        } else {
+          stopRow.style.display = 'none';
+        }
+
+        const mfeRow = document.getElementById('row_v2_mfe_20d');
+        const curMfe = s.forward_mfe_20d != null ? s.forward_mfe_20d : data.forward_mfe_20d;
+        if (curMfe != null) {
+          if (mfeRow) mfeRow.style.display = 'flex';
+          const mfeStr = `+${Number(curMfe).toFixed(1)}%`;
+          if (document.getElementById('v2_mfe_20d_val')) document.getElementById('v2_mfe_20d_val').textContent = mfeStr;
+          if (document.getElementById('ai_v2_mfe')) document.getElementById('ai_v2_mfe').textContent = mfeStr;
+        } else if (mfeRow) {
+          mfeRow.style.display = 'none';
+        }
+
+        const maeRow = document.getElementById('row_v2_mae_20d');
+        const curMae = s.forward_mae_20d != null ? s.forward_mae_20d : data.forward_mae_20d;
+        if (curMae != null) {
+          if (maeRow) maeRow.style.display = 'flex';
+          const maeStr = `-${Math.abs(Number(curMae)).toFixed(1)}%`;
+          if (document.getElementById('v2_mae_20d_val')) document.getElementById('v2_mae_20d_val').textContent = maeStr;
+          if (document.getElementById('ai_v2_mae')) document.getElementById('ai_v2_mae').textContent = maeStr;
+        } else if (maeRow) {
+          maeRow.style.display = 'none';
+        }
+
+        const seqRow = document.getElementById('row_v2_seq_20d');
+        const curSeq = s.prob_mfe_first != null ? s.prob_mfe_first : data.prob_mfe_first;
+        if (curSeq != null) {
+          if (seqRow) seqRow.style.display = 'flex';
+          const p = Number(curSeq);
+          const isMfe = p >= 0.50;
+          const winPct = isMfe ? (p * 100).toFixed(1) : ((1 - p) * 100).toFixed(1);
+          const seqText = isMfe ? `MFE First (${winPct}%)` : `MAE First (${winPct}%)`;
+          const seqColor = isMfe ? '#10b981' : '#f59e0b';
+          const html = `<span style="color:${seqColor}; font-weight:700;">${seqText}</span>`;
+          if (document.getElementById('v2_seq_20d_val')) document.getElementById('v2_seq_20d_val').innerHTML = html;
+          if (document.getElementById('ai_v2_seq')) document.getElementById('ai_v2_seq').innerHTML = html;
+        } else if (seqRow) {
+          seqRow.style.display = 'none';
+        }
+
+        const barrierRow = document.getElementById('row_v2_barrier_20d');
+        const curBarrier = s.prob_barrier_2r != null ? s.prob_barrier_2r : data.prob_barrier_2r;
+        if (curBarrier != null) {
+          if (barrierRow) barrierRow.style.display = 'flex';
+          const pb = Number(curBarrier);
+          const pbPct = (pb * 100).toFixed(1) + '%';
+          const isHigh = pb >= 0.25;
+          const color = isHigh ? '#34d399' : (pb >= 0.15 ? '#38bdf8' : '#94a3b8');
+          const badge = isHigh ? ' <span style="font-size:9.5px; background:rgba(16,185,129,0.2); border:1px solid #10b981; border-radius:3px; padding:1px 4px; color:#34d399; font-weight:700;">HIGH EDGE</span>' : '';
+          const html = `<span style="color:${color}; font-weight:700;">${pbPct}${badge}</span>`;
+          if (document.getElementById('v2_barrier_20d_val')) document.getElementById('v2_barrier_20d_val').innerHTML = html;
+          if (document.getElementById('ai_v2_barrier')) document.getElementById('ai_v2_barrier').innerHTML = html;
+        } else if (barrierRow) {
+          barrierRow.style.display = 'none';
+        }
+      } else if (v2Card) {
+        v2Card.style.display = 'none';
+      }
+
+      if (s.dynamic_stop_loss_pct != null) {
+        document.getElementById('ai_dynamic_stop').style.display = 'block';
+        document.getElementById('ai_stop_val').textContent = (s.dynamic_stop_loss_pct * 100).toFixed(1) + '%';
+        document.getElementById('ai_adv_warnings').style.display = 'block';
+      } else {
+        document.getElementById('ai_dynamic_stop').style.display = 'none';
+      }
     }
     
-    // Automatically trigger V2 load clamped to historical hold duration
+    // Automatically trigger V2 load (defaults to institutional Day 5 conviction evaluation)
     const slider = document.getElementById('epSlider');
     if (slider) { 
-        // [FIX]: Clamp slider to the actual survival duration of the trade
-        let max_survive = 5;
-        if (d && d.trade_1 && d.trade_1.hold_days) {
-            max_survive = Math.min(20, Math.max(1, d.trade_1.hold_days));
-        }
-        let default_val = Math.min(5, max_survive);
-        slider.value = default_val; 
-        onSliderMove(default_val);
+        slider.value = 5; 
+        onSliderMove(5);
     }
 
     if (d && d.sector_theme) {
@@ -1846,24 +3281,60 @@ function loadChart(ev) {
       document.getElementById('card_stepper').style.display = 'flex';
 
       // Trade 1 Execution
+      const lblTrEntry = document.getElementById('lbl_tr_entry');
+      const lblTrAdd = document.getElementById('lbl_tr_add');
+      const isDelayed = (tr1.entry_mode === 'delayed' || stratConfig.t1_mode === 'delayed');
+
+      if (lblTrEntry) {
+        lblTrEntry.textContent = isDelayed ? `Entry (Delayed Breakout on ${tr1.entry_date || 'Day 2-5'}):` : 'Entry (D1 Close):';
+      }
+
       if (tr1.skipped) {
-        document.getElementById('tr_entry').textContent = 'Skipped';
-        document.getElementById('tr_stop').textContent = 'Trade 1 Entry OFF';
-        document.getElementById('tr_add').textContent = '—';
-        document.getElementById('tr_exit_price').textContent = 'No Position Taken';
-        document.getElementById('tr_exit_reason').textContent = 'Skipped by User (Continuation Legs Only Mode)';
-        document.getElementById('tr_exit_reason').style.color = 'var(--muted)';
-        document.getElementById('tr_hold').textContent = '0 sessions';
-        document.getElementById('row_sma50_adh').style.display = 'none';
-        document.getElementById('tr_result').textContent = '0.0% (+0.00 R)';
-        document.getElementById('tr_result').style.color = 'var(--muted)';
-        document.getElementById('tr_exec_status').textContent = 'SKIPPED / 0.00 R';
-        document.getElementById('tr_exec_status').style.color = 'var(--muted)';
-        document.getElementById('card_trade_exec').style.display = 'flex';
+        if (isDelayed) {
+          document.getElementById('tr_entry').textContent = 'Cancelled / $0 Capital Risked';
+          document.getElementById('tr_stop').textContent = tr1.stop_price ? `$${tr1.stop_price.toFixed(2)}` : 'D1 Low';
+          if (lblTrAdd) lblTrAdd.textContent = 'Day 5 Pyramid (+50%):';
+          document.getElementById('tr_add').textContent = tr1.pyramid_added ? 'Active (+50% added on Day 5)' : 'Inactive (Day 5 Close < Entry)';
+          document.getElementById('tr_exit_price').textContent = '$0.00 (No Position)';
+          document.getElementById('tr_exit_reason').textContent = tr1.exit_reason || 'Cancelled / Defense Active';
+          document.getElementById('tr_exit_reason').style.color = 'var(--muted)';
+          document.getElementById('tr_hold').textContent = '0 sessions';
+          document.getElementById('row_sma50_adh').style.display = 'none';
+          if (document.getElementById('row_tr1_climax')) document.getElementById('row_tr1_climax').style.display = 'none';
+          if (document.getElementById('row_tr1_trailer')) document.getElementById('row_tr1_trailer').style.display = 'none';
+          document.getElementById('tr_result').textContent = '0.0% (+0.00 R)';
+          document.getElementById('tr_result').style.color = 'var(--muted)';
+          document.getElementById('tr_exec_status').textContent = 'CANCELLED / 0.00 R';
+          document.getElementById('tr_exec_status').style.color = 'var(--muted)';
+          document.getElementById('card_trade_exec').style.display = 'flex';
+        } else {
+          document.getElementById('tr_entry').textContent = 'Skipped';
+          document.getElementById('tr_stop').textContent = 'Trade 1 Entry OFF';
+          if (lblTrAdd) lblTrAdd.textContent = 'Secondary Add (D1 High):';
+          document.getElementById('tr_add').textContent = '—';
+          document.getElementById('tr_exit_price').textContent = 'No Position Taken';
+          document.getElementById('tr_exit_reason').textContent = tr1.exit_reason || 'Skipped by User (Continuation Legs Only Mode)';
+          document.getElementById('tr_exit_reason').style.color = 'var(--muted)';
+          document.getElementById('tr_hold').textContent = '0 sessions';
+          document.getElementById('row_sma50_adh').style.display = 'none';
+          if (document.getElementById('row_tr1_climax')) document.getElementById('row_tr1_climax').style.display = 'none';
+          if (document.getElementById('row_tr1_trailer')) document.getElementById('row_tr1_trailer').style.display = 'none';
+          document.getElementById('tr_result').textContent = '0.0% (+0.00 R)';
+          document.getElementById('tr_result').style.color = 'var(--muted)';
+          document.getElementById('tr_exec_status').textContent = 'SKIPPED / 0.00 R';
+          document.getElementById('tr_exec_status').style.color = 'var(--muted)';
+          document.getElementById('card_trade_exec').style.display = 'flex';
+        }
       } else {
         document.getElementById('tr_entry').textContent = `$${tr1.entry_price.toFixed(2)}`;
         document.getElementById('tr_stop').textContent = `$${tr1.stop_price.toFixed(2)} (-${tr1.risk_pct.toFixed(1)}% risk)`;
-        document.getElementById('tr_add').textContent = `$${tr1.add_trigger_price.toFixed(2)}`;
+        if (isDelayed) {
+          if (lblTrAdd) lblTrAdd.textContent = 'Day 5 Pyramid (+50%):';
+          document.getElementById('tr_add').textContent = tr1.pyramid_added ? 'Active (+50% added on Day 5)' : 'Inactive (Day 5 Close < Entry)';
+        } else {
+          if (lblTrAdd) lblTrAdd.textContent = 'Secondary Add (D1 High):';
+          document.getElementById('tr_add').textContent = `$${tr1.add_trigger_price.toFixed(2)}`;
+        }
 
         document.getElementById('tr_exit_price').textContent = `$${tr1.exit_price.toFixed(2)} on ${tr1.exit_date}`;
         document.getElementById('tr_exit_reason').textContent = tr1.exit_reason;
@@ -1873,9 +3344,25 @@ function loadChart(ev) {
         const climaxRow = document.getElementById('row_tr1_climax');
         if (tr1.climax_exit_triggered && climaxRow) {
           climaxRow.style.display = 'flex';
-          document.getElementById('tr1_climax_val').textContent = `50% sold at $${tr1.climax_exit_price.toFixed(2)} (+${tr1.climax_partial_r.toFixed(2)}R) on ${tr1.climax_exit_date}`;
+          const cPct = tr1.climax_partial_pct != null ? `${Math.round(tr1.climax_partial_pct)}%` : '50%';
+          document.getElementById('tr1_climax_val').textContent = `${cPct} sold at $${tr1.climax_exit_price.toFixed(2)} (+${tr1.climax_partial_r.toFixed(2)}R) on ${tr1.climax_exit_date}`;
         } else if (climaxRow) {
           climaxRow.style.display = 'none';
+        }
+
+        const trailerRow = document.getElementById('row_tr1_trailer');
+        if (stratConfig.use_ml_stop && trailerRow) {
+          const pctVal = tr1.dynamic_trailer_pct != null ? tr1.dynamic_trailer_pct : (d.ai_scores && d.ai_scores.dynamic_stop_loss_pct != null ? Math.abs(d.ai_scores.dynamic_stop_loss_pct * 100) : 16.8);
+          const pctStr = pctVal.toFixed(1) + '%';
+          trailerRow.style.display = 'flex';
+          if (tr1.dynamic_trailer_active && tr1.dynamic_trailer_stop) {
+            document.getElementById('tr1_trailer_val').textContent = `${pctStr} buffer ($${tr1.dynamic_trailer_stop.toFixed(2)})`;
+          } else {
+            const hVal = stratConfig.climax_r_hurdle ? stratConfig.climax_r_hurdle.toFixed(1) : '3.0';
+            document.getElementById('tr1_trailer_val').textContent = `${pctStr} buffer (Inactive · < ${hVal}R hurdle)`;
+          }
+        } else if (trailerRow) {
+          trailerRow.style.display = 'none';
         }
 
         const smaRow = document.getElementById('row_sma50_adh');
@@ -1909,13 +3396,18 @@ function loadChart(ev) {
     const dHistCount = document.getElementById('dossier_hist_count');
     const dHistChips = document.getElementById('dossier_hist_chips');
 
-    if (data.ticker_history && data.ticker_history.length > 0) {
+    // Historical genealogy chips for this ticker: show all historical setups across history
+    let validHistory = (data.all_ticker_events && data.all_ticker_events.length > 0) ? data.all_ticker_events : (data.ticker_history || []);
+
+    if (validHistory && validHistory.length > 0) {
       histName.textContent = data.symbol;
-      histCount.textContent = data.ticker_history.length;
-      const chipsHtml = data.ticker_history.map(h => {
+      histCount.textContent = validHistory.length;
+      const chipsHtml = validHistory.map(h => {
         const isCurrent = (h.date === ev.date);
         const gainText = (h.max_gain != null && h.max_gain > 0) ? `+${h.max_gain.toFixed(0)}%` : `${h.gap_pct.toFixed(0)}%`;
-        return `<span class="hist-chip ${isCurrent ? 'active' : ''}" onclick="onHistChipClick('${data.symbol}', '${h.date}', '${h.subtype}')">
+        const disquals = (h.disqualifications && h.disqualifications.length > 0) ? `\\nDisqualifications: ${h.disqualifications.join(', ')}` : (h.is_qualified ? `\\nStatus: Qualified Institutional EP` : ``);
+        const tooltip = `${h.date} (${(h.subtype||'ep').toUpperCase()})\\nGap: +${h.gap_pct}%, RVOL: ${h.rvol}x${disquals}`;
+        return `<span class="hist-chip ${isCurrent ? 'active' : ''}" title="${tooltip}" onclick="onHistChipClick('${data.symbol}', '${h.date}', '${h.subtype}')">
           <span>${h.date}</span>
           <span class="hist-chip-gain">${gainText}</span>
         </span>`;
@@ -1925,7 +3417,7 @@ function loadChart(ev) {
 
       if (cardHist && dHistChips) {
         dHistSym.textContent = data.symbol;
-        dHistCount.textContent = `${data.ticker_history.length} Events (2016–2026)`;
+        dHistCount.textContent = `${validHistory.length} Matching Setups (2016–2026)`;
         dHistChips.innerHTML = chipsHtml;
         cardHist.style.display = 'flex';
       }
@@ -1999,60 +3491,140 @@ function loadChart(ev) {
     // 4. Center Candlestick Chart
     candleSeries.setData(data.bars);
     volSeries.setData(data.volume);
-    if (data.ema20) ema20Series.setData(data.ema20);
-    if (data.sma50) sma50Series.setData(data.sma50);
+    window._lastVolMa20Data = data.vol_ma20 || [];
+    window._lastEma10Data = data.ema10 || [];
+    window._lastEma20Data = data.ema20 || [];
+    window._lastSma50Data = data.sma50 || [];
+    window._lastLarssonData = data.larsson || [];
+    window._lastChartData = data;
 
-    activePriceLines.forEach(pl => {
-      try { candleSeries.removePriceLine(pl); } catch (e) {}
+    if (data.larsson_spans && document.getElementById('lbl_larsson_spans')) {
+      document.getElementById('lbl_larsson_spans').textContent = `(${data.larsson_spans.join(', ')})`;
+    }
+
+    toggleEma10();
+    toggleEma20();
+    toggleSma50();
+    toggleVolMa20();
+    toggleLarsson();
+    updateLarssonLegendValues(null);
+
+    renderChartMarkersAndLines(data);
+
+    const container = document.getElementById('chart-container');
+    chart.applyOptions({ width: container.clientWidth, height: container.clientHeight });
+    chart.priceScale('right').applyOptions({ autoScale: true, scaleMargins: { top: 0.08, bottom: 0.25 } });
+    chart.priceScale('volume').applyOptions({ scaleMargins: { top: 0.82, bottom: 0.0 } });
+    if (data.bars && data.bars.length > 0) {
+      let evIdx = (data.event_index != null) ? data.event_index : data.bars.findIndex(b => b.time === ev.date);
+      if (evIdx < 0) evIdx = data.bars.length - 1;
+      const fromIdx = Math.max(0, evIdx - 35);
+      const toIdx = Math.min(data.bars.length - 1, evIdx + 110);
+      chart.timeScale().setVisibleLogicalRange({ from: fromIdx, to: toIdx });
+    }
+    requestAnimationFrame(() => {
+      renderAllDrawings();
+      renderLarssonRibbon();
     });
-    activePriceLines = [];
+    setTimeout(() => {
+      renderAllDrawings();
+      renderLarssonRibbon();
+    }, 60);
+    setTimeout(() => {
+      renderAllDrawings();
+      renderLarssonRibbon();
+    }, 180);
+  });
 
-    // Chart Markers
-    const markers = [{
-      time: ev.date, position: 'belowBar', color: '#10b981', shape: 'arrowUp', text: `T1 EP Entry: $${data.level != null ? data.bars.find(b => b.time === ev.date)?.close : ''}`
-    }];
-    
-    if (d && d.trade_1 && d.trade_1.exit_date) {
-      markers.push({
-        time: d.trade_1.exit_date, position: 'aboveBar',
-        color: d.trade_1.stopped_out ? '#ef4444' : '#38bdf8', shape: 'arrowDown',
-        text: `T1 Exit: ${d.trade_1.trade_r >= 0 ? '+' : ''}${d.trade_1.trade_r}R (${d.trade_1.trade_return_pct}%)`
-      });
+}
+
+function onHistChipClick(sym, dt, sub) {
+  selectedSym = sym; selectedDate = dt;
+  let ev = filteredEvents.find(e => e.symbol === sym && e.date === dt);
+  if (!ev && window._currentTickerHistory) {
+    const h = window._currentTickerHistory.find(x => x.date === dt);
+    if (h) {
+      ev = { symbol: sym, ...h };
     }
+  }
+  if (!ev) {
+    ev = { symbol: sym, date: dt, subtype: sub || 'ep' };
+  }
+  loadChart(ev);
+  renderTable();
+}
 
-    if (t2 && t2.has_reentry && t2.entry_date) {
-      markers.push({
-        time: t2.entry_date, position: 'belowBar',
-        color: '#fbbf24', shape: 'arrowUp',
-        text: `T2 Yellow Re-Entry: $${t2.entry_price}`
-      });
-      if (t2.exit_date) {
+function renderChartMarkersAndLines(data) {
+  if (!data) data = window._lastChartData;
+  if (!data || !candleSeries) return;
+
+  const d = data.dossier;
+  const ev = window._currentChartEvent || { date: data.date, symbol: data.symbol };
+
+  // 1. Clear existing price lines
+  activePriceLines.forEach(pl => {
+    try { candleSeries.removePriceLine(pl); } catch (e) {}
+  });
+  activePriceLines = [];
+
+  const markers = [];
+
+  const showT1 = document.getElementById('chk_mark_t1') ? document.getElementById('chk_mark_t1').checked : true;
+  const showT2 = document.getElementById('chk_mark_t2') ? document.getElementById('chk_mark_t2').checked : true;
+  const showT3 = document.getElementById('chk_mark_t3') ? document.getElementById('chk_mark_t3').checked : true;
+  const showAllEps = document.getElementById('chk_mark_all_eps') ? document.getElementById('chk_mark_all_eps').checked : (document.getElementById('chk_mark_eps') ? document.getElementById('chk_mark_eps').checked : true);
+  const showFiltEps = document.getElementById('chk_mark_filt_eps') ? document.getElementById('chk_mark_filt_eps').checked : false;
+
+  // 2. Trade 1 Markings & Price Lines
+  const tr1 = d ? d.trade_1 : null;
+  const isDelayed = (tr1 && (tr1.entry_mode === 'delayed' || stratConfig.t1_mode === 'delayed')) || (!tr1 && stratConfig.t1_mode === 'delayed');
+
+  if (showT1) {
+    if (tr1) {
+      if (!tr1.skipped && tr1.entry_date) {
         markers.push({
-          time: t2.exit_date, position: 'aboveBar',
-          color: t2.stopped_out ? '#ef4444' : '#34d399', shape: 'arrowDown',
-          text: `T2 Exit: ${t2.r_mult >= 0 ? '+' : ''}${t2.r_mult}R (${t2.return_pct}%)`
+          time: tr1.entry_date,
+          position: 'belowBar',
+          color: '#10b981',
+          shape: 'arrowUp',
+          text: `${isDelayed ? 'T1 Delayed Breakout' : 'T1 Close Entry'}: $${tr1.entry_price.toFixed(2)}`
+        });
+      } else if (tr1.skipped && isDelayed) {
+        markers.push({
+          time: ev.date,
+          position: 'aboveBar',
+          color: '#94a3b8',
+          shape: 'circle',
+          text: `T1 Cancelled (0 Risk): ${tr1.exit_reason}`
         });
       }
-    }
-
-    if (t3 && t3.has_reentry && t3.entry_date) {
+    } else if (!isDelayed && stratConfig.use_trade1) {
       markers.push({
-        time: t3.entry_date, position: 'belowBar',
-        color: '#a855f7', shape: 'arrowUp',
-        text: `T3 3rd Yellow Flip: $${t3.entry_price}`
+        time: ev.date,
+        position: 'belowBar',
+        color: '#10b981',
+        shape: 'arrowUp',
+        text: `T1 EP Entry: $${data.bars && data.bars.find(b => b.time === ev.date)?.close || ''}`
       });
-      if (t3.exit_date) {
-        markers.push({
-          time: t3.exit_date, position: 'aboveBar',
-          color: t3.stopped_out ? '#ef4444' : '#c084fc', shape: 'arrowDown',
-          text: `T3 Exit: ${t3.r_mult >= 0 ? '+' : ''}${t3.r_mult}R (${t3.return_pct}%)`
-        });
-      }
     }
 
-    candleSeries.setMarkers(markers);
+    if (tr1 && !tr1.skipped && tr1.climax_exit_triggered && tr1.climax_exit_date) {
+      const cPct = tr1.climax_partial_pct != null ? `${Math.round(tr1.climax_partial_pct)}%` : '50%';
+      markers.push({
+        time: tr1.climax_exit_date, position: 'aboveBar',
+        color: '#eab308', shape: 'arrowDown',
+        text: `🎯 ML Climax Exit (${cPct} at $${tr1.climax_exit_price}: +${tr1.climax_partial_r}R)`
+      });
+    }
 
-    // Price lines
+    if (tr1 && !tr1.skipped && tr1.exit_date && tr1.exit_date !== '—') {
+      markers.push({
+        time: tr1.exit_date, position: 'aboveBar',
+        color: tr1.stopped_out ? '#ef4444' : '#38bdf8', shape: 'arrowDown',
+        text: `T1 Exit: ${tr1.trade_r >= 0 ? '+' : ''}${tr1.trade_r}R (${tr1.trade_return_pct}%)`
+      });
+    }
+
     if (data.level) {
       activePriceLines.push(candleSeries.createPriceLine({
         price: data.level, color: '#ef4444', lineWidth: 2, lineStyle: 2, axisLabelVisible: true, title: 'T1 Stop (D1 Low)'
@@ -2060,49 +3632,157 @@ function loadChart(ev) {
     }
     if (data.trigger) {
       activePriceLines.push(candleSeries.createPriceLine({
-        price: data.trigger, color: '#10b981', lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: 'T1 Add Trigger'
+        price: data.trigger, color: '#10b981', lineWidth: 1, lineStyle: 2, axisLabelVisible: true,
+        title: isDelayed ? 'T1 Breakout Trigger (D1 High)' : 'T1 Add Trigger (D1 High)'
       }));
     }
-    if (t2 && t2.has_reentry && t2.stop_price) {
+    if (tr1 && tr1.dynamic_trailer_active && tr1.dynamic_trailer_stop) {
+      const pctStr = (tr1.dynamic_trailer_pct != null) ? ` (${tr1.dynamic_trailer_pct.toFixed(1)}% buffer)` : '';
+      activePriceLines.push(candleSeries.createPriceLine({
+        price: tr1.dynamic_trailer_stop,
+        color: '#f59e0b',
+        lineWidth: 1,
+        lineStyle: 2,
+        axisLabelVisible: true,
+        title: `🤖 ML Trailing Stop ($${tr1.dynamic_trailer_stop.toFixed(2)})${pctStr}`
+      }));
+    }
+  }
+
+  // 3. Trade 2 Markings & Price Lines
+  const t2 = d ? d.trade_2 : null;
+  if (showT2 && t2 && t2.has_reentry) {
+    if (t2.entry_date) {
+      markers.push({
+        time: t2.entry_date, position: 'belowBar',
+        color: '#fbbf24', shape: 'arrowUp',
+        text: `T2 Yellow Re-Entry: $${t2.entry_price}`
+      });
+    }
+    if (t2.exit_date) {
+      markers.push({
+        time: t2.exit_date, position: 'aboveBar',
+        color: t2.stopped_out ? '#ef4444' : '#34d399', shape: 'arrowDown',
+        text: `T2 Exit: ${t2.r_mult >= 0 ? '+' : ''}${t2.r_mult}R (${t2.return_pct}%)`
+      });
+    }
+    if (t2.stop_price) {
       activePriceLines.push(candleSeries.createPriceLine({
         price: t2.stop_price, color: '#f59e0b', lineWidth: 1, lineStyle: 3, axisLabelVisible: true, title: `T2 Stop ($${t2.stop_price})`
       }));
     }
-    if (t3 && t3.has_reentry && t3.stop_price) {
+  }
+
+  // 4. Trade 3 Markings & Price Lines
+  const t3 = d ? d.trade_3 : null;
+  if (showT3 && t3 && t3.has_reentry) {
+    if (t3.entry_date) {
+      markers.push({
+        time: t3.entry_date, position: 'belowBar',
+        color: '#a855f7', shape: 'arrowUp',
+        text: `T3 3rd Yellow Flip: $${t3.entry_price}`
+      });
+    }
+    if (t3.exit_date) {
+      markers.push({
+        time: t3.exit_date, position: 'aboveBar',
+        color: t3.stopped_out ? '#ef4444' : '#c084fc', shape: 'arrowDown',
+        text: `T3 Exit: ${t3.r_mult >= 0 ? '+' : ''}${t3.r_mult}R (${t3.return_pct}%)`
+      });
+    }
+    if (t3.stop_price) {
       activePriceLines.push(candleSeries.createPriceLine({
         price: t3.stop_price, color: '#a855f7', lineWidth: 1, lineStyle: 3, axisLabelVisible: true, title: `T3 Stop ($${t3.stop_price})`
       }));
     }
+  }
 
-    const container = document.getElementById('chart-container');
-    chart.applyOptions({ width: container.clientWidth, height: container.clientHeight });
-    chart.priceScale('right').applyOptions({ autoScale: true, scaleMargins: { top: 0.08, bottom: 0.25 } });
-    chart.priceScale('vol').applyOptions({ scaleMargins: { top: 0.84, bottom: 0.0 } });
-    if (data.bars && data.bars.length > 0) {
-      chart.timeScale().setVisibleLogicalRange({ from: 0, to: Math.min(data.bars.length - 1, 140) });
-    }
-  });
+  // 5. EP Event Markers (all historical EPs for this symbol vs filtered)
+  if (showAllEps || showFiltEps) {
+    const chkReasons = document.getElementById('chk_settings_show_reasons');
+    const showReasons = chkReasons ? chkReasons.checked : false;
+    const history = showFiltEps ? (data.ticker_history || []) : (data.all_ticker_events || data.ticker_history || window._currentTickerHistory || []);
+    history.forEach(h => {
+      const isCur = (h.date === ev.date);
+      const gapStr = h.gap_pct != null ? `+${h.gap_pct.toFixed(0)}%` : '';
+      const rvolStr = h.rvol != null ? `${h.rvol.toFixed(1)}x` : '';
+      const gainStr = (h.max_gain != null && h.max_gain > 0) ? `(+${h.max_gain.toFixed(0)}% run)` : '';
+      const isQual = (h.is_qualified !== false);
+      const failReason = (h.disqualifications && h.disqualifications.length > 0) ? h.disqualifications[0] : (h.primary_reason || 'Filtered');
 
-}
+      let markerColor = '#06b6d4';
+      let markerText = '';
 
-function onHistChipClick(sym, dt, sub) {
-  selectedSym = sym; selectedDate = dt;
-  const ev = filteredEvents.find(e => e.symbol === sym && e.date === dt) || { symbol: sym, date: dt, subtype: sub || 'ep' };
-  loadChart(ev);
-  renderTable();
+      if (isCur) {
+        markerColor = '#38bdf8';
+        markerText = `⚡ SELECTED EP: ${gapStr} (RVOL ${rvolStr}) ${gainStr}`;
+      } else if (showReasons) {
+        if (isQual) {
+          markerColor = '#10b981';
+          markerText = `⚡ QUALIFIED EP: ${gapStr} (RVOL ${rvolStr}) ${gainStr}`;
+        } else {
+          markerColor = '#f87171';
+          markerText = `🚫 FILTERED: ${failReason} (${gapStr} RVOL ${rvolStr})`;
+        }
+      } else {
+        markerColor = showFiltEps ? '#c084fc' : '#06b6d4';
+        markerText = `⚡ EP: ${gapStr} (RVOL ${rvolStr}) ${gainStr}`;
+      }
+      
+      markers.push({
+        time: h.date,
+        position: 'belowBar',
+        color: markerColor,
+        shape: 'circle',
+        text: markerText
+      });
+    });
+  }
+
+  markers.sort((a, b) => (a.time < b.time ? -1 : (a.time > b.time ? 1 : 0)));
+  candleSeries.setMarkers(markers);
 }
 
 // Attach filter listeners
-['f_outcome', 'f_milestone', 'f_sector', 'f_theme', 'f_retrace', 'f_cpos', 'f_subtype', 'f_year'].forEach(id => {
-  document.getElementById(id).addEventListener('change', fetchEvents);
+['f_outcome', 'f_milestone', 'f_sector', 'f_theme', 'f_retrace', 'f_cpos', 'f_subtype', 'f_year', 'f_v2', 'f_prev_gap', 'f_recent_days'].forEach(id => {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener('change', (e) => {
+    if (id === 'f_recent_days') {
+      const customEl = document.getElementById('f_recent_days_custom');
+      if (customEl) {
+        if (e.target.value === 'custom') {
+          customEl.style.display = 'inline-block';
+          customEl.focus();
+        } else {
+          customEl.style.display = 'none';
+          customEl.value = '';
+        }
+      }
+    }
+    fetchEvents();
+  });
 });
 document.getElementById('f_search').addEventListener('input', fetchEvents);
+const cRecentEl = document.getElementById('f_recent_days_custom');
+if (cRecentEl) cRecentEl.addEventListener('input', fetchEvents);
 
-window.onload = () => {
-  initChart();
-  loadFilters();
-  fetchEvents();
-};
+let _appBooted = false;
+function bootApp() {
+  if (_appBooted) return;
+  _appBooted = true;
+  try { initChart(); } catch (e) { console.error('initChart error:', e); }
+  try { loadFilters(); } catch (e) { console.error('loadFilters error:', e); }
+  try { fetchEvents(); } catch (e) { console.error('fetchEvents error:', e); }
+}
+
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', bootApp);
+} else {
+  bootApp();
+}
+window.addEventListener('load', () => {
+  bootApp();
+});
 </script>
 </body>
 </html>
@@ -2149,9 +3829,9 @@ def api_events():
     preset = request.args.get("preset", "all")
     if preset == "pinnacle":
         q = q[
-            (q["close_pos"] >= 0.65) &
-            (q["rvol"] >= 2.5) &
-            (q["gap_pct"] >= 5.0) &
+            ((q["close_pos"] >= 0.65) | (q["subtype"] == "dre")) &
+            (q["rvol"] >= 2.4) &
+            ((q["gap_pct"] >= 5.0) | (q["subtype"].isin(["dre", "ep9m"]))) &
             (q["sector"].isin(TOP_SECTORS) | q["theme"].isin(TOP_THEMES)) &
             ((q["sec_m1_pctile"] >= 50) | (q["thm_m1_pctile"] >= 50))
         ]
@@ -2214,6 +3894,11 @@ def api_events():
         q = q[q["close_pos"] >= 0.80]
     if request.args.get("cond_held_5d") == "1":
         q = q[~q["breached_d1_low_5d"]]
+    if request.args.get("cond_no_prev_gap") == "1":
+        if "prev_day_gap_up" in q.columns:
+            q = q[~q["prev_day_gap_up"]]
+        elif "prev_day_gap_pct" in q.columns:
+            q = q[q["prev_day_gap_pct"] <= 0.0]
 
     outcome = request.args.get("outcome")
     if outcome:
@@ -2271,6 +3956,41 @@ def api_events():
     if search:
         q = q[q["symbol"].str.contains(search, case=False, na=False)]
 
+    v2_filter = request.args.get("v2")
+    if v2_filter == "20":
+        q = q[q["ml_50"] >= 0.20]
+    elif v2_filter == "30":
+        q = q[q["ml_50"] >= 0.30]
+    elif v2_filter == "40":
+        q = q[q["ml_50"] >= 0.40]
+    elif v2_filter == "50":
+        q = q[q["ml_50"] >= 0.50]
+    elif v2_filter == "sub20":
+        q = q[q["ml_50"] < 0.20]
+
+    prev_gap = request.args.get("prev_gap")
+    if prev_gap == "no_gap":
+        if "prev_day_gap_up" in q.columns:
+            q = q[~q["prev_day_gap_up"]]
+        elif "prev_day_gap_pct" in q.columns:
+            q = q[q["prev_day_gap_pct"] <= 0.0]
+    elif prev_gap == "gap_up":
+        if "prev_day_gap_up" in q.columns:
+            q = q[q["prev_day_gap_up"]]
+        elif "prev_day_gap_pct" in q.columns:
+            q = q[q["prev_day_gap_pct"] > 0.0]
+
+    recent_days = request.args.get("recent_days")
+    if recent_days:
+        try:
+            n_days = int(recent_days)
+            if n_days > 0 and not df.empty:
+                anchor_dt = pd.to_datetime(df["date"].max())
+                cutoff_dt = (anchor_dt - pd.Timedelta(days=n_days)).strftime("%Y-%m-%d")
+                q = q[q["date"] >= cutoff_dt]
+        except (ValueError, TypeError):
+            pass
+
     n = len(q)
     def _safe_float(val, default=0.0):
         if val is None or pd.isna(val):
@@ -2283,6 +4003,14 @@ def api_events():
     use_ml_stop = request.args.get("use_ml_stop", "1") in ["1", "true", "True"]
     use_multileg = request.args.get("use_multileg", "1") in ["1", "true", "True"]
     use_multileg_ml = request.args.get("use_multileg_ml", "1") in ["1", "true", "True"]
+    try:
+        climax_partial_pct = float(request.args.get("climax_partial_pct", "0.50"))
+    except (ValueError, TypeError):
+        climax_partial_pct = 0.50
+    try:
+        climax_r_hurdle = float(request.args.get("climax_r_hurdle", "3.0"))
+    except (ValueError, TypeError):
+        climax_r_hurdle = 3.0
 
     n = len(q)
     if n > 0:
@@ -2303,7 +4031,12 @@ def api_events():
         mean_180d = _safe_float(q["ret_180d"].dropna().mean()) if "ret_180d" in q.columns and len(q["ret_180d"].dropna()) > 0 else 0.0
 
         executed_trades = []
+        strat_r_list = []
+        strat_ret_list = []
         for _, r_ev in q.iterrows():
+            ev_t1_r = 0.0
+            ev_t1_ret = 0.0
+
             if use_trade1:
                 if t1_mode == "delayed":
                     has_delayed = bool(r_ev.get("t1_delayed_has_entry", False))
@@ -2314,43 +4047,96 @@ def api_events():
                         else:
                             if use_pyramid and use_ml_climax and use_ml_stop:
                                 col = "t1_delayed_ai_opt_r"
+                                base_col = "t1_delayed_dyn_pyramid_r"
                             elif use_pyramid and use_ml_climax:
                                 col = "t1_delayed_climax_pyramid_r"
+                                base_col = "t1_delayed_pyramid_r"
                             elif use_pyramid and use_ml_stop:
                                 col = "t1_delayed_dyn_pyramid_r"
+                                base_col = "t1_delayed_dyn_pyramid_r"
                             elif use_pyramid:
                                 col = "t1_delayed_pyramid_r"
+                                base_col = "t1_delayed_pyramid_r"
                             elif use_ml_climax and use_ml_stop:
                                 col = "t1_delayed_climax_dyn_r"
+                                base_col = "t1_delayed_dyn_r"
                             elif use_ml_climax:
                                 col = "t1_delayed_climax_r"
+                                base_col = "t1_delayed_r"
                             elif use_ml_stop:
                                 col = "t1_delayed_dyn_r"
+                                base_col = "t1_delayed_dyn_r"
                             else:
                                 col = "t1_delayed_r"
+                                base_col = "t1_delayed_r"
+
                             t1_r = float(r_ev.get(col, r_ev.get("t1_delayed_r", 0.0)))
+                            if use_ml_climax and (climax_partial_pct != 0.50 or climax_r_hurdle != 3.0):
+                                base_r = float(r_ev.get(base_col, r_ev.get("t1_delayed_r", 0.0)))
+                                if bool(r_ev.get("t1_climax_triggered", False)):
+                                    max_g = float(r_ev.get("max_gain", 0.0))
+                                    risk_p = float(r_ev.get("risk_pct", 10.0))
+                                    approx_max_r = max_g / risk_p if risk_p > 0 else 0.0
+                                    if approx_max_r >= climax_r_hurdle:
+                                        t1_r = base_r + 2.0 * climax_partial_pct * (t1_r - base_r)
+                                    else:
+                                        t1_r = base_r
+                            ev_t1_r = t1_r
+                            risk_p = float(r_ev.get("t1_delayed_risk_pct", 10.0)) if pd.notna(r_ev.get("t1_delayed_risk_pct")) else 10.0
+                            if risk_p <= 0:
+                                risk_p = 10.0
+                            ev_t1_ret = round(t1_r * risk_p, 1)
                             executed_trades.append(t1_r)
                 else:
                     # Day 1 Close Entry
                     if use_pyramid and use_ml_climax and use_ml_stop:
                         col = "t1_climax_dyn_pyramid_r"
+                        base_col = "t1_dyn_pyramid_r"
                     elif use_pyramid and use_ml_climax:
                         col = "t1_climax_pyramid_r"
+                        base_col = "t1_pyramid_r"
                     elif use_pyramid and use_ml_stop:
                         col = "t1_dyn_pyramid_r"
+                        base_col = "t1_dyn_pyramid_r"
                     elif use_pyramid:
                         col = "t1_pyramid_r"
+                        base_col = "t1_pyramid_r"
                     elif use_ml_climax and use_ml_stop:
                         col = "t1_climax_dyn_r"
+                        base_col = "t1_dyn_r"
                     elif use_ml_climax:
                         col = "t1_climax_r"
+                        base_col = "t1_real_r"
                     elif use_ml_stop:
                         col = "t1_dyn_r"
+                        base_col = "t1_dyn_r"
                     else:
                         col = "t1_real_r"
+                        base_col = "t1_real_r"
+
                     t1_r = float(r_ev.get(col, r_ev.get("t1_real_r", 0.0)))
+                    if use_ml_climax and (climax_partial_pct != 0.50 or climax_r_hurdle != 3.0):
+                        base_r = float(r_ev.get(base_col, r_ev.get("t1_real_r", 0.0)))
+                        if bool(r_ev.get("t1_climax_triggered", False)):
+                            max_g = float(r_ev.get("max_gain", 0.0))
+                            risk_p = float(r_ev.get("risk_pct", 10.0))
+                            approx_max_r = max_g / risk_p if risk_p > 0 else 0.0
+                            if approx_max_r >= climax_r_hurdle:
+                                t1_r = base_r + 2.0 * climax_partial_pct * (t1_r - base_r)
+                            else:
+                                t1_r = base_r
+                    ev_t1_r = t1_r
+                    risk_p = float(r_ev.get("risk_pct", 10.0)) if pd.notna(r_ev.get("risk_pct")) else 10.0
+                    if risk_p <= 0:
+                        risk_p = 10.0
+                    if "t1_real_ret" in r_ev and pd.notna(r_ev.get("t1_real_ret")) and col == "t1_real_r":
+                        ev_t1_ret = float(r_ev["t1_real_ret"])
+                    else:
+                        ev_t1_ret = round(t1_r * risk_p, 1)
                     executed_trades.append(t1_r)
 
+            ev_extra_r = 0.0
+            ev_extra_ret = 0.0
             if use_multileg and r_ev.get("t2_has_reentry", False):
                 t2_val = float(r_ev.get("t2_real_r", 0.0))
                 t2_track = str(r_ev.get("t2_track", ""))
@@ -2359,8 +4145,12 @@ def api_events():
                     # HTF Continuation is high-conviction flag breakout; Base Ribbon requires >= 0.35 probability
                     if t2_track in ["htf_continuation", "track_a_htf"] or (pd.notna(t2_prob) and t2_prob >= 0.35):
                         executed_trades.append(t2_val)
+                        ev_extra_r += t2_val
+                        ev_extra_ret += round(t2_val * 10.0, 1)
                 else:
                     executed_trades.append(t2_val)
+                    ev_extra_r += t2_val
+                    ev_extra_ret += round(t2_val * 10.0, 1)
 
             if use_multileg and r_ev.get("t3_has_reentry", False):
                 t3_val = float(r_ev.get("t3_real_r", 0.0))
@@ -2368,8 +4158,19 @@ def api_events():
                     t3_prob = r_ev.get("t3_prob_reentry", 0.5)
                     if pd.notna(t3_prob) and t3_prob >= 0.35:
                         executed_trades.append(t3_val)
+                        ev_extra_r += t3_val
+                        ev_extra_ret += round(t3_val * 10.0, 1)
                 else:
                     executed_trades.append(t3_val)
+                    ev_extra_r += t3_val
+                    ev_extra_ret += round(t3_val * 10.0, 1)
+
+            strat_r_list.append(round(ev_t1_r + ev_extra_r, 2))
+            strat_ret_list.append(round(ev_t1_ret + ev_extra_ret, 1))
+
+        q = q.copy()
+        q["strat_r"] = strat_r_list
+        q["strat_ret"] = strat_ret_list
 
         trade_arr = np.array(executed_trades) if len(executed_trades) > 0 else np.array([0.0])
         wins = trade_arr[trade_arr > 0]
@@ -2416,6 +4217,9 @@ def api_events():
             "mean_180d": round(mean_180d, 1),
         }
     else:
+        q = q.copy()
+        q["strat_r"] = []
+        q["strat_ret"] = []
         kpis = {
             "count": 0, "strat_count": 0, "strat_ev": 0.0, "strat_pnl": 0.0, "strat_pnl_comp": 0.0,
             "strat_winrate": 0.0, "strat_avg_win": 0.0, "strat_avg_loss": 0.0, "strat_max_dd": 0.0, "strat_pf": 0.0,
@@ -2446,7 +4250,9 @@ def compute_dossier(sym: str, date_str: str, d: pd.DataFrame, pos: int, ev_row: 
                     use_ml_stop: bool = True, use_multileg: bool = True, use_multileg_ml: bool = True,
                     use_trade1: bool = True, ribbon_spans=(8, 12, 16, 21),
                     use_dynamic_trailer: bool | None = None, use_climax_exit: bool | None = None,
-                    use_ml_targets: bool = True):
+                    use_ml_targets: bool = True,
+                    climax_partial_pct: float = 0.50,
+                    climax_r_hurdle: float = 3.0):
     if use_dynamic_trailer is not None:
         use_ml_stop = bool(use_dynamic_trailer)
         use_dynamic_trailer = bool(use_dynamic_trailer)
@@ -2577,16 +4383,37 @@ def compute_dossier(sym: str, date_str: str, d: pd.DataFrame, pos: int, ev_row: 
     seen_bull = False
     pyramid_added = False
     t1_skipped = False
+    breakout_bar = None
     climax_triggered = False
     climax_exit_date = None
     climax_exit_price = None
     climax_r = 0.0
     trailer_active = False
     trailer_stop = d1_low
+    trailer_buf_pct = 16.8
     final_trade_r = 0.0
     final_trade_ret = 0.0
     seen_above_sma50 = False
     from ep_ml_engine import engine
+
+    if use_ml_stop:
+        if ev_row and pd.notna(ev_row.get("dynamic_stop_loss_pct")):
+            p_val = abs(float(ev_row["dynamic_stop_loss_pct"])) * 100.0
+            if 2.0 <= p_val <= 40.0:
+                trailer_buf_pct = p_val
+        else:
+            try:
+                t_feat = engine.compute_rolling_features(sym, pos, min(len(d) - 1, pos + 5), df=d)
+                if t_feat:
+                    p_buf = float(engine.predict_dynamic_trailer(t_feat))
+                    if p_buf < 0:
+                        p_buf = abs(p_buf)
+                    if 0 < p_buf <= 0.50:
+                        p_buf = p_buf * 100.0
+                    if 2.0 <= p_buf <= 40.0:
+                        trailer_buf_pct = p_buf
+            except Exception:
+                pass
 
     if not use_trade1:
         t1_skipped = True
@@ -2643,12 +4470,17 @@ def compute_dossier(sym: str, date_str: str, d: pd.DataFrame, pos: int, ev_row: 
                     pyramid_added = True
                 dyn_stop_pct = preds.get("dynamic_stop_loss_pct", None)
                 if use_ml_stop and dyn_stop_pct is not None and not np.isnan(dyn_stop_pct):
-                    cand_stop = t1_entry_price * (1.0 + dyn_stop_pct)
-                    t1_stop_price = max(cand_stop, d1_low)
+                    buf = abs(float(dyn_stop_pct))
+                    if buf > 1.0:
+                        buf = buf / 100.0
+                    cand_stop = t1_entry_price * (1.0 - buf)
+                    t1_stop_price = max(shelf_low, min(cand_stop, t1_entry_price * 0.99))
             except Exception:
                 pass
 
             t1_risk_pct = (t1_entry_price - t1_stop_price) / t1_entry_price * 100.0 if t1_entry_price > 0 else 10.0
+            if t1_risk_pct <= 0.0:
+                t1_risk_pct = 1.0
             t1_peak = t1_entry_price
             trailer_stop = t1_stop_price
 
@@ -2672,10 +4504,10 @@ def compute_dossier(sym: str, date_str: str, d: pd.DataFrame, pos: int, ev_row: 
                     risk_pts = t1_entry_price - t1_stop_price
                     unrealized_r = (t1_peak - t1_entry_price) / risk_pts if risk_pts > 0 else 0.0
 
-                    # Dynamic Trailer check (hurdle >= 3.0R)
-                    if use_ml_stop and unrealized_r >= 3.0 and b >= breakout_bar + 2:
+                    # Dynamic Trailer check (hurdle >= climax_r_hurdle)
+                    if use_ml_stop and unrealized_r >= climax_r_hurdle and b >= breakout_bar + 2:
                         trailer_active = True
-                        trail_from_peak = t1_peak * (1.0 - 0.168)
+                        trail_from_peak = t1_peak * (1.0 - trailer_buf_pct / 100.0)
                         e20 = float(fwd["ema20"].iloc[b]) if "ema20" in fwd.columns else c
                         support_floor = e20 * 0.97
                         cand_stop = min(trail_from_peak, support_floor)
@@ -2690,13 +4522,13 @@ def compute_dossier(sym: str, date_str: str, d: pd.DataFrame, pos: int, ev_row: 
                         break
 
                     # Climax Partial Profit check
-                    if use_ml_climax and not climax_triggered and unrealized_r >= 3.0:
+                    if use_ml_climax and not climax_triggered and unrealized_r >= climax_r_hurdle:
                         e20 = float(fwd["ema20"].iloc[b]) if "ema20" in fwd.columns else c
                         if (c - e20) / e20 >= 0.20 and (t1_peak - c) / t1_peak <= 0.035:
                             climax_triggered = True
                             climax_exit_price = c
                             climax_exit_date = fwd.index[b].strftime("%Y-%m-%d")
-                            climax_r = ((climax_exit_price / t1_entry_price - 1.0) * 100.0) / t1_risk_pct
+                            climax_r = ((climax_exit_price / t1_entry_price - 1.0) * 100.0) / t1_risk_pct if t1_risk_pct > 0 else 0.0
 
                     if l <= t1_stop_price:
                         t1_stopped = True
@@ -2725,8 +4557,8 @@ def compute_dossier(sym: str, date_str: str, d: pd.DataFrame, pos: int, ev_row: 
 
             if climax_triggered:
                 climax_ret = (climax_exit_price / t1_entry_price - 1.0) * 100.0
-                final_trade_r = 0.50 * climax_r + 0.50 * t1_r
-                final_trade_ret = 0.50 * climax_ret + 0.50 * t1_ret
+                final_trade_r = climax_partial_pct * climax_r + (1.0 - climax_partial_pct) * t1_r
+                final_trade_ret = climax_partial_pct * climax_ret + (1.0 - climax_partial_pct) * t1_ret
             else:
                 final_trade_r = t1_r
                 final_trade_ret = t1_ret
@@ -2756,10 +4588,10 @@ def compute_dossier(sym: str, date_str: str, d: pd.DataFrame, pos: int, ev_row: 
             risk_pts = d1_close - d1_low
             unrealized_r = (t1_peak - d1_close) / risk_pts if risk_pts > 0 else 0.0
 
-            # Dynamic Trailer check (hurdle >= 3.0R)
-            if use_ml_stop and unrealized_r >= 3.0 and b >= 3:
+            # Dynamic Trailer check (hurdle >= climax_r_hurdle)
+            if use_ml_stop and unrealized_r >= climax_r_hurdle and b >= 3:
                 trailer_active = True
-                trail_from_peak = t1_peak * (1.0 - 0.168)
+                trail_from_peak = t1_peak * (1.0 - trailer_buf_pct / 100.0)
                 e20 = float(fwd["ema20"].iloc[b]) if "ema20" in fwd.columns else c
                 support_floor = e20 * 0.97
                 cand_stop = min(trail_from_peak, support_floor)
@@ -2775,7 +4607,7 @@ def compute_dossier(sym: str, date_str: str, d: pd.DataFrame, pos: int, ev_row: 
                 break
 
             # Climax Partial Profit check
-            if use_ml_climax and not climax_triggered and unrealized_r >= 3.0:
+            if use_ml_climax and not climax_triggered and unrealized_r >= climax_r_hurdle:
                 e20 = float(fwd["ema20"].iloc[b]) if "ema20" in fwd.columns else c
                 if (c - e20) / e20 >= 0.20 and (t1_peak - c) / t1_peak <= 0.035:
                     climax_triggered = True
@@ -2820,8 +4652,8 @@ def compute_dossier(sym: str, date_str: str, d: pd.DataFrame, pos: int, ev_row: 
 
         if climax_triggered:
             climax_ret = (climax_exit_price / d1_close - 1.0) * 100.0
-            final_trade_r = 0.50 * climax_r + 0.50 * t1_r
-            final_trade_ret = 0.50 * climax_ret + 0.50 * t1_ret
+            final_trade_r = climax_partial_pct * climax_r + (1.0 - climax_partial_pct) * t1_r
+            final_trade_ret = climax_partial_pct * climax_ret + (1.0 - climax_partial_pct) * t1_ret
         else:
             final_trade_r = t1_r
             final_trade_ret = t1_ret
@@ -2842,8 +4674,18 @@ def compute_dossier(sym: str, date_str: str, d: pd.DataFrame, pos: int, ev_row: 
             held_cnt = (valid_sma["close"] >= valid_sma["sma50"]).sum()
             sma50_adh = round(float(held_cnt) / len(valid_sma) * 100.0, 1)
 
+    t1_entry_date = None
+    if t1_mode == "delayed":
+        if breakout_bar is not None and breakout_bar < len(fwd):
+            t1_entry_date = fwd.index[breakout_bar].strftime("%Y-%m-%d")
+    else:
+        if len(fwd) > 0:
+            t1_entry_date = fwd.index[0].strftime("%Y-%m-%d")
+
     trade_1 = {
         "skipped": bool(t1_skipped),
+        "entry_mode": str(t1_mode),
+        "entry_date": t1_entry_date,
         "entry_price": round(t1_entry_price, 2),
         "stop_price": round(t1_stop_price, 2),
         "risk_pct": round(t1_risk_pct, 1),
@@ -2861,8 +4703,11 @@ def compute_dossier(sym: str, date_str: str, d: pd.DataFrame, pos: int, ev_row: 
         "climax_exit_date": climax_exit_date,
         "climax_exit_price": round(climax_exit_price, 2) if climax_exit_price else None,
         "climax_partial_r": round(climax_r, 2) if climax_triggered else None,
+        "climax_partial_pct": round(climax_partial_pct * 100.0, 1),
+        "climax_r_hurdle": round(climax_r_hurdle, 1),
         "dynamic_trailer_active": bool(trailer_active),
         "dynamic_trailer_stop": round(trailer_stop, 2) if trailer_active else None,
+        "dynamic_trailer_pct": round(trailer_buf_pct, 1),
         "sma50_adherence_pct": sma50_adh,
         "pyramid_added": bool(pyramid_added),
         "pyramid_note": "AI Pyramid (+50% size on Day 5 V2 Conviction)" if pyramid_added else None
@@ -2918,10 +4763,12 @@ def compute_dossier(sym: str, date_str: str, d: pd.DataFrame, pos: int, ev_row: 
                     if 1.0 <= t2_risk_pct <= 35.0:
                         t2_stopped = False
                         t2_exit_price = None
-    
+                        dyn_active = False
+                        dyn_trail = ur_stop
+
                         ur_feats = engine.compute_ur_reentry_features(sym, pos, pos + t1_exit_bar, pos + ur_signal_bar, ur_stop, ribbon_spans=ribbon_spans, df=d)
                         ur_pred = engine.predict_ur_reentry(ur_feats) if ur_feats else {"prob_win": 0.5, "is_qualified": True}
-    
+
                         # Zero-lookahead Day 1 check on entry bar
                         day1_low = float(fwd["low"].iloc[entry_bar])
                         day1_open = float(fwd["open"].iloc[entry_bar])
@@ -2933,8 +4780,6 @@ def compute_dossier(sym: str, date_str: str, d: pd.DataFrame, pos: int, ev_row: 
                         else:
                             t2_peak_hold = t2_entry
                             risk_pts = t2_entry - ur_stop
-                            dyn_trail = ur_stop
-                            dyn_active = False
     
                             for b in range(entry_bar + 1, len(fwd)):
                                 c = float(fwd["close"].iloc[b])
@@ -3085,7 +4930,9 @@ def compute_dossier(sym: str, date_str: str, d: pd.DataFrame, pos: int, ev_row: 
                             if 1.0 <= t2_risk_pct <= 35.0:
                                 t2_stopped = False
                                 t2_exit_price = None
-    
+                                dyn_active = False
+                                dyn_trail = t2_stop
+
                                 # Zero-lookahead Day 1 check on entry bar itself
                                 day1_low = float(fwd["low"].iloc[entry_bar])
                                 day1_open = float(fwd["open"].iloc[entry_bar])
@@ -3097,8 +4944,6 @@ def compute_dossier(sym: str, date_str: str, d: pd.DataFrame, pos: int, ev_row: 
                                 else:
                                     t2_peak_hold = t2_entry
                                     risk_pts = t2_entry - t2_stop
-                                    dyn_trail = t2_stop
-                                    dyn_active = False
     
                                     for b in range(entry_bar + 1, len(fwd)):
                                         c = float(fwd["close"].iloc[b])
@@ -3236,7 +5081,9 @@ def compute_dossier(sym: str, date_str: str, d: pd.DataFrame, pos: int, ev_row: 
                             t3_risk_pct = (t3_entry - swing5_3) / t3_entry * 100.0
                             if 1.0 <= t3_risk_pct <= 35.0:
                                 t3_stopped = False; t3_exit_bar = None; t3_exit_price = None
-    
+                                dyn_active_3 = False
+                                dyn_trail_3 = swing5_3
+
                                 day1_low_3 = float(fwd["low"].iloc[entry_bar_3])
                                 day1_open_3 = float(fwd["open"].iloc[entry_bar_3])
                                 if day1_low_3 <= swing5_3:
@@ -3247,8 +5094,6 @@ def compute_dossier(sym: str, date_str: str, d: pd.DataFrame, pos: int, ev_row: 
                                 else:
                                     t3_peak_hold = t3_entry
                                     risk3_pts = t3_entry - swing5_3
-                                    dyn_trail_3 = swing5_3
-                                    dyn_active_3 = False
     
                                     for b in range(entry_bar_3 + 1, len(fwd)):
                                         c = float(fwd["close"].iloc[b])
@@ -3318,6 +5163,24 @@ def compute_dossier(sym: str, date_str: str, d: pd.DataFrame, pos: int, ev_row: 
         ai_scores["ml_200"] = float(ev_row.get("ml_200", 0)) if pd.notna(ev_row.get("ml_200")) else None
         ai_scores["is_toxic"] = bool(ev_row.get("is_toxic", False))
         ai_scores["dynamic_stop_loss_pct"] = float(ev_row.get("dynamic_stop_loss_pct", 0.0)) if pd.notna(ev_row.get("dynamic_stop_loss_pct")) else None
+        ai_scores["forward_mfe_20d"] = float(ev_row.get("forward_mfe_20d", 0.0)) if pd.notna(ev_row.get("forward_mfe_20d")) else None
+        ai_scores["forward_mae_20d"] = float(ev_row.get("forward_mae_20d", 0.0)) if pd.notna(ev_row.get("forward_mae_20d")) else None
+        ai_scores["prob_mfe_first"] = float(ev_row.get("prob_mfe_first", 0.0)) if pd.notna(ev_row.get("prob_mfe_first")) else None
+        ai_scores["prob_barrier_2r"] = float(ev_row.get("prob_barrier_2r", 0.0)) if pd.notna(ev_row.get("prob_barrier_2r")) else None
+
+    if ai_scores.get("forward_mfe_20d") is None or ai_scores.get("prob_mfe_first") is None or ai_scores.get("prob_barrier_2r") is None:
+        try:
+            from ep_ml_engine import engine
+            t_offset = min(pos + 5, len(d) - 1)
+            feats = engine.compute_rolling_features(sym, pos, t_offset, df=d, allow_stopped=True)
+            if feats:
+                exc = engine.predict_forward_excursion(feats)
+                ai_scores["forward_mfe_20d"] = exc.get("pred_mfe_20d")
+                ai_scores["forward_mae_20d"] = exc.get("pred_mae_20d")
+                ai_scores["prob_mfe_first"] = exc.get("prob_mfe_first")
+                ai_scores["prob_barrier_2r"] = exc.get("prob_barrier_2r")
+        except Exception:
+            pass
 
     return {
         "ai_scores": ai_scores,
@@ -3391,10 +5254,161 @@ def api_ml_rolling():
     if bars is None or event_date not in bars.index: return jsonify({"error": "No bars"})
     d1_idx = bars.index.get_loc(event_date)
     t_idx = d1_idx + days_forward
-    features = engine.compute_rolling_features(sym, d1_idx, t_idx)
-    if not features: return jsonify({"stopped_out": True})
+    features = engine.compute_rolling_features(sym, d1_idx, t_idx, df=bars, allow_stopped=True)
+    if not features: return jsonify({"error": "Out of range"})
     probs = engine.predict_rolling(features)
-    return jsonify({"probs": probs})
+    is_stopped = bool(features.get("is_stopped_out", False))
+    return jsonify({"probs": probs, "is_stopped": is_stopped})
+
+def compute_daily_exhaustion(d: pd.DataFrame, pos: int, max_bars: int = 120) -> dict:
+    from ep_ml_engine import engine
+    if not hasattr(engine, 'exhaustion_classifier') or not engine.exhaustion_classifier:
+        return {}
+    try:
+        scaler_cols = list(engine.exhaustion_classifier.named_steps["scaler"].feature_names_in_)
+        d1_idx = pos
+        d1_close = float(d["close"].iloc[d1_idx])
+        d1_low = float(d["low"].iloc[d1_idx])
+        risk1_pts = max(d1_close * 0.05, d1_close - d1_low)
+        adr_val = float(d["adr_pts"].iloc[d1_idx]) if "adr_pts" in d.columns and pd.notna(d["adr_pts"].iloc[d1_idx]) else (d1_close * 0.05)
+        if adr_val <= 0: adr_val = d1_close * 0.05
+
+        import trendlab
+        records = []
+        dates = []
+        last_tl_data = (0.0, 0.0, 2.0, 1.0)
+        n_bars = min(max_bars, len(d) - pos)
+
+        stopped_flags = []
+        for i in range(n_bars):
+            t_idx = pos + i
+            t_close = float(d["close"].iloc[t_idx])
+            t_date = str(d.index[t_idx].date())
+            dates.append(t_date)
+
+            is_stopped = bool(d["low"].iloc[d1_idx:t_idx+1].min() < d1_low)
+            stopped_flags.append(is_stopped)
+
+            days_since_ep = i
+            ret_since_ep = (t_close - d1_close) / d1_close
+            peak_so_far = float(d["high"].iloc[d1_idx:t_idx+1].max())
+            unrealized_r = (peak_so_far - d1_close) / risk1_pts
+            gain_adr = (peak_so_far - d1_close) / adr_val
+            drawdown_from_peak = (t_close - peak_so_far) / peak_so_far * 100.0 if peak_so_far > 0 else 0.0
+
+            ema10_t = float(d["ema10"].iloc[t_idx]) if "ema10" in d.columns else t_close
+            ema20_t = float(d["ema20"].iloc[t_idx]) if "ema20" in d.columns else t_close
+            sma50_t = float(d["sma50"].iloc[t_idx]) if "sma50" in d.columns else t_close
+            dist_10ema = (t_close - ema10_t) / ema10_t if ema10_t > 0 else 0.0
+            dist_20ema = (t_close - ema20_t) / ema20_t if ema20_t > 0 else 0.0
+            dist_50sma = (t_close - sma50_t) / sma50_t if sma50_t > 0 else 0.0
+            rvol_t = float(d["rvol"].iloc[t_idx]) if "rvol" in d.columns else 1.0
+
+            if i % 3 == 0 or i == 0:
+                lookback = d.iloc[max(0, t_idx-250):t_idx+1]
+                r = trendlab._compute(lookback)
+                pidx = r["pidx"]
+                pconf = r["pconf"]
+                pprice = r["pprice"]
+                ptype = r["ptype"]
+                v_mask = [k for k in range(len(pidx)) if pconf[k] <= len(lookback) - 1]
+                v_pidx = [pidx[k] for k in v_mask]
+                v_pprice = [pprice[k] for k in v_mask]
+                v_ptype = [ptype[k] for k in v_mask]
+
+                last_swing_retrace = 0.0
+                mean_swing_retrace = 0.0
+                up_vol = 0.0
+                dn_vol = 0.0
+                rvol_at_pivot_high = rvol_t
+                if len(v_pidx) >= 2:
+                    retrace_vals = []
+                    for k in range(1, len(v_pidx)):
+                        p_start = v_pidx[k - 1]
+                        p_end = v_pidx[k]
+                        leg_v = float(lookback["volume"].iloc[p_start:p_end + 1].sum())
+                        if v_ptype[k] == trendlab.PIVOT_HIGH:
+                            up_vol += leg_v
+                        else:
+                            dn_vol += leg_v
+                            h_px = v_pprice[k - 1]
+                            l_px = v_pprice[k]
+                            if k >= 2:
+                                prev_l_px = v_pprice[k - 2]
+                                if h_px > prev_l_px:
+                                    retrace_vals.append((h_px - l_px) / (h_px - prev_l_px))
+                    if retrace_vals:
+                        last_swing_retrace = float(retrace_vals[-1])
+                        mean_swing_retrace = float(np.mean(retrace_vals))
+                swing_vol_ratio = (up_vol / (dn_vol + 1.0)) if dn_vol > 0 else 2.0
+                last_tl_data = (last_swing_retrace, mean_swing_retrace, swing_vol_ratio, rvol_at_pivot_high)
+            else:
+                last_swing_retrace, mean_swing_retrace, swing_vol_ratio, rvol_at_pivot_high = last_tl_data
+
+            sub_df = d.iloc[max(0, t_idx-10):t_idx+1]
+            sub_c = sub_df["close"].to_numpy(dtype=float)
+            sub_o = sub_df["open"].to_numpy(dtype=float)
+            sub_e10 = sub_df["ema10"].to_numpy(dtype=float) if "ema10" in sub_df.columns else sub_c
+
+            consecutive_gaps = 0
+            for j in range(len(sub_c)-1, 0, -1):
+                if sub_o[j] > sub_c[j-1]: consecutive_gaps += 1
+                else: break
+
+            gap_count_5d = 0
+            if len(sub_c) >= 6:
+                for j in range(len(sub_c)-5, len(sub_c)):
+                    if sub_o[j] > sub_c[j-1]: gap_count_5d += 1
+
+            parabolic_bars = int(np.sum(sub_c > sub_e10))
+            thrust_accel = float((sub_c[-1] - sub_c[0]) / sub_c[0]) if len(sub_c) > 0 and sub_c[0] > 0 else 0.0
+
+            records.append({
+                "feature_days_since_ep": days_since_ep,
+                "feature_ret_since_ep": ret_since_ep,
+                "feature_unrealized_r": unrealized_r,
+                "feature_gain_adr": gain_adr,
+                "feature_drawdown_from_peak": drawdown_from_peak,
+                "feature_dist_10ema": dist_10ema,
+                "feature_dist_20ema": dist_20ema,
+                "feature_dist_50sma": dist_50sma,
+                "feature_rvol": rvol_t,
+                "feature_rvol_pivot_high": rvol_at_pivot_high,
+                "feature_last_swing_retrace": last_swing_retrace,
+                "feature_mean_swing_retrace": mean_swing_retrace,
+                "feature_swing_vol_ratio": swing_vol_ratio,
+                "feature_parabolic_bars": parabolic_bars,
+                "feature_thrust_accel": thrust_accel,
+                "feature_consecutive_gaps": consecutive_gaps,
+                "feature_gap_count_5d": gap_count_5d,
+                "feature_gap_pct": float(d["gap_pct"].iloc[d1_idx]) if "gap_pct" in d.columns else 0.0,
+                "feature_close_pos": float(d["close_pos"].iloc[d1_idx]) if "close_pos" in d.columns else 0.5,
+                "feature_is_novel_vol_9m": 1,
+                "feature_is_blue_sky": 1,
+                "feature_dist_to_overhead_pct": 1.0
+            })
+
+        if records:
+            df_batch = pd.DataFrame(records).reindex(columns=scaler_cols, fill_value=0.0)
+            probs = engine.exhaustion_classifier.predict_proba(df_batch)[:, 1]
+        else:
+            probs = []
+
+        result_map = {}
+        for idx in range(len(records)):
+            d_str = dates[idx]
+            p = float(probs[idx])
+            lvl = "Low" if p < 0.20 else ("Elevated" if p < 0.35 else ("High" if p < 0.50 else "🚨 Climax"))
+            result_map[d_str] = {
+                "prob": round(p, 3),
+                "pct": round(p * 100.0, 1),
+                "level": lvl,
+                "is_stopped": stopped_flags[idx],
+            }
+
+        return result_map
+    except Exception as e:
+        return {}
 
 @app.route("/api/chart")
 
@@ -3423,25 +5437,83 @@ def api_chart():
     else:
         pos = d.index.get_loc(ts)
 
-    lo = max(0, pos - 40)
-    hi = len(d)  # Load all historical bars up to present day so user can scroll right
-    sub = d.iloc[lo:hi]
+    try:
+        larsson_fastest = int(request.args.get("larsson_fastest", "8"))
+    except (ValueError, TypeError):
+        larsson_fastest = 8
+    larsson_fastest = max(2, min(100, larsson_fastest))
 
+    if larsson_fastest == 32:
+        larsson_spans = (32, 35, 50, 58)
+    elif larsson_fastest <= 20:
+        s1 = larsson_fastest
+        s2 = int(round(larsson_fastest * 1.5))
+        s3 = int(round(larsson_fastest * 2.0))
+        s4 = int(round(larsson_fastest * 2.625))
+        larsson_spans = (s1, s2, s3, s4)
+    else:
+        s1 = larsson_fastest
+        s2 = int(round(larsson_fastest * 35.0 / 32.0))
+        s3 = int(round(larsson_fastest * 50.0 / 32.0))
+        s4 = int(round(larsson_fastest * 58.0 / 32.0))
+        larsson_spans = (s1, s2, s3, s4)
+
+    s1, s2, s3, s4 = larsson_spans
+    e1 = scanner_core._pine_ema(d['close'], s1)
+    e2 = scanner_core._pine_ema(d['close'], s2)
+    e3 = scanner_core._pine_ema(d['close'], s3)
+    e4 = scanner_core._pine_ema(d['close'], s4)
+    ema10_s = scanner_core._pine_ema(d['close'], 10)
+
+    bullish = (e1 >= e2) & (e2 >= e3) & (e3 >= e4)
+    bearish = (e1 < e2) & (e2 < e3) & (e3 < e4)
+    valid_l = e1.notna() & e2.notna() & e3.notna() & e4.notna()
+
+    l_state = pd.Series('gray', index=d.index)
+    l_state[valid_l & bullish] = 'yellow'
+    l_state[valid_l & bearish] = 'blue'
+
+    sub = d  # Load all historical bars from inception so user has full history
+    vol_sma20 = d["volume"].rolling(20).mean()
+    adr_pts_14 = (d["high"] - d["low"]).rolling(14).mean()
+    adr_pct_14 = ((d["high"] / d["low"] - 1.0).rolling(14).mean() * 100.0)
     bars = []
     volume = []
+    vol_ma20 = []
+    ema10 = []
     ema20 = []
     sma50 = []
+    larsson = []
+    adr14_map = {}
 
-    for idx, r in sub.iterrows():
+    for i, (idx, r) in enumerate(sub.iterrows()):
         t = idx.strftime("%Y-%m-%d")
         o, h, l, c = float(r["open"]), float(r["high"]), float(r["low"]), float(r["close"])
         v = float(r["volume"]) if pd.notna(r["volume"]) else 0
         bars.append({"time": t, "open": o, "high": h, "low": l, "close": c})
-        volume.append({"time": t, "value": v, "color": "rgba(16,185,129,0.3)" if c >= o else "rgba(239,68,68,0.3)"})
+        if pd.notna(adr_pts_14.iloc[i]):
+            adr14_map[t] = {
+                "pts": round(float(adr_pts_14.iloc[i]), 2),
+                "pct": round(float(adr_pct_14.iloc[i]), 2)
+            }
+        volume.append({"time": t, "value": v, "color": "rgba(16,185,129,0.55)" if c >= o else "rgba(239,68,68,0.55)"})
+        if pd.notna(vol_sma20.iloc[i]):
+            vol_ma20.append({"time": t, "value": round(float(vol_sma20.iloc[i]), 0)})
         if "ema20" in r and pd.notna(r["ema20"]):
             ema20.append({"time": t, "value": round(float(r["ema20"]), 2)})
         if "sma50" in r and pd.notna(r["sma50"]):
             sma50.append({"time": t, "value": round(float(r["sma50"]), 2)})
+        if pd.notna(ema10_s.iloc[i]):
+            ema10.append({"time": t, "value": round(float(ema10_s.iloc[i]), 2)})
+        f_val = round(float(e1.iloc[i]), 2) if pd.notna(e1.iloc[i]) else None
+        s_val = round(float(e4.iloc[i]), 2) if pd.notna(e4.iloc[i]) else None
+        larsson.append({
+            "time": t,
+            "fast": f_val,
+            "slow": s_val,
+            "value": f_val,
+            "state": str(l_state.iloc[i])
+        })
 
     ev_row_bar = d.iloc[pos]
     level = round(float(ev_row_bar["low"]), 2)
@@ -3455,18 +5527,108 @@ def api_chart():
         if not matches.empty:
             ev_row_dict = matches.iloc[0].to_dict()
 
-        # Extract all historical valid EP events for this ticker across history
+        # Extract all historical valid EP events for this ticker across history (unfiltered)
+        def _calc_disqualifications(h_row):
+            reasons = []
+            g = round(float(h_row.get("gap_pct", 0.0)), 1)
+            rv = round(float(h_row.get("rvol", 0.0)), 1)
+            cp = round(float(h_row.get("close_pos", 0.0)), 2)
+            v48 = bool(h_row.get("violated_48h", False))
+            pg = bool(h_row.get("prev_day_gap_up", False))
+            pg_pct = round(float(h_row.get("prev_day_gap_pct", 0.0)), 1) if pd.notna(h_row.get("prev_day_gap_pct")) else 0.0
+            ml = round(float(h_row.get("ml_50", 0.0)), 3) if pd.notna(h_row.get("ml_50")) else None
+            st = str(h_row.get("subtype", "ep"))
+
+            if v48:
+                reasons.append("Violated 48H Gate")
+            if g < 8.0 and st != "dre":
+                reasons.append(f"Sub-8% Gap (+{g:.1f}%)")
+            if rv < 2.0:
+                reasons.append(f"Low RVOL ({rv:.1f}x)")
+            if cp < 0.65 and st != "dre":
+                reasons.append(f"Weak Close Pos ({cp:.2f})")
+            if pg:
+                reasons.append(f"Prior Day Gap Up (+{pg_pct:.1f}%)")
+            if ml is not None and ml < 0.20:
+                reasons.append(f"Low V2 Conviction ({ml*100:.0f}%)")
+            if st not in ("classic", "dre", "ep9m", "bigmove"):
+                reasons.append(f"Subtype: {st}")
+            return reasons
+
+        all_ticker_events = []
+        for _, h_row in df[df["symbol"] == sym].sort_values("date", ascending=False).iterrows():
+            disquals = _calc_disqualifications(h_row)
+            all_ticker_events.append({
+                "date": str(h_row["date"]),
+                "subtype": str(h_row.get("subtype", "ep")),
+                "gap_pct": round(float(h_row.get("gap_pct", 0.0)), 1),
+                "rvol": round(float(h_row.get("rvol", 0.0)), 1),
+                "close_pos": round(float(h_row.get("close_pos", 0.0)), 2),
+                "max_gain": round(float(h_row.get("max_gain", 0.0)), 1) if pd.notna(h_row.get("max_gain")) else None,
+                "ret_20d": round(float(h_row.get("ret_20d", 0.0)), 1) if pd.notna(h_row.get("ret_20d")) else 0.0,
+                "outcome": str(h_row.get("outcome", "")),
+                "violated_48h": bool(h_row.get("violated_48h", False)),
+                "prev_day_gap_up": bool(h_row.get("prev_day_gap_up", False)),
+                "ml_50": round(float(h_row.get("ml_50", 0.0)), 3) if pd.notna(h_row.get("ml_50")) else None,
+                "is_qualified": (len(disquals) == 0),
+                "disqualifications": disquals,
+                "primary_reason": disquals[0] if disquals else None
+            })
+
+        # Extract historical valid EP events for this ticker across history, respecting active filters
         t_matches = df[df["symbol"] == sym].sort_values("date", ascending=False)
+        v2_filter = request.args.get("v2", "")
+        if v2_filter == "20":
+            t_matches = t_matches[t_matches["ml_50"] >= 0.20]
+        elif v2_filter == "30":
+            t_matches = t_matches[t_matches["ml_50"] >= 0.30]
+        elif v2_filter == "40":
+            t_matches = t_matches[t_matches["ml_50"] >= 0.40]
+        elif v2_filter == "50":
+            t_matches = t_matches[t_matches["ml_50"] >= 0.50]
+        elif v2_filter == "sub20":
+            t_matches = t_matches[t_matches["ml_50"] < 0.20]
+
+        prev_gap = request.args.get("prev_gap", "")
+        if prev_gap == "no_gap":
+            if "prev_day_gap_up" in t_matches.columns:
+                t_matches = t_matches[~t_matches["prev_day_gap_up"]]
+            elif "prev_day_gap_pct" in t_matches.columns:
+                t_matches = t_matches[t_matches["prev_day_gap_pct"] <= 0.0]
+        elif prev_gap == "gap_up":
+            if "prev_day_gap_up" in t_matches.columns:
+                t_matches = t_matches[t_matches["prev_day_gap_up"]]
+            elif "prev_day_gap_pct" in t_matches.columns:
+                t_matches = t_matches[t_matches["prev_day_gap_pct"] > 0.0]
+
+        recent_days = request.args.get("recent_days", "")
+        if recent_days:
+            try:
+                n_days = int(recent_days)
+                if n_days > 0 and not df.empty:
+                    anchor_dt = pd.to_datetime(df["date"].max())
+                    cutoff_dt = (anchor_dt - pd.Timedelta(days=n_days)).strftime("%Y-%m-%d")
+                    t_matches = t_matches[t_matches["date"] >= cutoff_dt]
+            except (ValueError, TypeError):
+                pass
+
         for _, h_row in t_matches.iterrows():
+            disquals = _calc_disqualifications(h_row)
             ticker_history.append({
                 "date": str(h_row["date"]),
                 "subtype": str(h_row.get("subtype", "ep")),
                 "gap_pct": round(float(h_row.get("gap_pct", 0.0)), 1),
                 "rvol": round(float(h_row.get("rvol", 0.0)), 1),
+                "close_pos": round(float(h_row.get("close_pos", 0.0)), 2),
                 "max_gain": round(float(h_row.get("max_gain", 0.0)), 1) if pd.notna(h_row.get("max_gain")) else None,
                 "ret_20d": round(float(h_row.get("ret_20d", 0.0)), 1) if pd.notna(h_row.get("ret_20d")) else 0.0,
                 "outcome": str(h_row.get("outcome", "")),
-                "violated_48h": bool(h_row.get("violated_48h", False))
+                "violated_48h": bool(h_row.get("violated_48h", False)),
+                "prev_day_gap_up": bool(h_row.get("prev_day_gap_up", False)),
+                "ml_50": round(float(h_row.get("ml_50", 0.0)), 3) if pd.notna(h_row.get("ml_50")) else None,
+                "is_qualified": (len(disquals) == 0),
+                "disqualifications": disquals,
+                "primary_reason": disquals[0] if disquals else None
             })
 
     def clean_json(obj):
@@ -3491,21 +5653,54 @@ def api_chart():
     use_ml_stop = request.args.get("use_ml_stop", "1") in ["1", "true", "True"]
     use_multileg = request.args.get("use_multileg", "1") in ["1", "true", "True"]
     use_multileg_ml = request.args.get("use_multileg_ml", "1") in ["1", "true", "True"]
+    try:
+        climax_partial_pct = float(request.args.get("climax_partial_pct", "0.50"))
+    except (ValueError, TypeError):
+        climax_partial_pct = 0.50
+    try:
+        climax_r_hurdle = float(request.args.get("climax_r_hurdle", "3.0"))
+    except (ValueError, TypeError):
+        climax_r_hurdle = 3.0
 
     use_dyn = request.args.get("dynamic_trailer", "0") in ["1", "true", "True"]
-    dossier = compute_dossier(sym, date_str, d, pos, ev_row_dict, t1_mode=t1_mode, use_pyramid=use_pyramid, use_ml_climax=use_ml_climax, use_ml_stop=use_ml_stop, use_multileg=use_multileg, use_multileg_ml=use_multileg_ml, use_trade1=use_trade1, ribbon_spans=(8, 12, 16, 21), use_dynamic_trailer=use_dyn)
+    dossier = compute_dossier(sym, date_str, d, pos, ev_row_dict, t1_mode=t1_mode, use_pyramid=use_pyramid, use_ml_climax=use_ml_climax, use_ml_stop=use_ml_stop, use_multileg=use_multileg, use_multileg_ml=use_multileg_ml, use_trade1=use_trade1, ribbon_spans=(8, 12, 16, 21), use_dynamic_trailer=use_dyn, climax_partial_pct=climax_partial_pct, climax_r_hurdle=climax_r_hurdle)
+
+    gap_val = round(float(ev_row_dict.get("gap_pct", 0.0) if ev_row_dict else ev_row_bar.get("gap_pct", 0.0)), 1)
+    rvol_val = round(float(ev_row_dict.get("rvol", 0.0) if ev_row_dict else ev_row_bar.get("rvol", 0.0)), 1)
+    ret_20d_val = round(float(ev_row_dict.get("ret_20d", 0.0)), 1) if (ev_row_dict and pd.notna(ev_row_dict.get("ret_20d"))) else 0.0
+    ret_60d_val = round(float(ev_row_dict.get("ret_60d", 0.0)), 1) if (ev_row_dict and pd.notna(ev_row_dict.get("ret_60d"))) else 0.0
+    max_gain_val = round(float(ev_row_dict.get("max_gain", 0.0)), 1) if (ev_row_dict and pd.notna(ev_row_dict.get("max_gain"))) else None
+    subtype_val = str(ev_row_dict.get("subtype", "ep")) if ev_row_dict else "ep"
 
     res = {
         "symbol": sym,
         "date": date_str,
+        "subtype": subtype_val,
+        "gap_pct": gap_val,
+        "rvol": rvol_val,
+        "ret_20d": ret_20d_val,
+        "ret_60d": ret_60d_val,
+        "max_gain": max_gain_val,
+        "forward_mfe_20d": dossier.get("ai_scores", {}).get("forward_mfe_20d"),
+        "forward_mae_20d": dossier.get("ai_scores", {}).get("forward_mae_20d"),
+        "prob_mfe_first": dossier.get("ai_scores", {}).get("prob_mfe_first"),
+        "prob_barrier_2r": dossier.get("ai_scores", {}).get("prob_barrier_2r"),
         "bars": bars,
         "volume": volume,
+        "vol_ma20": vol_ma20,
+        "ema10": ema10,
         "ema20": ema20,
         "sma50": sma50,
+        "larsson": larsson,
+        "larsson_spans": list(larsson_spans),
+        "event_index": pos,
         "level": level,
         "trigger": trigger,
         "dossier": dossier,
-        "ticker_history": ticker_history
+        "ticker_history": ticker_history,
+        "all_ticker_events": all_ticker_events,
+        "adr14": adr14_map,
+        "exhaustion": compute_daily_exhaustion(d, pos, max_bars=120)
     }
     return jsonify(clean_json(res))
 
@@ -3518,7 +5713,7 @@ def main():
     print("=======================================================")
     print(f"🚀 EP Review Server running at: http://127.0.0.1:{args.port}")
     print("=======================================================")
-    app.run(host="127.0.0.1", port=args.port, debug=False)
+    app.run(host="127.0.0.1", port=args.port, debug=False, threaded=True)
 
 if __name__ == "__main__":
     main()

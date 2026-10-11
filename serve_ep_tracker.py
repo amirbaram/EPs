@@ -2174,7 +2174,7 @@ Evaluate this morning's premarket candidate cohort, eliminate the 64.5% "Gap-and
 let currentView = 'all';
 let allEvents = [];
 let selectedEvent = null;
-let chart = null, candleSeries = null, volumeSeries = null, ema20Series = null;
+let chart = null, candleSeries = null, volumeSeries = null, volMa20Series = null, ema20Series = null;
 let activeLines = [];
 let emergingBoard = null;
 let currentDrawerTab = 'themes';
@@ -2421,10 +2421,18 @@ function initChart() {
     priceScaleId: 'volume',
     priceLineVisible: false
   });
+  volMa20Series = chart.addLineSeries({
+    priceFormat: { type: 'volume' },
+    priceScaleId: 'volume',
+    color: '#38bdf8',
+    lineWidth: 1.5,
+    title: 'Vol 20 MA',
+    priceLineVisible: false
+  });
   chart.priceScale('volume').applyOptions({
     scaleMargins: { top: 0.84, bottom: 0.0 }
   });
-  ema20Series = chart.addLineSeries({ color: '#38bdf8', lineWidth: 1.5, title: '20 EMA' });
+  ema20Series = chart.addLineSeries({ color: '#f59e0b', lineWidth: 1.5, title: '20 EMA' });
 
   const ro = new ResizeObserver(entries => {
     for (const entry of entries) {
@@ -2850,14 +2858,23 @@ function selectEvent(ev) {
   fetch(`/api/ml_rolling?symbol=${ev.symbol}&event_date=${ev.event_date}&days_forward=${fetch_offset}`)
     .then(res => res.json())
     .then(data => {
-        if (data.stopped_out || data.error) {
-            document.getElementById('ai_v2_50').textContent = 'STOP';
-            document.getElementById('ai_v2_100').textContent = 'STOP';
-            document.getElementById('ai_v2_150').textContent = 'STOP';
-            document.getElementById('ai_v2_200').textContent = 'STOP';
+        if (data.error && !data.probs) {
+            document.getElementById('ai_v2_50').textContent = 'N/A';
+            document.getElementById('ai_v2_100').textContent = 'N/A';
+            document.getElementById('ai_v2_150').textContent = 'N/A';
+            document.getElementById('ai_v2_200').textContent = 'N/A';
             return;
         }
         if (data.probs) {
+            const isStopped = data.is_stopped || (data.probs && data.probs.is_stopped_out);
+            const badge = document.getElementById('ai_v2_day_badge');
+            if (badge) {
+                if (isStopped) {
+                    badge.innerHTML = `Day ${display_day} <span style="background:#ef4444; color:#fff; padding:1px 5px; border-radius:4px; font-size:9px; margin-left:4px; font-weight:bold;">STOPPED</span>`;
+                } else {
+                    badge.innerHTML = `Day ${display_day}`;
+                }
+            }
             document.getElementById('ai_v2_50').innerHTML = formatProb(data.probs.prob_50);
             document.getElementById('ai_v2_100').innerHTML = formatProb(data.probs.prob_100);
             document.getElementById('ai_v2_150').innerHTML = formatProb(data.probs.prob_150);
@@ -2919,6 +2936,7 @@ function loadChartData(ev) {
 
       candleSeries.setData(data.bars);
       volumeSeries.setData(data.volume);
+      if (data.vol_ma20 && volMa20Series) volMa20Series.setData(data.vol_ma20);
       if (data.ema20) ema20Series.setData(data.ema20);
 
       activeLines.push(candleSeries.createPriceLine({
@@ -3516,6 +3534,7 @@ function loadStockChart(sym) {
         activeLines = [];
         candleSeries.setData(data.bars);
         volumeSeries.setData(data.volume);
+        if (data.vol_ma20 && volMa20Series) volMa20Series.setData(data.vol_ma20);
         if (data.ema20) ema20Series.setData(data.ema20);
         candleSeries.setMarkers([]);
         document.getElementById('chart_sym').textContent = `${sym} — Stock Chart`;
@@ -4920,10 +4939,11 @@ def api_ml_rolling():
     if bars is None or event_date not in bars.index: return jsonify({"error": "No bars"})
     d1_idx = bars.index.get_loc(event_date)
     t_idx = d1_idx + days_forward
-    features = engine.compute_rolling_features(sym, d1_idx, t_idx)
-    if not features: return jsonify({"stopped_out": True})
+    features = engine.compute_rolling_features(sym, d1_idx, t_idx, df=bars, allow_stopped=True)
+    if not features: return jsonify({"error": "Out of range"})
     probs = engine.predict_rolling(features)
-    return jsonify({"probs": probs})
+    is_stopped = bool(features.get("is_stopped_out", False))
+    return jsonify({"probs": probs, "is_stopped": is_stopped})
 
 @app.route("/api/chart")
 
@@ -4942,19 +4962,23 @@ def api_chart():
     # Slice to last 40 bars
     sub = d.iloc[max(0, len(d) - 40):]
     
+    vol_sma20 = sub["volume"].rolling(20).mean()
     bars = []
     vol = []
+    vol_ma20 = []
     ema20 = []
-    for idx, r in sub.iterrows():
+    for i, (idx, r) in enumerate(sub.iterrows()):
         t = idx.strftime("%Y-%m-%d")
         o, h, l, c = float(r["open"]), float(r["high"]), float(r["low"]), float(r["close"])
         v = float(r["volume"]) if pd.notna(r["volume"]) else 0
         bars.append({"time": t, "open": o, "high": h, "low": l, "close": c})
         vol.append({"time": t, "value": v, "color": "rgba(16,185,129,0.3)" if c >= o else "rgba(239,68,68,0.3)"})
+        if pd.notna(vol_sma20.iloc[i]):
+            vol_ma20.append({"time": t, "value": round(float(vol_sma20.iloc[i]), 0)})
         if "ema20" in r and pd.notna(r["ema20"]):
             ema20.append({"time": t, "value": round(float(r["ema20"]), 2)})
 
-    return jsonify({"symbol": sym, "bars": bars, "volume": vol, "ema20": ema20})
+    return jsonify({"symbol": sym, "bars": bars, "volume": vol, "vol_ma20": vol_ma20, "ema20": ema20})
 
 import ep_predictor
 

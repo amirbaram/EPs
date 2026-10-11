@@ -11,6 +11,158 @@ import scanner_core
 from ep_ml_engine import engine
 
 
+_cached_bars = {}
+
+
+def get_prepared_bars(sym: str, ribbon_spans=(8, 12, 16, 21)) -> pd.DataFrame | None:
+    cache_key = (sym, tuple(ribbon_spans))
+    if cache_key in _cached_bars:
+        return _cached_bars[cache_key]
+    raw = datastore.load_bars(sym)
+    if raw is None or len(raw) < 30:
+        _cached_bars[cache_key] = None
+        return None
+    d = scanner_core.calc_intermediate_ribbon(raw, spans=ribbon_spans)
+    if "sma50" not in d.columns:
+        d["sma50"] = d["close"].rolling(50).mean()
+    if "vol20" not in d.columns:
+        d["vol20"] = d["volume"].rolling(20).mean()
+    if "low5" not in d.columns:
+        d["low5"] = d["low"].rolling(5, min_periods=1).min()
+    _cached_bars[cache_key] = d
+    return d
+
+
+def simulate_ml_continuation_trade_fast(
+    fwd: pd.DataFrame,
+    entry_bar: int,
+    t2_entry: float,
+    stop_lvl: float,
+    ribbon_spans=(8, 12, 16, 21),
+) -> tuple[int, float, float] | None:
+    t2_risk_pct = (t2_entry - stop_lvl) / t2_entry * 100.0
+    if not (1.0 <= t2_risk_pct <= 35.0):
+        return None
+    risk_pts = t2_entry - stop_lvl
+
+    closes = fwd["close"].to_numpy(dtype=np.float64)
+    opens = fwd["open"].to_numpy(dtype=np.float64)
+    highs = fwd["high"].to_numpy(dtype=np.float64)
+    lows = fwd["low"].to_numpy(dtype=np.float64)
+    vols = fwd["volume"].to_numpy(dtype=np.float64)
+    vol20s = fwd["vol20"].to_numpy(dtype=np.float64) if "vol20" in fwd.columns else vols
+    sma50s = fwd["sma50"].to_numpy(dtype=np.float64) if "sma50" in fwd.columns else closes
+    states = fwd["ribbon_state"].to_numpy()
+    e21_col = f"ribbon_ema{ribbon_spans[3]}"
+    e21s = fwd[e21_col].to_numpy(dtype=np.float64) if e21_col in fwd.columns else closes
+    comps = (
+        fwd["ribbon_compression"].to_numpy(dtype=np.float64)
+        if "ribbon_compression" in fwd.columns
+        else np.zeros(len(fwd))
+    )
+
+    day1_low = lows[entry_bar]
+    day1_open = opens[entry_bar]
+    if day1_low <= stop_lvl:
+        ml_exit_price = day1_open if day1_open < stop_lvl else stop_lvl
+        ml_exit_bar = entry_bar
+        ml_ret = (ml_exit_price / t2_entry - 1.0) * 100.0
+        ml_r = ml_ret / t2_risk_pct if t2_risk_pct > 0 else 0.0
+        return ml_exit_bar, ml_exit_price, ml_r
+
+    ml_exit_bar = None
+    dynamic_trail_stop = stop_lvl
+    n_fwd = len(fwd)
+
+    n_trade_bars = n_fwd - (entry_bar + 1)
+    if n_trade_bars <= 0:
+        ml_exit_price = closes[entry_bar]
+        ml_ret = (ml_exit_price / t2_entry - 1.0) * 100.0
+        ml_r = ml_ret / t2_risk_pct if t2_risk_pct > 0 else 0.0
+        return entry_bar, ml_exit_price, ml_r
+
+    sub_highs = highs[entry_bar + 1:]
+    cum_highs = np.maximum.accumulate(sub_highs)
+    trade_peaks = np.maximum(t2_entry, cum_highs)
+    unrealized_r = (trade_peaks - t2_entry) / risk_pts
+
+    dyn_active_mask = unrealized_r >= 2.5
+    dyn_stop_cand = np.full(n_trade_bars, -np.inf, dtype=np.float64)
+
+    if np.any(dyn_active_mask):
+        k_indices = np.where(dyn_active_mask)[0]
+        b_indices = entry_bar + 1 + k_indices
+
+        c_sub = closes[b_indices]
+        e21_sub = e21s[b_indices]
+        sma50_sub = sma50s[b_indices]
+        v_sub = vols[b_indices]
+        v20_sub = vol20s[b_indices]
+        comp_sub = comps[b_indices]
+        peaks_sub = trade_peaks[k_indices]
+        r_mult_sub = unrealized_r[k_indices]
+        days_in_trade_sub = (b_indices - entry_bar).astype(np.float64)
+
+        dist_e21 = np.divide(c_sub - e21_sub, e21_sub, out=np.zeros_like(c_sub), where=(e21_sub > 0))
+        dist_sma50 = np.divide(c_sub - sma50_sub, sma50_sub, out=np.zeros_like(c_sub), where=(sma50_sub > 0))
+        vol_contract = np.divide(v_sub, v20_sub, out=np.ones_like(v_sub), where=(v20_sub > 0))
+        dd_from_peak = np.divide((c_sub - peaks_sub) * 100.0, peaks_sub, out=np.zeros_like(c_sub), where=(peaks_sub > 0))
+
+        X_mat = np.column_stack([
+            r_mult_sub, dist_e21, comp_sub, dist_sma50, vol_contract, days_in_trade_sub, dd_from_peak
+        ])
+        pred_buffers = engine.predict_continuation_trailer_batch(X_mat)
+        trails_from_peak = peaks_sub * (1.0 - pred_buffers / 100.0)
+
+        if "low5" in fwd.columns:
+            shelf5_sub = fwd["low5"].to_numpy(dtype=np.float64)[b_indices]
+        else:
+            shelf5_sub = np.array([lows[max(0, b - 4):b + 1].min() for b in b_indices])
+        support_lvl = np.minimum(e21_sub * 0.98, shelf5_sub * 0.98)
+        dyn_stop_cand[k_indices] = np.minimum(trails_from_peak, support_lvl)
+
+    for k in range(n_trade_bars):
+        b = entry_bar + 1 + k
+        c = closes[b]
+        l = lows[b]
+        b_open = opens[b]
+        s = states[b]
+        sma50 = sma50s[b]
+
+        if dyn_active_mask[k]:
+            dynamic_trail_stop = max(dynamic_trail_stop, dyn_stop_cand[k])
+
+        # Hard stop
+        if l <= stop_lvl:
+            ml_exit_bar = b
+            ml_exit_price = b_open if b_open < stop_lvl else stop_lvl
+            break
+
+        # Dynamic trailer stop
+        if dynamic_trail_stop > stop_lvl and l <= dynamic_trail_stop:
+            ml_exit_bar = b
+            ml_exit_price = b_open if b_open < dynamic_trail_stop else dynamic_trail_stop
+            break
+
+        if pd.notna(s) and s == "blue":
+            ml_exit_bar = b
+            ml_exit_price = c
+            break
+
+        if pd.notna(sma50) and c < sma50:
+            ml_exit_bar = b
+            ml_exit_price = c
+            break
+
+    if ml_exit_bar is None:
+        ml_exit_bar = n_fwd - 1
+        ml_exit_price = closes[-1]
+
+    ml_ret = (ml_exit_price / t2_entry - 1.0) * 100.0
+    ml_r = ml_ret / t2_risk_pct if t2_risk_pct > 0 else 0.0
+    return ml_exit_bar, ml_exit_price, ml_r
+
+
 def run_comparison(ribbon_spans=(8, 12, 16, 21), max_eps=None):
     study_path = Path("data/simulations/ep_combined_study_scored.parquet")
     backup_path = Path("data/simulations/ep_combined_study_scored_pre_dual_track.parquet")
@@ -30,15 +182,9 @@ def run_comparison(ribbon_spans=(8, 12, 16, 21), max_eps=None):
 
         sym = row["symbol"]
         date_str = str(row["date"])
-        raw = datastore.load_bars(sym)
-        if raw is None or len(raw) < 30:
+        d = get_prepared_bars(sym, ribbon_spans=ribbon_spans)
+        if d is None or len(d) < 30:
             continue
-
-        d = scanner_core.calc_intermediate_ribbon(raw, spans=ribbon_spans)
-        if "sma50" not in d.columns:
-            d["sma50"] = d["close"].rolling(50).mean()
-        if "vol20" not in d.columns:
-            d["vol20"] = d["volume"].rolling(20).mean()
 
         ts = pd.Timestamp(date_str)
         if ts not in d.index:
@@ -101,7 +247,6 @@ def run_comparison(ribbon_spans=(8, 12, 16, 21), max_eps=None):
 
         # --- SIMULATE BASELINE T2 & T3 (WITHOUT ML) ---
         base_t2 = {"has_reentry": False, "r_mult": 0.0, "track": "none"}
-        base_t3 = {"has_reentry": False, "r_mult": 0.0}
 
         # Track 1 U&R Detection
         ur_signal_bar = None
@@ -251,76 +396,13 @@ def run_comparison(ribbon_spans=(8, 12, 16, 21), max_eps=None):
 
             entry_bar = ur_signal_bar + 1
             t2_entry = float(fwd["open"].iloc[entry_bar])
-            t2_risk_pct = (t2_entry - ur_stop) / t2_entry * 100.0
 
             # Only enter if qualified by Model 1!
-            if 1.0 <= t2_risk_pct <= 35.0 and ur_pred["is_qualified"]:
-                risk_pts = t2_entry - ur_stop
-                day1_low = float(fwd["low"].iloc[entry_bar])
-                day1_open = float(fwd["open"].iloc[entry_bar])
-
-                if day1_low <= ur_stop:
-                    ml_exit_price = day1_open if day1_open < ur_stop else ur_stop
-                    ml_exit_bar = entry_bar
-                else:
-                    ml_exit_bar = None
-                    trade_peak = t2_entry
-                    dynamic_trail_stop = ur_stop
-
-                    for b in range(entry_bar + 1, len(fwd)):
-                        c = float(fwd["close"].iloc[b])
-                        l = float(fwd["low"].iloc[b])
-                        h = float(fwd["high"].iloc[b])
-                        b_open = float(fwd["open"].iloc[b])
-                        s = fwd["ribbon_state"].iloc[b]
-                        sma50 = fwd["sma50"].iloc[b]
-
-                        if h > trade_peak:
-                            trade_peak = h
-
-                        # Check Dynamic Trailer activation at >= +2.5R
-                        unrealized_r = (trade_peak - t2_entry) / risk_pts
-                        if unrealized_r >= 2.5:
-                            c_feats = engine.compute_continuation_trailer_features(fwd, b, t2_entry, trade_peak, risk_pts, ribbon_spans=ribbon_spans, entry_bar=entry_bar)
-                            pred_buffer = engine.predict_continuation_trailer(c_feats)
-                            trail_from_peak = trade_peak * (1.0 - pred_buffer / 100.0)
-
-                            e21_col = f"ribbon_ema{ribbon_spans[3]}"
-                            e21 = float(fwd[e21_col].iloc[b]) if e21_col in fwd.columns else c
-                            shelf5 = float(fwd["low"].iloc[max(0, b - 4):b + 1].min())
-                            support_lvl = min(e21 * 0.98, shelf5 * 0.98)
-                            dyn_stop_cand = min(trail_from_peak, support_lvl)
-                            dynamic_trail_stop = max(dynamic_trail_stop, dyn_stop_cand)
-
-                        # Hard stop
-                        if l <= ur_stop:
-                            ml_exit_bar = b
-                            ml_exit_price = b_open if b_open < ur_stop else ur_stop
-                            break
-
-                        # Dynamic trailer stop
-                        if dynamic_trail_stop > ur_stop and l <= dynamic_trail_stop:
-                            ml_exit_bar = b
-                            ml_exit_price = b_open if b_open < dynamic_trail_stop else dynamic_trail_stop
-                            break
-
-                        if pd.notna(s) and s == "blue":
-                            ml_exit_bar = b
-                            ml_exit_price = c
-                            break
-
-                        if pd.notna(sma50) and c < sma50:
-                            ml_exit_bar = b
-                            ml_exit_price = c
-                            break
-
-                    if ml_exit_bar is None:
-                        ml_exit_bar = len(fwd) - 1
-                        ml_exit_price = float(fwd["close"].iloc[-1])
-
-                ml_ret = (ml_exit_price / t2_entry - 1.0) * 100.0
-                ml_r = ml_ret / t2_risk_pct if t2_risk_pct > 0 else 0.0
-                ml_t2 = {"has_reentry": True, "r_mult": round(ml_r, 3), "track": "track_1_ur", "prob": ur_pred["prob_win"]}
+            if ur_pred["is_qualified"]:
+                sim_res = simulate_ml_continuation_trade_fast(fwd, entry_bar, t2_entry, ur_stop, ribbon_spans=ribbon_spans)
+                if sim_res is not None:
+                    ml_exit_bar, ml_exit_price, ml_r = sim_res
+                    ml_t2 = {"has_reentry": True, "r_mult": round(ml_r, 3), "track": "track_1_ur", "prob": ur_pred["prob_win"]}
 
         # If Track 1 did not take a trade (or was filtered out), evaluate Track 2 with Dynamic Trailer!
         if not ml_t2["has_reentry"] and base_t2.get("track") == "track_2_ribbon":
@@ -329,71 +411,10 @@ def run_comparison(ribbon_spans=(8, 12, 16, 21), max_eps=None):
             swing5_low = float(fwd["low"].iloc[max(0, entry_bar - 5):entry_bar].min())
             t2_stop = round(swing5_low, 2)
             t2_entry = float(fwd["open"].iloc[entry_bar])
-            t2_risk_pct = (t2_entry - t2_stop) / t2_entry * 100.0
 
-            if 1.0 <= t2_risk_pct <= 35.0:
-                risk_pts = t2_entry - t2_stop
-                day1_low = float(fwd["low"].iloc[entry_bar])
-                day1_open = float(fwd["open"].iloc[entry_bar])
-
-                if day1_low <= t2_stop:
-                    ml_exit_price = day1_open if day1_open < t2_stop else t2_stop
-                    ml_exit_bar = entry_bar
-                else:
-                    ml_exit_bar = None
-                    trade_peak = t2_entry
-                    dynamic_trail_stop = t2_stop
-
-                    for b in range(entry_bar + 1, len(fwd)):
-                        c = float(fwd["close"].iloc[b])
-                        l = float(fwd["low"].iloc[b])
-                        h = float(fwd["high"].iloc[b])
-                        b_open = float(fwd["open"].iloc[b])
-                        s = fwd["ribbon_state"].iloc[b]
-                        sma50 = fwd["sma50"].iloc[b]
-
-                        if h > trade_peak:
-                            trade_peak = h
-
-                        unrealized_r = (trade_peak - t2_entry) / risk_pts
-                        if unrealized_r >= 2.5:
-                            c_feats = engine.compute_continuation_trailer_features(fwd, b, t2_entry, trade_peak, risk_pts, ribbon_spans=ribbon_spans, entry_bar=entry_bar)
-                            pred_buffer = engine.predict_continuation_trailer(c_feats)
-                            trail_from_peak = trade_peak * (1.0 - pred_buffer / 100.0)
-
-                            e21_col = f"ribbon_ema{ribbon_spans[3]}"
-                            e21 = float(fwd[e21_col].iloc[b]) if e21_col in fwd.columns else c
-                            shelf5 = float(fwd["low"].iloc[max(0, b - 4):b + 1].min())
-                            support_lvl = min(e21 * 0.98, shelf5 * 0.98)
-                            dyn_stop_cand = min(trail_from_peak, support_lvl)
-                            dynamic_trail_stop = max(dynamic_trail_stop, dyn_stop_cand)
-
-                        if l <= t2_stop:
-                            ml_exit_bar = b
-                            ml_exit_price = b_open if b_open < t2_stop else t2_stop
-                            break
-
-                        if dynamic_trail_stop > t2_stop and l <= dynamic_trail_stop:
-                            ml_exit_bar = b
-                            ml_exit_price = b_open if b_open < dynamic_trail_stop else dynamic_trail_stop
-                            break
-
-                        if pd.notna(s) and s == "blue":
-                            ml_exit_bar = b
-                            ml_exit_price = c
-                            break
-
-                        if pd.notna(sma50) and c < sma50:
-                            ml_exit_bar = b
-                            ml_exit_price = c
-                            break
-
-                    if ml_exit_bar is None:
-                        ml_exit_bar = len(fwd) - 1
-                        ml_exit_price = float(fwd["close"].iloc[-1])
-
-                ml_ret = (ml_exit_price / t2_entry - 1.0) * 100.0
-                ml_r = ml_ret / t2_risk_pct if t2_risk_pct > 0 else 0.0
+            sim_res = simulate_ml_continuation_trade_fast(fwd, entry_bar, t2_entry, t2_stop, ribbon_spans=ribbon_spans)
+            if sim_res is not None:
+                ml_exit_bar, ml_exit_price, ml_r = sim_res
                 ml_t2 = {"has_reentry": True, "r_mult": round(ml_r, 3), "track": "track_2_ribbon", "prob": 0.5}
 
         results.append({
@@ -480,7 +501,7 @@ if __name__ == "__main__":
     print(f"{'Metric':<20} | {'Baseline (Unfiltered)':<22} | {'ML-Qualified (Model 1)':<24} | {'Delta':<15}")
     print("-" * 85)
     for k in ["trades", "win_rate", "ev_r", "total_r", "pf", "max_dd_r"]:
-        unit = "%" if k == "win_rate" else (" R" if "r" in k else "")
+        unit = "%" if k == "win_rate" else (" R" if k in ("ev_r", "total_r", "max_dd_r") else "")
         v_old = m_base_ur[k]
         v_new = m_ml_ur[k]
         diff = v_new - v_old
@@ -498,7 +519,7 @@ if __name__ == "__main__":
     print(f"{'Metric':<20} | {'Baseline (Standard Exits)':<22} | {'ML-Enhanced (Model 1+2)':<24} | {'Delta':<15}")
     print("-" * 85)
     for k in ["trades", "win_rate", "ev_r", "total_r", "pf", "max_dd_r"]:
-        unit = "%" if k == "win_rate" else (" R" if "r" in k else "")
+        unit = "%" if k == "win_rate" else (" R" if k in ("ev_r", "total_r", "max_dd_r") else "")
         v_old = m_base_all[k]
         v_new = m_ml_all[k]
         diff = v_new - v_old
@@ -516,7 +537,7 @@ if __name__ == "__main__":
     print(f"{'Metric':<20} | {'Baseline Lifecycle':<22} | {'ML-Enhanced Lifecycle':<24} | {'Delta':<15}")
     print("-" * 85)
     for k in ["trades", "win_rate", "ev_r", "total_r", "pf", "max_dd_r"]:
-        unit = "%" if k == "win_rate" else (" R" if "r" in k else "")
+        unit = "%" if k == "win_rate" else (" R" if k in ("ev_r", "total_r", "max_dd_r") else "")
         v_old = m_base_seq[k]
         v_new = m_ml_seq[k]
         diff = v_new - v_old

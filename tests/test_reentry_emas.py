@@ -483,7 +483,84 @@ class TestReentryEMAs(unittest.TestCase):
         feats = engine.compute_continuation_trailer_features(df, 80, 100.0, 115.0, 5.0, entry_bar=70)
         self.assertEqual(feats["feature_days_in_trade"], 10.0)
 
+    def test_continuation_trailer_vectorized_batch_prediction_regression(self):
+        """Regression test (seed: 20261010, Date: 2026-10-10):
+        Verifies predict_continuation_trailer_batch produces identical results to
+        predict_continuation_trailer across arbitrary candidate matrices.
+        """
+        cols = list(engine.continuation_trailer.named_steps["scaler"].feature_names_in_)
+        np.random.seed(42)
+        X_mat = np.random.randn(20, len(cols))
+
+        # Vectorized batch prediction
+        batch_preds = engine.predict_continuation_trailer_batch(X_mat)
+        self.assertEqual(len(batch_preds), 20)
+        self.assertTrue(np.all((batch_preds >= 3.0) & (batch_preds <= 35.0)))
+
+        # Compare row-by-row with scalar predict_continuation_trailer
+        for i in range(20):
+            feats_dict = {col: float(X_mat[i, j]) for j, col in enumerate(cols)}
+            scalar_pred = engine.predict_continuation_trailer(feats_dict)
+            self.assertAlmostEqual(batch_preds[i], scalar_pred, places=2)
+
+        # Edge cases: empty matrix, NaNs, Infs, None dictionary values
+        empty_preds = engine.predict_continuation_trailer_batch(np.empty((0, len(cols))))
+        self.assertEqual(len(empty_preds), 0)
+
+        nan_inf_mat = np.array([[np.nan, np.inf, -np.inf, 1.0, 2.0, 3.0, 4.0]])
+        nan_preds = engine.predict_continuation_trailer_batch(nan_inf_mat)
+        self.assertEqual(len(nan_preds), 1)
+        self.assertTrue(3.0 <= nan_preds[0] <= 35.0)
+
+        none_dict = {col: None for col in cols}
+        scalar_none_pred = engine.predict_continuation_trailer(none_dict)
+        self.assertTrue(3.0 <= scalar_none_pred <= 35.0)
+
+    def test_simulate_ml_continuation_trade_fast_regression(self):
+        """Regression test (seed: 20261010, Date: 2026-10-10):
+        Verifies simulate_ml_continuation_trade_fast accurately executes continuation mechanics,
+        including 0 trade bar boundaries, immediate intraday stops, and trailing stops.
+        """
+        import sim_ml_continuation
+        dates = pd.date_range("2024-01-01", periods=30, freq="B")
+        closes = np.array([100.0 + i * 2.0 for i in range(30)], dtype=np.float64)
+        opens = closes - 0.5
+        highs = closes + 1.0
+        lows = closes - 1.0
+        vols = np.full(30, 100_000.0)
+
+        df = pd.DataFrame({
+            "open": opens, "high": highs, "low": lows, "close": closes, "volume": vols,
+            "sma50": np.full(30, 80.0), "ribbon_state": ["yellow"] * 30,
+            "ribbon_ema21": closes - 3.0, "ribbon_compression": np.full(30, 0.05),
+            "vol20": vols, "low5": lows - 0.5
+        }, index=dates)
+
+        # 1. Normal profitable runner reaching >= 2.5R
+        res = sim_ml_continuation.simulate_ml_continuation_trade_fast(df, 0, 99.5, 95.0)
+        self.assertIsNotNone(res)
+        exit_bar, exit_px, r_mult = res
+        self.assertGreater(r_mult, 2.0)
+        self.assertGreaterEqual(exit_bar, 1)
+
+        # 2. Immediate Day 1 low breach (risk_pct in [1%, 35%], low breaches stop)
+        df_breach = df.copy()
+        df_breach.iloc[0, df_breach.columns.get_loc("low")] = 94.0
+        res_stopped = sim_ml_continuation.simulate_ml_continuation_trade_fast(df_breach, 0, 99.5, 96.0)
+        self.assertIsNotNone(res_stopped)
+        s_bar, s_px, s_r = res_stopped
+        self.assertEqual(s_bar, 0)
+        self.assertLess(s_r, 0.0)
+
+        # 3. Boundary: entry on the final bar (0 trade bars forward)
+        res_last = sim_ml_continuation.simulate_ml_continuation_trade_fast(df, 29, 157.5, 150.0)
+        self.assertIsNotNone(res_last)
+        l_bar, l_px, l_r = res_last
+        self.assertEqual(l_bar, 29)
+        self.assertEqual(l_px, closes[-1])
+
 
 if __name__ == "__main__":
     unittest.main()
+
 

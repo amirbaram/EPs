@@ -32,22 +32,24 @@ def load() -> None:
         return
     _SECTOR = {}
     try:
-        for row in csv.DictReader(SECTORS_FILE.open()):
-            sym, sec = _key(row.get("ticker", "")), (row.get("sector") or "").strip()
-            if sym and sec:
-                _SECTOR[sym] = sec
+        with SECTORS_FILE.open(encoding="utf-8", errors="replace") as f:
+            for row in csv.DictReader(f):
+                sym, sec = _key(row.get("ticker", "")), (row.get("sector") or "").strip()
+                if sym and sec:
+                    _SECTOR[sym] = sec
     except FileNotFoundError:
         pass
     _THEMES_BY_SYM, _SYMS_BY_THEME = {}, {}
     try:
-        for row in csv.DictReader(THEMES_FILE.open()):
-            sym, th = _key(row.get("ticker", "")), (row.get("theme") or "").strip()
-            if not sym or not th:
-                continue
-            _SYMS_BY_THEME.setdefault(th, set()).add(sym)
-            lst = _THEMES_BY_SYM.setdefault(sym, [])
-            if th not in lst:
-                lst.append(th)
+        with THEMES_FILE.open(encoding="utf-8", errors="replace") as f:
+            for row in csv.DictReader(f):
+                sym, th = _key(row.get("ticker", "")), (row.get("theme") or "").strip()
+                if not sym or not th:
+                    continue
+                _SYMS_BY_THEME.setdefault(th, set()).add(sym)
+                lst = _THEMES_BY_SYM.setdefault(sym, [])
+                if th not in lst:
+                    lst.append(th)
     except FileNotFoundError:
         pass
     for lst in _THEMES_BY_SYM.values():
@@ -56,8 +58,10 @@ def load() -> None:
 
 def reload() -> None:
     """Drop the caches so the next lookup re-reads the CSVs (after an edit / re-seed)."""
-    global _SECTOR
+    global _SECTOR, _THEMES_BY_SYM, _SYMS_BY_THEME
     _SECTOR = None
+    _THEMES_BY_SYM = None
+    _SYMS_BY_THEME = None
     load()
 
 
