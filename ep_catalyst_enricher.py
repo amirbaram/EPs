@@ -60,10 +60,17 @@ def _load_json(path: Path) -> dict:
 
 def _save_json(path: Path, data: dict):
     path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = path.with_suffix(".tmp")
-    with open(temp_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-    temp_path.replace(path)
+    temp_path = path.with_name(f"{path.stem}_{os.getpid()}_{time.time_ns()}.tmp")
+    try:
+        with open(temp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        temp_path.replace(path)
+    except Exception:
+        if temp_path.exists():
+            try:
+                temp_path.unlink()
+            except Exception:
+                pass
 
 
 def get_cik_for_symbol(sym: str) -> str | None:
