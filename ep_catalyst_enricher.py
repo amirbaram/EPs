@@ -232,7 +232,24 @@ def get_clean_company_name(sym: str) -> str:
 
 
 def get_historical_news(sym: str, ep_date_str: str, company_name: str = "", lookback_days: int = 35) -> list[dict]:
-    """Fetches and caches news headlines from Google News RSS for sym / company near ep_date_str."""
+    """Fetches and caches news headlines from Google News RSS for sym / company near ep_date_str.
+    
+    Strictly verifies that news articles are contemporaneous with the EP event (within 14 days).
+    Google News RSS only indexes recent articles (~45-60 days); for historical dates older than
+    60 days, it returns empty list to prevent injecting irrelevant modern news.
+    """
+    try:
+        ep_dt = pd.to_datetime(ep_date_str).date()
+        today = pd.Timestamp.now().date()
+        days_ago = (today - ep_dt).days
+    except Exception:
+        return []
+
+    # If the episode occurred more than 60 days ago, Google News RSS does NOT have contemporaneous news.
+    # Never query it for older dates to avoid polluting historical records with today's news.
+    if days_ago > 60:
+        return []
+
     if not company_name:
         company_name = get_clean_company_name(sym)
 
@@ -241,7 +258,16 @@ def get_historical_news(sym: str, ep_date_str: str, company_name: str = "", look
     if cache.exists():
         try:
             with open(cache, "r", encoding="utf-8") as f:
-                return json.load(f)
+                cached = json.load(f)
+                valid = []
+                for a in cached:
+                    try:
+                        a_dt = pd.to_datetime(a.get("date")).date()
+                        if abs((a_dt - ep_dt).days) <= 14:
+                            valid.append(a)
+                    except Exception:
+                        pass
+                return valid
         except Exception:
             pass
 
@@ -259,9 +285,14 @@ def get_historical_news(sym: str, ep_date_str: str, company_name: str = "", look
                 link = item.find("link").text if item.find("link") is not None else ""
                 source = item.find("source").text if item.find("source") is not None else ""
                 try:
-                    pub_dt = pd.to_datetime(pub).strftime("%Y-%m-%d")
+                    pub_obj = pd.to_datetime(pub).date()
+                    pub_dt = pub_obj.strftime("%Y-%m-%d")
                 except Exception:
-                    pub_dt = pub[:10] if pub else ""
+                    continue
+
+                # Ensure article was published contemporaneously with the EP event (within 14 days)
+                if abs((pub_obj - ep_dt).days) > 14:
+                    continue
 
                 articles.append({
                     "title": title,
@@ -289,17 +320,30 @@ def get_catalyst_dossier(sym: str, ep_date_str: str, sector: str = "", theme: st
 
     cache_key = f"{sym.upper()}_{ep_date_str}"
     curated = _CURATED_CACHE.get(sym.upper(), {})
+    ep_dt = pd.to_datetime(ep_date_str).date()
 
     # If curated exists, always prioritize it over a stale generic cache entry
     if cache_key in _HIST_CACHE and not curated:
         res = dict(_HIST_CACHE[cache_key])
-        if res.get("news_articles") is None:
-            res["news_articles"] = get_historical_news(sym, ep_date_str, lookback_days=35)[:6]
+        raw_news = res.get("news_articles")
+        if not raw_news:
+            raw_news = get_historical_news(sym, ep_date_str, lookback_days=35)[:6]
+        # Sanitize any non-contemporaneous articles from cache
+        clean_news = []
+        for a in (raw_news or []):
+            try:
+                a_dt = pd.to_datetime(a.get("date")).date()
+                if abs((a_dt - ep_dt).days) <= 14:
+                    clean_news.append(a)
+            except Exception:
+                pass
+        res["news_articles"] = clean_news
         return res
 
     # Check curated cache by symbol
     if curated:
         news_items = get_historical_news(sym, ep_date_str, lookback_days=35)
+        clean_news = [a for a in news_items if abs((pd.to_datetime(a.get("date")).date() - ep_dt).days) <= 14]
         res = {
             "symbol": sym.upper(),
             "date": ep_date_str,
@@ -309,7 +353,7 @@ def get_catalyst_dossier(sym: str, ep_date_str: str, sector: str = "", theme: st
             "analysis": curated.get("analysis", f"{sym.upper()} experienced an episodic surge triggering structural repricing."),
             "news_summary": curated.get("news_summary", f"{sym.upper()} news and corporate developments around {ep_date_str}."),
             "sec_filings": extract_filings_around_date(sym, ep_date_str),
-            "news_articles": news_items[:6],
+            "news_articles": clean_news[:6],
             "earnings_date": get_earnings_concurrence(sym, ep_date_str),
             "has_earnings_concurrence": get_earnings_concurrence(sym, ep_date_str) is not None
         }
@@ -321,6 +365,8 @@ def get_catalyst_dossier(sym: str, ep_date_str: str, sector: str = "", theme: st
     filings = extract_filings_around_date(sym, ep_date_str)
     earnings_dt = get_earnings_concurrence(sym, ep_date_str)
     news_items = get_historical_news(sym, ep_date_str, lookback_days=35)
+    clean_news = [a for a in news_items if abs((pd.to_datetime(a.get("date")).date() - ep_dt).days) <= 14]
+
 
     has_earnings = bool(earnings_dt)
     category = "Corporate Institutional Repricing"
@@ -385,8 +431,8 @@ def get_catalyst_dossier(sym: str, ep_date_str: str, sector: str = "", theme: st
         items_str = f" ({', '.join(f0.get('item_labels', [])[:2])})" if f0.get("item_labels") else ""
         analysis = f"{sym.upper()} filed official Form {f0['form']}{items_str} with the SEC on {f0['date']}."
         news_summary = f"{sym.upper()} regulatory filing submitted on {f0['date']}."
-    elif news_items:
-        top_n = news_items[0]
+    elif clean_news:
+        top_n = clean_news[0]
         headline = top_n["title"]
         if is_biotech:
             category = "Biotechnology / Clinical Trial Breakthrough"
@@ -412,7 +458,7 @@ def get_catalyst_dossier(sym: str, ep_date_str: str, sector: str = "", theme: st
         "analysis": analysis,
         "news_summary": news_summary,
         "sec_filings": filings,
-        "news_articles": news_items[:6],
+        "news_articles": clean_news[:6],
         "earnings_date": earnings_dt,
         "has_earnings_concurrence": has_earnings
     }

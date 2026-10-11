@@ -982,9 +982,34 @@ class TestClimaxTrailer(unittest.TestCase):
         self.assertIn(b'id="btn_enlarged_stock_list"', resp.data)
         self.assertIn(b'id="enlarged_stock_list_modal"', resp.data)
 
+    def test_contemporaneous_news_and_minimized_expand_button_prominence(self):
+        """Regression test: verifies that historical episodes (e.g. HLIT 2017) never leak modern news,
+        and that minimized chart mode hides extraneous controls so the Expand button is unobstructed.
+        Seed: 20261011, Date: 2026-10-11.
+        """
+        import serve_ep
+        import ep_catalyst_enricher
+        client = serve_ep.app.test_client()
+
+        # 1. Historical episode news contemporaneity: HLIT 2017-10-31
+        cat = ep_catalyst_enricher.get_catalyst_dossier("HLIT", "2017-10-31")
+        self.assertEqual(cat["symbol"], "HLIT")
+        self.assertEqual(cat["date"], "2017-10-31")
+        # Ensure official 8-K from 2017-10-30 is attached
+        self.assertTrue(any("2017-10-30" in f.get("date", "") for f in cat.get("sec_filings", [])))
+        # Ensure zero modern news leaked into 2017 episode
+        for a in cat.get("news_articles", []):
+            self.assertNotIn("2026", a.get("date", ""))
+
+        # 2. Verify minimized chart mode hides enlarged-only controls
+        self.assertIn('.chart-enlarged-only-controls {\n    display: none !important;', serve_ep.HTML_TEMPLATE)
+        self.assertIn('.workspace.fullscreen-chart-mode .chart-enlarged-only-controls {\n    display: flex !important;', serve_ep.HTML_TEMPLATE)
+        self.assertIn('btn-chart-expand-main', serve_ep.HTML_TEMPLATE)
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
 
 

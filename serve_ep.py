@@ -268,17 +268,15 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     box-shadow: 0 0 8px rgba(56, 189, 248, 0.4);
   }
 
-  /* Chart header controls and badges: always visible with clean flex spacing */
+  /* Chart header controls and badges: hidden when minimized so Expand button is unobstructed */
   .chart-enlarged-only-controls {
-    display: flex !important;
-    align-items: center;
-    gap: 6px;
-    flex-wrap: nowrap;
+    display: none !important;
   }
   .workspace.fullscreen-chart-mode .chart-enlarged-only-controls {
     display: flex !important;
     align-items: center;
     gap: 8px;
+    flex-wrap: nowrap;
   }
   .workspace.fullscreen-chart-mode #btn_enlarged_stock_list {
     background: #0284c7 !important;
@@ -838,15 +836,15 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           <div id="chart_tags"></div>
           <button id="btn_chart_settings" class="btn-chart-enlarge" onclick="toggleChartSettings()" title="Configure Chart Displays, Markers, and Parameters">⚙️ Settings</button>
           <button id="btn_toggle_draw" class="btn-chart-enlarge" onclick="toggleDrawToolbar()" title="Toggle on-chart drawing tools (Measure, Line, Text, Arrow)">✏️ Tools</button>
+          <button id="btn_enlarged_stock_list" class="btn-chart-enlarge" onclick="openEnlargedStockListModal()" title="Open filtered stock list to select another ticker">
+            📋 Stocks (<span id="lbl_enlarged_stock_count">0</span>)
+          </button>
+          <div style="display:inline-flex; align-items:center; gap:2px;">
+            <button id="btn_chart_prev_ticker" class="btn-chart-enlarge" onclick="stepFilteredStock(-1)" title="Previous ticker in filtered list (Arrow Left)" style="padding:3px 6px;">◀</button>
+            <button id="btn_chart_next_ticker" class="btn-chart-enlarge" onclick="stepFilteredStock(1)" title="Next ticker in filtered list (Arrow Right)" style="padding:3px 6px;">▶</button>
+          </div>
         </div>
-        <button id="btn_enlarged_stock_list" class="btn-chart-enlarge" onclick="openEnlargedStockListModal()" title="Open filtered stock list to select another ticker">
-          📋 Stocks (<span id="lbl_enlarged_stock_count">0</span>)
-        </button>
-        <div style="display:inline-flex; align-items:center; gap:2px;">
-          <button id="btn_chart_prev_ticker" class="btn-chart-enlarge" onclick="stepFilteredStock(-1)" title="Previous ticker in filtered list (Arrow Left)" style="padding:3px 6px;">◀</button>
-          <button id="btn_chart_next_ticker" class="btn-chart-enlarge" onclick="stepFilteredStock(1)" title="Next ticker in filtered list (Arrow Right)" style="padding:3px 6px;">▶</button>
-        </div>
-        <button id="btn_chart_fullscreen" class="btn-chart-enlarge" onclick="toggleChartFullscreen()" title="Toggle full-screen chart display (Esc to exit)" style="flex-shrink:0;">⛶ Enlarge</button>
+        <button id="btn_chart_fullscreen" class="btn-chart-enlarge btn-chart-expand-main" onclick="toggleChartFullscreen()" title="Toggle full-screen chart display (Esc to exit)" style="flex-shrink:0;">⛶ Enlarge</button>
       </div>
     </div>
     <div class="ticker-history-bar" id="ticker_history_bar" style="display:none;">
@@ -3571,8 +3569,15 @@ function loadChart(ev) {
 
       const newsList = document.getElementById('news_articles_list');
       const newsCountBadge = document.getElementById('news_count_badge');
-      const newsContainer = document.getElementById('sec_news_container');
-      const newsArticles = cat.news_articles || [];
+      const rawArticles = cat.news_articles || [];
+      const epDateObj = new Date(ev.date);
+      // Strictly filter to contemporaneous articles (within 20 days of the episode)
+      const newsArticles = rawArticles.filter(a => {
+        if (!a || !a.date) return false;
+        const artDate = new Date(a.date);
+        const diffDays = Math.abs((artDate - epDateObj) / (1000 * 60 * 60 * 24));
+        return !isNaN(diffDays) && diffDays <= 20;
+      });
       if (newsCountBadge) newsCountBadge.textContent = `${newsArticles.length} Article${newsArticles.length === 1 ? '' : 's'}`;
 
       if (newsList) {
