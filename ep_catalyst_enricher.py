@@ -218,10 +218,68 @@ def get_earnings_concurrence(sym: str, ep_date_str: str, window_days: int = 5) -
     return best_dt
 
 
+def get_clean_company_name(sym: str) -> str:
+    """Extracts cleaned core corporate name for symbol to optimize news search precision."""
+    get_cik_for_symbol(sym)
+    if _CIK_CACHE:
+        for v in _CIK_CACHE.values():
+            if v.get("ticker", "").upper() == sym.upper():
+                title = v.get("title", "")
+                title = re.sub(r"(?i)\b(inc|corp|corporation|ltd|limited|co|llc|plc|nv|sa)\b\.?", "", title)
+                title = title.replace(",", "").strip()
+                return title
+    return ""
+
+
+def get_historical_news(sym: str, ep_date_str: str, company_name: str = "", lookback_days: int = 35) -> list[dict]:
+    """Fetches and caches news headlines from Google News RSS for sym / company near ep_date_str."""
+    if not company_name:
+        company_name = get_clean_company_name(sym)
+
+    EDGAR_DIR.mkdir(parents=True, exist_ok=True)
+    cache = EDGAR_DIR / f"{sym.upper()}_{ep_date_str}_news.json"
+    if cache.exists():
+        try:
+            with open(cache, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+
+    query = f"{sym} {company_name}".strip()
+    url = f"https://news.google.com/rss/search?q={urllib.parse.quote(query)}+when:{lookback_days}d&hl=en-US&gl=US&ceid=US:en"
+    req = urllib.request.Request(url, headers=_UA)
+    articles = []
+    try:
+        import xml.etree.ElementTree as ET
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            tree = ET.fromstring(resp.read())
+            for item in tree.findall("./channel/item"):
+                title = item.find("title").text if item.find("title") is not None else ""
+                pub = item.find("pubDate").text if item.find("pubDate") is not None else ""
+                link = item.find("link").text if item.find("link") is not None else ""
+                source = item.find("source").text if item.find("source") is not None else ""
+                try:
+                    pub_dt = pd.to_datetime(pub).strftime("%Y-%m-%d")
+                except Exception:
+                    pub_dt = pub[:10] if pub else ""
+
+                articles.append({
+                    "title": title,
+                    "date": pub_dt,
+                    "pub_raw": pub,
+                    "source": source,
+                    "url": link
+                })
+        _save_json(cache, articles)
+    except Exception:
+        pass
+    return articles
+
+
 def get_catalyst_dossier(sym: str, ep_date_str: str, sector: str = "", theme: str = "") -> dict:
-    """Returns complete institutional catalyst profile, SEC filings, and earnings concurrence.
+    """Returns complete institutional catalyst profile, SEC filings, earnings concurrence, and news coverage.
     
-    Checks pre-mined historical catalysts cache first; falls back dynamically to SEC EDGAR / Yahoo.
+    Checks pre-mined historical catalysts cache first; falls back dynamically to SEC EDGAR, Google News, and Yahoo.
     """
     global _HIST_CACHE, _CURATED_CACHE
     if _HIST_CACHE is None:
@@ -230,13 +288,18 @@ def get_catalyst_dossier(sym: str, ep_date_str: str, sector: str = "", theme: st
         _CURATED_CACHE = _load_json(CURATED_CATALYSTS_PATH)
 
     cache_key = f"{sym.upper()}_{ep_date_str}"
-    if cache_key in _HIST_CACHE:
+    curated = _CURATED_CACHE.get(sym.upper(), {})
+
+    # If curated exists, always prioritize it over a stale generic cache entry
+    if cache_key in _HIST_CACHE and not curated:
         res = dict(_HIST_CACHE[cache_key])
+        if res.get("news_articles") is None:
+            res["news_articles"] = get_historical_news(sym, ep_date_str, lookback_days=35)[:6]
         return res
 
     # Check curated cache by symbol
-    curated = _CURATED_CACHE.get(sym.upper(), {})
     if curated:
+        news_items = get_historical_news(sym, ep_date_str, lookback_days=35)
         res = {
             "symbol": sym.upper(),
             "date": ep_date_str,
@@ -246,14 +309,18 @@ def get_catalyst_dossier(sym: str, ep_date_str: str, sector: str = "", theme: st
             "analysis": curated.get("analysis", f"{sym.upper()} experienced an episodic surge triggering structural repricing."),
             "news_summary": curated.get("news_summary", f"{sym.upper()} news and corporate developments around {ep_date_str}."),
             "sec_filings": extract_filings_around_date(sym, ep_date_str),
+            "news_articles": news_items[:6],
             "earnings_date": get_earnings_concurrence(sym, ep_date_str),
             "has_earnings_concurrence": get_earnings_concurrence(sym, ep_date_str) is not None
         }
+        _HIST_CACHE[cache_key] = res
+        _save_json(HIST_CATALYSTS_PATH, _HIST_CACHE)
         return res
 
-    # Dynamic extraction via SEC EDGAR and Earnings Calendar
+    # Dynamic extraction via SEC EDGAR, Google News, and Earnings Calendar
     filings = extract_filings_around_date(sym, ep_date_str)
     earnings_dt = get_earnings_concurrence(sym, ep_date_str)
+    news_items = get_historical_news(sym, ep_date_str, lookback_days=35)
 
     has_earnings = bool(earnings_dt)
     category = "Corporate Institutional Repricing"
@@ -318,6 +385,17 @@ def get_catalyst_dossier(sym: str, ep_date_str: str, sector: str = "", theme: st
         items_str = f" ({', '.join(f0.get('item_labels', [])[:2])})" if f0.get("item_labels") else ""
         analysis = f"{sym.upper()} filed official Form {f0['form']}{items_str} with the SEC on {f0['date']}."
         news_summary = f"{sym.upper()} regulatory filing submitted on {f0['date']}."
+    elif news_items:
+        top_n = news_items[0]
+        headline = top_n["title"]
+        if is_biotech:
+            category = "Biotechnology / Clinical Trial Breakthrough"
+            tier = "Tier-1 Transformational Medical Breakthrough"
+        else:
+            category = f"{sector or 'Corporate'} Media / Press Release Catalyst"
+            tier = "Tier-2 Institutional Catalyst"
+        analysis = f"{sym.upper()} high-volume episodic surge accompanied by press and media reports: {top_n['title']} ({top_n['date']})."
+        news_summary = top_n["title"]
     else:
         category = f"{sector or 'Corporate'} Institutional Repricing"
         headline = f"{sym.upper()} Episodic Pivot Volume & Price Repricing"
@@ -334,6 +412,7 @@ def get_catalyst_dossier(sym: str, ep_date_str: str, sector: str = "", theme: st
         "analysis": analysis,
         "news_summary": news_summary,
         "sec_filings": filings,
+        "news_articles": news_items[:6],
         "earnings_date": earnings_dt,
         "has_earnings_concurrence": has_earnings
     }

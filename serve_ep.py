@@ -1141,6 +1141,15 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             <div style="color:var(--muted); font-style:italic;">No official SEC filings in window.</div>
           </div>
         </div>
+
+        <div id="sec_news_container" style="display:flex; flex-direction:column; gap:4px; margin-top:2px;">
+          <div style="font-size:10px; color:var(--muted); text-transform:uppercase; font-weight:700; display:flex; justify-content:space-between;">
+            <span>Press Releases &amp; News Coverage:</span>
+            <span id="news_count_badge" style="color:#c084fc;">0 Articles</span>
+          </div>
+          <div id="news_articles_list" style="display:flex; flex-direction:column; gap:4px; font-size:10.5px;">
+          </div>
+        </div>
       </div>
     </div>
 
@@ -3312,6 +3321,33 @@ function loadChart(ev) {
                   <span style="color:#94a3b8; margin-left:4px; font-size:10px;">${itemsText}</span>
                 </div>
                 ${f.url ? `<a href="${f.url}" target="_blank" rel="noopener noreferrer" style="color:#38bdf8; text-decoration:none; font-weight:700; font-size:10.5px; flex-shrink:0;" title="View official SEC filing on EDGAR archive">View SEC EDGAR ↗</a>` : ''}
+              </div>
+            `;
+          }).join('');
+        }
+      }
+
+      const newsList = document.getElementById('news_articles_list');
+      const newsCountBadge = document.getElementById('news_count_badge');
+      const newsContainer = document.getElementById('sec_news_container');
+      const newsArticles = cat.news_articles || [];
+      if (newsCountBadge) newsCountBadge.textContent = `${newsArticles.length} Article${newsArticles.length === 1 ? '' : 's'}`;
+
+      if (newsList) {
+        if (!newsArticles.length) {
+          if (newsContainer) newsContainer.style.display = filings.length ? 'none' : 'flex';
+          newsList.innerHTML = '<div style="color:var(--muted); font-style:italic; padding:2px 0;">No external news headlines indexed in window.</div>';
+        } else {
+          if (newsContainer) newsContainer.style.display = 'flex';
+          newsList.innerHTML = newsArticles.map(a => {
+            return `
+              <div style="background:#131826; border:1px solid #202b3f; border-radius:4px; padding:5px 8px; display:flex; justify-content:space-between; align-items:center;">
+                <div style="min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; margin-right:8px;">
+                  <span class="badge" style="background:#4c1d95; color:#ddd6fe; font-size:9.5px; padding:1px 5px; border-radius:3px;">${a.source || 'Media'}</span>
+                  <span style="color:#94a3b8; margin-left:6px; font-size:10px;">${a.date}</span>
+                  <span style="color:#e2e8f0; margin-left:6px; font-weight:600;" title="${a.title}">${a.title}</span>
+                </div>
+                ${a.url ? `<a href="${a.url}" target="_blank" rel="noopener noreferrer" style="color:#c084fc; text-decoration:none; font-weight:700; font-size:10.5px; flex-shrink:0;" title="Read article">Read ↗</a>` : ''}
               </div>
             `;
           }).join('');
