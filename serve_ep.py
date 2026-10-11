@@ -57,8 +57,12 @@ def get_df():
             DF["close_pos"] = DF["close_pos"].fillna(0.5)
             if "prev_day_gap_pct" in DF.columns:
                 DF["prev_day_gap_pct"] = DF["prev_day_gap_pct"].fillna(0.0)
-            if "prev_day_gap_up" in DF.columns:
-                DF["prev_day_gap_up"] = DF["prev_day_gap_up"].fillna(False)
+            if "adr_pct" in DF.columns:
+                DF["adr_pct"] = DF["adr_pct"].fillna(5.0)
+            else:
+                DF["adr_pct"] = 5.0
+            if "prev_day_gap_pct" in DF.columns:
+                DF["prev_day_gap_up"] = DF["prev_day_gap_pct"] > (0.33 * DF["adr_pct"])
             print(f"Loaded {len(DF)} EP events.")
         else:
             print(f"Error: {DATA_PATH} not found!")
@@ -540,8 +544,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <span>🔥 5D Support (Held D1 Low)</span>
     <span class="booster-pill">+1.76 R Exp</span>
   </div>
-  <div class="booster-chip" id="b_no_prev_gap" onclick="toggleBooster('no_prev_gap')" title="Filters out EPs that already gapped up on Day -1 (prior session) before the catalyst">
-    <span>🛡️ Clean Pivot (No Prior Gap)</span>
+  <div class="booster-chip" id="b_no_prev_gap" onclick="toggleBooster('no_prev_gap')" title="Filters out EPs that already gapped up on Day -1 by > 0.33×ADR before the catalyst">
+    <span>🛡️ Clean Pivot (No Gap &gt; 0.33×ADR)</span>
     <span class="booster-pill">Trap Avoidance</span>
   </div>
   <button class="booster-reset" onclick="resetBoosters()">Clear Boosters</button>
@@ -655,11 +659,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   </div>
 
   <div class="filter-group">
-    <label title="Filter out EPs that gapped up on Day -1 (prior session) before catalyst">Prior Day Gap</label>
+    <label title="Filter out EPs that gapped up on Day -1 by > 0.33×ADR before catalyst">Prior Day Gap</label>
     <select id="f_prev_gap">
       <option value="">All</option>
-      <option value="no_gap">🛡️ Clean (No Prior Gap)</option>
-      <option value="gap_up">⚠️ Prior Day Gapped Up</option>
+      <option value="no_gap">🛡️ Clean (No Gap &gt; 0.33×ADR)</option>
+      <option value="gap_up">⚠️ Prior Gap Up (&gt; 0.33×ADR)</option>
     </select>
   </div>
 
@@ -3187,8 +3191,8 @@ function renderTable() {
       : '·';
 
     const prevGapBadge = e.prev_day_gap_up
-      ? `<br><span style="color:#f59e0b; font-size:9.5px; font-weight:600;" title="Prior day (D-1) gapped up by ${e.prev_day_gap_pct}%">⚠️ P-Gap +${Number(e.prev_day_gap_pct || 0).toFixed(0)}%</span>`
-      : `<br><span style="color:#10b981; font-size:9.5px;" title="Clean pivot: no prior day gap-up">✓ Clean</span>`;
+      ? `<br><span style="color:#f59e0b; font-size:9.5px; font-weight:600;" title="Prior day (D-1) gapped up by ${e.prev_day_gap_pct}% (> 0.33×ADR)">⚠️ P-Gap +${Number(e.prev_day_gap_pct || 0).toFixed(0)}%</span>`
+      : `<br><span style="color:#10b981; font-size:9.5px;" title="Clean pivot: no prior day gap-up > 0.33×ADR">✓ Clean</span>`;
 
     return `<tr class="${isSel ? 'selected' : ''}" onclick="onRowClick('${e.symbol}','${e.date}')">
       <td class="tl">${e.date}</td>
@@ -3305,8 +3309,8 @@ function renderEnlargedStockList(query) {
       : '·';
 
     const prevGapBadge = e.prev_day_gap_up
-      ? `<br><span style="color:#f59e0b; font-size:9px; font-weight:600;" title="Prior day (D-1) gapped up by ${e.prev_day_gap_pct}%">⚠️ P-Gap +${Number(e.prev_day_gap_pct || 0).toFixed(0)}%</span>`
-      : `<br><span style="color:#10b981; font-size:9px;" title="Clean pivot">✓ Clean</span>`;
+      ? `<br><span style="color:#f59e0b; font-size:9px; font-weight:600;" title="Prior day (D-1) gapped up by ${e.prev_day_gap_pct}% (> 0.33×ADR)">⚠️ P-Gap +${Number(e.prev_day_gap_pct || 0).toFixed(0)}%</span>`
+      : `<br><span style="color:#10b981; font-size:9px;" title="Clean pivot: no prior day gap-up > 0.33×ADR">✓ Clean</span>`;
 
     const subBadge = (e.subtype === 'dre')
       ? '<span style="background:rgba(244,63,94,0.2); color:#fb7185; padding:1px 4px; border-radius:3px; font-size:9px; font-weight:700;">DRE</span>'
@@ -4307,8 +4311,10 @@ def api_events():
     if request.args.get("cond_no_prev_gap") == "1":
         if "prev_day_gap_up" in q.columns:
             q = q[~q["prev_day_gap_up"]]
+        elif "prev_day_gap_pct" in q.columns and "adr_pct" in q.columns:
+            q = q[q["prev_day_gap_pct"] <= 0.33 * q["adr_pct"]]
         elif "prev_day_gap_pct" in q.columns:
-            q = q[q["prev_day_gap_pct"] <= 0.0]
+            q = q[q["prev_day_gap_pct"] <= 1.5]
 
     outcome = request.args.get("outcome")
     if outcome:
@@ -4382,13 +4388,17 @@ def api_events():
     if prev_gap == "no_gap":
         if "prev_day_gap_up" in q.columns:
             q = q[~q["prev_day_gap_up"]]
+        elif "prev_day_gap_pct" in q.columns and "adr_pct" in q.columns:
+            q = q[q["prev_day_gap_pct"] <= 0.33 * q["adr_pct"]]
         elif "prev_day_gap_pct" in q.columns:
-            q = q[q["prev_day_gap_pct"] <= 0.0]
+            q = q[q["prev_day_gap_pct"] <= 1.5]
     elif prev_gap == "gap_up":
         if "prev_day_gap_up" in q.columns:
             q = q[q["prev_day_gap_up"]]
+        elif "prev_day_gap_pct" in q.columns and "adr_pct" in q.columns:
+            q = q[q["prev_day_gap_pct"] > 0.33 * q["adr_pct"]]
         elif "prev_day_gap_pct" in q.columns:
-            q = q[q["prev_day_gap_pct"] > 0.0]
+            q = q[q["prev_day_gap_pct"] > 1.5]
 
     recent_days = request.args.get("recent_days")
     if recent_days:
@@ -5958,8 +5968,9 @@ def api_chart():
             rv = round(float(h_row.get("rvol", 0.0)), 1)
             cp = round(float(h_row.get("close_pos", 0.0)), 2)
             v48 = bool(h_row.get("violated_48h", False))
-            pg = bool(h_row.get("prev_day_gap_up", False))
             pg_pct = round(float(h_row.get("prev_day_gap_pct", 0.0)), 1) if pd.notna(h_row.get("prev_day_gap_pct")) else 0.0
+            adr = round(float(h_row.get("adr_pct", 5.0)), 1) if pd.notna(h_row.get("adr_pct")) else 5.0
+            pg = bool(h_row.get("prev_day_gap_up", False))
             ml = round(float(h_row.get("ml_50", 0.0)), 3) if pd.notna(h_row.get("ml_50")) else None
             st = str(h_row.get("subtype", "ep"))
 
@@ -5972,7 +5983,7 @@ def api_chart():
             if cp < 0.65 and st != "dre":
                 reasons.append(f"Weak Close Pos ({cp:.2f})")
             if pg:
-                reasons.append(f"Prior Day Gap Up (+{pg_pct:.1f}%)")
+                reasons.append(f"Prior Day Gap Up (+{pg_pct:.1f}% > 0.33×ADR)")
             if ml is not None and ml < 0.20:
                 reasons.append(f"Low V2 Conviction ({ml*100:.0f}%)")
             if st not in ("classic", "dre", "ep9m", "bigmove"):
@@ -5997,11 +6008,15 @@ def api_chart():
         if prev_gap == "no_gap":
             if "prev_day_gap_up" in t_matches.columns:
                 t_matches = t_matches[~t_matches["prev_day_gap_up"]]
+            elif "prev_day_gap_pct" in t_matches.columns and "adr_pct" in t_matches.columns:
+                t_matches = t_matches[t_matches["prev_day_gap_pct"] <= 0.33 * t_matches["adr_pct"]]
             elif "prev_day_gap_pct" in t_matches.columns:
                 t_matches = t_matches[t_matches["prev_day_gap_pct"] <= 0.0]
         elif prev_gap == "gap_up":
             if "prev_day_gap_up" in t_matches.columns:
                 t_matches = t_matches[t_matches["prev_day_gap_up"]]
+            elif "prev_day_gap_pct" in t_matches.columns and "adr_pct" in t_matches.columns:
+                t_matches = t_matches[t_matches["prev_day_gap_pct"] > 0.33 * t_matches["adr_pct"]]
             elif "prev_day_gap_pct" in t_matches.columns:
                 t_matches = t_matches[t_matches["prev_day_gap_pct"] > 0.0]
 
@@ -6032,6 +6047,8 @@ def api_chart():
                 "ret_20d": round(float(h_row.get("ret_20d", 0.0)), 1) if pd.notna(h_row.get("ret_20d")) else 0.0,
                 "outcome": str(h_row.get("outcome", "")),
                 "violated_48h": bool(h_row.get("violated_48h", False)),
+                "adr_pct": round(float(h_row.get("adr_pct", 5.0)), 1) if pd.notna(h_row.get("adr_pct")) else 5.0,
+                "prev_day_gap_pct": round(float(h_row.get("prev_day_gap_pct", 0.0)), 1) if pd.notna(h_row.get("prev_day_gap_pct")) else 0.0,
                 "prev_day_gap_up": bool(h_row.get("prev_day_gap_up", False)),
                 "ml_50": round(float(h_row.get("ml_50", 0.0)), 3) if pd.notna(h_row.get("ml_50")) else None,
                 "is_qualified": bool(len(disquals) == 0),
@@ -6058,6 +6075,8 @@ def api_chart():
                 "ret_20d": round(float(h_row.get("ret_20d", 0.0)), 1) if pd.notna(h_row.get("ret_20d")) else 0.0,
                 "outcome": str(h_row.get("outcome", "")),
                 "violated_48h": bool(h_row.get("violated_48h", False)),
+                "adr_pct": round(float(h_row.get("adr_pct", 5.0)), 1) if pd.notna(h_row.get("adr_pct")) else 5.0,
+                "prev_day_gap_pct": round(float(h_row.get("prev_day_gap_pct", 0.0)), 1) if pd.notna(h_row.get("prev_day_gap_pct")) else 0.0,
                 "prev_day_gap_up": bool(h_row.get("prev_day_gap_up", False)),
                 "ml_50": round(float(h_row.get("ml_50", 0.0)), 3) if pd.notna(h_row.get("ml_50")) else None,
                 "is_qualified": bool(len(disquals) == 0 and matches_filt),

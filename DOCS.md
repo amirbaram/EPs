@@ -8,6 +8,8 @@ This repository (`amirbaram/EPs`) contains the institutional **Episodic Pivot (E
 |---|---|---|
 | `serve_ep.py` | `http://127.0.0.1:8782` | Historical Review & Strategy Backtester (Delayed Breakout, Day 5 Pyramiding, ML Climax Exit, ML Trailing Stop, Multi-Leg Continuations). |
 | `serve_ep_tracker.py` | `http://127.0.0.1:8783` | Live Multi-Quarter EP Tracker & Real-Time Rolling Telemetry. |
+| `serve_qm.py` | `http://127.0.0.1:8785` | Historical QM Setup & EP Cross-Reference Explorer (Momentum Continuation & EP Catalyst Alignment, Pure Visualizer). |
+| `mine_qm_setups.py` | `data/simulations/qm_historical_setups.parquet` | Precomputing historical QM setups and cross-referencing against the curated EP study dataset. |
 | `ep_ml_engine.py` | — | Feature engineering, rolling ordinal ML, 1-year climax exit classifier, and dynamic trailing stop quantile regressor. |
 | `generate_handbook_pdf.py` | `docs/EP_Pinnacle_Elite_Strategy_Handbook.pdf` | Automatic compiler for the Strategy Handbook PDF. |
 | `scripts/check.sh` | — | Non-negotiable fast CI gate (`tests/` regression suite). Run after every edit. |

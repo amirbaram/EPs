@@ -200,14 +200,15 @@ def build_ep_row(sym: str, dt_str: str, subtype: str, thm_engine) -> dict | None
     sec_m3_pctile = float(sec_info.get("m3_pct", 50.0))
     thm_m1_pctile = float(thm_info.get("m1_pct", 50.0))
 
-    # Previous day gap
+    # Previous day gap (only flagged if gap > 0.33 * ADR)
     prev_day_gap_pct = 0.0
     prev_day_gap_up = False
+    adr_pct_val = float(d["adr_pct"].iloc[pos - 1]) if ("adr_pct" in d.columns and pos > 0 and pd.notna(d["adr_pct"].iloc[pos - 1])) else 5.0
     if pos > 0 and "gap_pct" in d.columns:
         prev_gap = d["gap_pct"].iloc[pos - 1]
         if pd.notna(prev_gap):
             prev_day_gap_pct = float(prev_gap)
-            prev_day_gap_up = bool(prev_day_gap_pct > 0.0)
+            prev_day_gap_up = bool(prev_day_gap_pct > (0.33 * adr_pct_val))
 
     # Forward tracking window
     fwd = d.iloc[pos:].copy()
@@ -427,6 +428,7 @@ def build_ep_row(sym: str, dt_str: str, subtype: str, thm_engine) -> dict | None
         "t1_dyn_pyramid_r": round(t1_dyn_pyramid_r, 3),
         "t1_climax_dyn_pyramid_r": round(t1_climax_dyn_pyramid_r, 3),
         "t1_delayed_climax_pyramid_r": round(t1_delayed_climax_pyramid_r, 3),
+        "adr_pct": round(adr_pct_val, 2),
         "prev_day_gap_pct": round(prev_day_gap_pct, 2),
         "prev_day_gap_up": prev_day_gap_up
     }

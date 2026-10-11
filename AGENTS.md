@@ -7,6 +7,7 @@ Located at `/Users/amirbaram/Documents/code/EPs`.
 ```bash
 .venv/bin/python serve_ep.py          # Historical Review & Strategy Backtester → http://127.0.0.1:8782
 .venv/bin/python serve_ep_tracker.py  # Live Multi-Quarter EP Tracker & Telemetry → http://127.0.0.1:8783
+.venv/bin/python serve_qm.py          # Historical QM Setup & EP Cross-Reference Explorer → http://127.0.0.1:8785
 ```
 Deps: Python 3.13 virtual environment located at `.venv/`. Use `.venv/bin/python` for all execution.
 
@@ -39,6 +40,9 @@ bash scripts/check.sh                 # Byte-compiles core EP modules + runs tes
 |---|---|
 | Historical Review Server & Strategy Engine | `serve_ep.py` (port 8782) |
 | Live Multi-Quarter Tracker Server | `serve_ep_tracker.py` (port 8783) |
+| QM Setup & EP Cross-Reference Server | `serve_qm.py` (port 8785) |
+| Historical QM Mining & EP Linkage Pipeline | `mine_qm_setups.py` |
+| Precomputed QM Setups Dataset | `data/simulations/qm_historical_setups.parquet` |
 | Machine Learning Engine & Feature Extractors | `ep_ml_engine.py` |
 | Technical Indicators & Intermediate Ribbons | `scanner_core.py`, `indicators.py` |
 | Local Datastore Bar Loading | `datastore.py` |

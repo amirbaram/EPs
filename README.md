@@ -14,6 +14,12 @@ Run all commands using the local `.venv` environment:
 
 # 2. Live EP Multi-Quarter Tracker & Rolling Telemetry
 .venv/bin/python serve_ep_tracker.py  # Live Tracker → http://127.0.0.1:8783
+
+# 3. QM Momentum Continuation & EP Catalyst Explorer (Pure Setup Viewer)
+.venv/bin/python serve_qm.py          # QM Viewer → http://127.0.0.1:8785
+
+# Optional: Recompute Historical QM Setups & EP Cross-References
+.venv/bin/python mine_qm_setups.py    # Mines data/bars/*.parquet → data/simulations/qm_historical_setups.parquet
 ```
 
 ### The Non-Negotiable Test Gate
