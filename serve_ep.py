@@ -280,6 +280,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     align-items: center;
     gap: 8px;
   }
+  .workspace.fullscreen-chart-mode #btn_enlarged_stock_list {
+    background: #0284c7 !important;
+    color: #fff !important;
+    border-color: #38bdf8 !important;
+    box-shadow: 0 0 10px rgba(56, 189, 248, 0.4);
+  }
 
   /* Chart Settings Floating Panel */
   .chart-settings-panel {
@@ -426,10 +432,25 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
   /* Modal */
   .modal-overlay {
-    display: none; position: fixed; inset: 0; background: rgba(0, 0, 0, 0.75);
-    z-index: 100; justify-content: center; align-items: center; padding: 20px;
+    display: none; position: fixed; inset: 0; background: rgba(0, 0, 0, 0.8);
+    z-index: 100005 !important; justify-content: center; align-items: center; padding: 20px;
+    backdrop-filter: blur(4px);
   }
   .modal-overlay.active { display: flex; }
+
+  /* Enlarged Stock List Table */
+  .esl-table { width: 100%; border-collapse: collapse; font-size: 11.5px; }
+  .esl-table th {
+    padding: 7px 10px; background: #161e2e; color: #94a3b8; font-weight: 700;
+    text-transform: uppercase; font-size: 10px; letter-spacing: 0.5px;
+    border-bottom: 1px solid #283548; user-select: none;
+  }
+  .esl-table th.tl { text-align: left; }
+  .esl-table td { padding: 6px 10px; border-bottom: 1px solid #1a2333; }
+  .esl-table td.tl { text-align: left; }
+  .esl-table tr { cursor: pointer; transition: background 0.12s ease; }
+  .esl-table tr:hover { background: rgba(56, 189, 248, 0.08); }
+  .esl-table tr.selected { background: rgba(2, 132, 199, 0.22) !important; border-left: 3px solid #38bdf8; }
   .modal-box {
     background: #121722; border: 1px solid #2d3748; border-radius: 8px; width: 100%; max-width: 900px;
     max-height: 85vh; display: flex; flex-direction: column; box-shadow: 0 10px 30px rgba(0,0,0,0.8);
@@ -817,6 +838,13 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           <div id="chart_tags"></div>
           <button id="btn_chart_settings" class="btn-chart-enlarge" onclick="toggleChartSettings()" title="Configure Chart Displays, Markers, and Parameters">⚙️ Settings</button>
           <button id="btn_toggle_draw" class="btn-chart-enlarge" onclick="toggleDrawToolbar()" title="Toggle on-chart drawing tools (Measure, Line, Text, Arrow)">✏️ Tools</button>
+        </div>
+        <button id="btn_enlarged_stock_list" class="btn-chart-enlarge" onclick="openEnlargedStockListModal()" title="Open filtered stock list to select another ticker">
+          📋 Stocks (<span id="lbl_enlarged_stock_count">0</span>)
+        </button>
+        <div style="display:inline-flex; align-items:center; gap:2px;">
+          <button id="btn_chart_prev_ticker" class="btn-chart-enlarge" onclick="stepFilteredStock(-1)" title="Previous ticker in filtered list (Arrow Left)" style="padding:3px 6px;">◀</button>
+          <button id="btn_chart_next_ticker" class="btn-chart-enlarge" onclick="stepFilteredStock(1)" title="Next ticker in filtered list (Arrow Right)" style="padding:3px 6px;">▶</button>
         </div>
         <button id="btn_chart_fullscreen" class="btn-chart-enlarge" onclick="toggleChartFullscreen()" title="Toggle full-screen chart display (Esc to exit)" style="flex-shrink:0;">⛶ Enlarge</button>
       </div>
@@ -1610,6 +1638,58 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   </div>
 </div>
 
+<!-- Filtered Stock List Modal for Enlarged Chart Navigation -->
+<div class="modal-overlay" id="enlarged_stock_list_modal" onclick="closeEnlargedStockListModal(event)">
+  <div class="modal-box" style="width:1120px; max-width:96vw; height:85vh; display:flex; flex-direction:column;" onclick="event.stopPropagation()">
+    <div class="modal-header" style="padding:10px 18px; display:flex; justify-content:space-between; align-items:center; background:#161d2b; border-bottom:1px solid #232f42;">
+      <div style="display:flex; align-items:center; gap:12px; flex:1; flex-wrap:wrap;">
+        <span style="font-size:15px; font-weight:700; color:#fff; display:flex; align-items:center; gap:6px;">
+          📋 Filtered Stock List (<span id="esl_count" style="color:#38bdf8;">0</span>)
+        </span>
+        <div style="position:relative; width:260px;">
+          <input type="text" id="esl_search" placeholder="Quick search symbol, sector, theme..." 
+                 oninput="filterEnlargedStockList(this.value)" 
+                 onkeydown="if(event.key==='Enter'){ const r=document.querySelector('#esl_table_body tr'); if(r) r.click(); }"
+                 style="width:100%; background:#0c1017; border:1px solid #334155; border-radius:4px; padding:5px 10px 5px 28px; color:#fff; font-size:12px; outline:none;">
+          <span style="position:absolute; left:8px; top:6px; font-size:12px; color:#64748b;">🔍</span>
+        </div>
+        <span style="font-size:11px; color:#94a3b8;" id="esl_filter_summary">Current Active Filters</span>
+      </div>
+      <button class="modal-close" onclick="closeEnlargedStockListModal()" style="font-size:22px; line-height:1; padding:2px 8px; cursor:pointer;">&times;</button>
+    </div>
+    <div style="background:#0f172a; padding:6px 18px; border-bottom:1px solid #1e293b; font-size:11px; color:#94a3b8; display:flex; justify-content:space-between; align-items:center;">
+      <span>Click any row to switch chart and dossier immediately. Active ticker is highlighted.</span>
+      <span>Tip: Press <kbd style="background:#1e293b; padding:1px 4px; border-radius:3px; color:#cbd5e1; border:1px solid #334155;">Esc</kbd> to close · <kbd style="background:#1e293b; padding:1px 4px; border-radius:3px; color:#cbd5e1; border:1px solid #334155;">Enter</kbd> to pick first</span>
+    </div>
+    <div style="flex:1; overflow-y:auto; padding:0; background:#0e121a;">
+      <table class="esl-table">
+        <thead style="position:sticky; top:0; z-index:10; background:#161e2e; border-bottom:1px solid #283548;">
+          <tr>
+            <th class="tl" onclick="sortEslBy('date')" style="cursor:pointer;" title="Sort by Date">Date ↕</th>
+            <th class="tl" onclick="sortEslBy('symbol')" style="cursor:pointer;" title="Sort by Symbol">Symbol ↕</th>
+            <th class="tl" style="width:50px;">Type</th>
+            <th class="tl" onclick="sortEslBy('sector')" style="cursor:pointer;" title="Sort by Sector">Sector ↕</th>
+            <th class="tl" onclick="sortEslBy('theme')" style="cursor:pointer;" title="Sort by Theme">Theme ↕</th>
+            <th onclick="sortEslBy('gap_pct')" style="cursor:pointer;" title="Sort by Overnight Gap %">Gap % ↕</th>
+            <th onclick="sortEslBy('rvol')" style="cursor:pointer;" title="Sort by Relative Volume">RVOL ↕</th>
+            <th onclick="sortEslBy('close_pos')" style="cursor:pointer;" title="Sort by Close Position">ClosePos ↕</th>
+            <th class="tl" onclick="sortEslBy('violated_48h')" style="cursor:pointer;" title="Sort by 48H Retracement">48H ↕</th>
+            <th onclick="sortEslBy('ret_20d')" style="cursor:pointer;" title="Sort by 20D Return">20D % ↕</th>
+            <th onclick="sortEslBy('ret_60d')" style="cursor:pointer;" title="Sort by 60D Return">60D % ↕</th>
+            <th onclick="sortEslBy('max_gain')" style="cursor:pointer;" title="Sort by Peak Gain">Peak % ↕</th>
+            <th onclick="sortEslBy('strat_r')" style="cursor:pointer;" title="Sort by Strategy R-Multiple">Strategy R ↕</th>
+            <th class="tl" onclick="sortEslBy('outcome')" style="cursor:pointer;" title="Sort by Outcome">Outcome ↕</th>
+            <th onclick="sortEslBy('ml_50')" style="cursor:pointer;" title="Sort by AI Conviction">AI 50% ↕</th>
+          </tr>
+        </thead>
+        <tbody id="esl_table_body">
+          <!-- Dynamically populated -->
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
 <script>
 let allEvents = [];
 let filteredEvents = [];
@@ -1871,6 +1951,11 @@ function toggleChartFullscreen() {
 
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') {
+    const eslModal = document.getElementById('enlarged_stock_list_modal');
+    if (eslModal && eslModal.classList.contains('active')) {
+      closeEnlargedStockListModal();
+      return;
+    }
     const p = document.getElementById('chart_settings_panel');
     if (p && p.style.display !== 'none') {
       p.style.display = 'none';
@@ -1887,6 +1972,14 @@ document.addEventListener('keydown', (e) => {
     const ws = document.querySelector('.workspace');
     if (ws && ws.classList.contains('fullscreen-chart-mode')) {
       toggleChartFullscreen();
+    }
+  }
+  if ((e.key === 'ArrowLeft' || e.key === 'ArrowRight') && !e.ctrlKey && !e.metaKey && !e.altKey) {
+    if (['INPUT', 'SELECT', 'TEXTAREA'].includes(document.activeElement?.tagName)) return;
+    const ws = document.querySelector('.workspace');
+    if (ws && ws.classList.contains('fullscreen-chart-mode')) {
+      e.preventDefault();
+      stepFilteredStock(e.key === 'ArrowRight' ? 1 : -1);
     }
   }
 });
@@ -2312,6 +2405,7 @@ document.addEventListener('keydown', e => {
   if (e.key === 'Escape') {
     closeHandbook();
     closeGroupStocks();
+    closeEnlargedStockListModal();
   }
 });
 
@@ -3077,6 +3171,8 @@ function renderTable() {
   }).join('');
 
   tbody.innerHTML = rows;
+  const elCount = document.getElementById('lbl_enlarged_stock_count');
+  if (elCount) elCount.textContent = (filteredEvents ? filteredEvents.length : 0).toLocaleString();
 }
 
 function onRowClick(sym, dt) {
@@ -3091,6 +3187,152 @@ function sortBy(col) {
   else { sortCol = col; sortAsc = false; }
   renderTable();
 }
+
+let eslFilterText = '';
+
+function openEnlargedStockListModal() {
+  const modal = document.getElementById('enlarged_stock_list_modal');
+  if (!modal) return;
+  modal.classList.add('active');
+  const searchInput = document.getElementById('esl_search');
+  if (searchInput) searchInput.value = '';
+  eslFilterText = '';
+  renderEnlargedStockList('');
+  setTimeout(() => {
+    if (searchInput) searchInput.focus();
+    const selRow = document.querySelector('#esl_table_body tr.selected');
+    if (selRow) selRow.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  }, 60);
+}
+
+function closeEnlargedStockListModal(e) {
+  if (e && e.target && e.target.id !== 'enlarged_stock_list_modal' && !e.target.classList.contains('modal-close')) return;
+  const modal = document.getElementById('enlarged_stock_list_modal');
+  if (modal) modal.classList.remove('active');
+}
+
+function filterEnlargedStockList(val) {
+  eslFilterText = (val || '').trim().toLowerCase();
+  renderEnlargedStockList(eslFilterText);
+}
+
+function renderEnlargedStockList(query) {
+  const tbody = document.getElementById('esl_table_body');
+  if (!tbody) return;
+  const countEl = document.getElementById('esl_count');
+  const hdrCountEl = document.getElementById('lbl_enlarged_stock_count');
+  const totalCount = filteredEvents ? filteredEvents.length : 0;
+  if (hdrCountEl) hdrCountEl.textContent = totalCount.toLocaleString();
+
+  const q = (query != null ? query : eslFilterText || '').toLowerCase();
+  let list = filteredEvents || [];
+  if (q) {
+    list = list.filter(e => 
+      (e.symbol && e.symbol.toLowerCase().includes(q)) ||
+      (e.sector && e.sector.toLowerCase().includes(q)) ||
+      (e.theme && e.theme.toLowerCase().includes(q)) ||
+      (e.date && e.date.includes(q)) ||
+      (e.outcome && e.outcome.toLowerCase().includes(q))
+    );
+  }
+
+  if (countEl) {
+    countEl.textContent = q ? `${list.length} / ${totalCount}` : totalCount.toLocaleString();
+  }
+
+  const sumEl = document.getElementById('esl_filter_summary');
+  if (sumEl) {
+    const activePreset = currentPreset || 'Custom';
+    sumEl.textContent = `Preset: ${activePreset} · T1: ${(stratConfig.t1_mode||'delayed').toUpperCase()}`;
+  }
+
+  if (!list.length) {
+    tbody.innerHTML = '<tr><td colspan="15" style="text-align:center; padding:30px; color:var(--muted);">No matching stocks found.</td></tr>';
+    return;
+  }
+
+  const rows = list.map(e => {
+    const isSel = (e.symbol === selectedSym && e.date === selectedDate);
+    const tagCls = e.outcome && e.outcome.includes('Runaway') ? 'tag-runaway' :
+                   (e.outcome && e.outcome.includes('Digestion') ? 'tag-digestion' :
+                   (e.outcome && e.outcome.includes('Trap') ? 'tag-trap' : 'tag-fade'));
+    const retraceDisp = e.violated_48h ? '<span class="tag-violated">✗ Lost</span>' : '<span class="tag-held">✓ Held</span>';
+    const c20 = (e.ret_20d != null && e.ret_20d >= 0 ? 'style="color:var(--green);"' : 'style="color:var(--red);"');
+    const c60 = (e.ret_60d != null && e.ret_60d >= 0 ? 'style="color:var(--green);"' : 'style="color:var(--red);"');
+
+    const stratColor = e.strat_r != null ? (e.strat_r > 0 ? 'var(--green)' : (e.strat_r < 0 ? 'var(--red)' : 'var(--muted)')) : 'var(--muted)';
+    const stratDisp = e.strat_r != null
+      ? `${e.strat_r >= 0 ? '+' : ''}${e.strat_r.toFixed(2)} R <span style="font-size:10px; opacity:0.8;">(${e.strat_ret != null && e.strat_ret >= 0 ? '+' : ''}${(e.strat_ret || 0).toFixed(1)}%)</span>`
+      : '·';
+
+    const prevGapBadge = e.prev_day_gap_up
+      ? `<br><span style="color:#f59e0b; font-size:9px; font-weight:600;" title="Prior day (D-1) gapped up by ${e.prev_day_gap_pct}%">⚠️ P-Gap +${Number(e.prev_day_gap_pct || 0).toFixed(0)}%</span>`
+      : `<br><span style="color:#10b981; font-size:9px;" title="Clean pivot">✓ Clean</span>`;
+
+    const subBadge = (e.subtype === 'dre')
+      ? '<span style="background:rgba(244,63,94,0.2); color:#fb7185; padding:1px 4px; border-radius:3px; font-size:9px; font-weight:700;">DRE</span>'
+      : '<span style="background:rgba(56,189,248,0.2); color:#38bdf8; padding:1px 4px; border-radius:3px; font-size:9px; font-weight:700;">EP</span>';
+
+    return `<tr class="${isSel ? 'selected' : ''}" onclick="onEslRowClick('${e.symbol}','${e.date}')">
+      <td class="tl">${e.date}</td>
+      <td class="tl" style="font-weight:700; color:#fff; font-size:12px;">${e.symbol}</td>
+      <td class="tl">${subBadge}</td>
+      <td class="tl" style="max-width:120px; overflow:hidden; text-overflow:ellipsis; color:#38bdf8;">${e.sector || '·'}</td>
+      <td class="tl" style="max-width:120px; overflow:hidden; text-overflow:ellipsis; color:#c084fc;">${e.theme || '·'}</td>
+      <td>${e.gap_pct != null ? e.gap_pct.toFixed(1) + '%' + prevGapBadge : '·'}</td>
+      <td>${e.rvol != null ? e.rvol.toFixed(1) + 'x' : '·'}</td>
+      <td>${e.close_pos != null ? e.close_pos.toFixed(2) : '·'}</td>
+      <td class="tl">${retraceDisp}</td>
+      <td ${c20}>${e.ret_20d != null ? (e.ret_20d >= 0 ? '+' : '') + e.ret_20d.toFixed(1) + '%' : '·'}</td>
+      <td ${c60}>${e.ret_60d != null ? (e.ret_60d >= 0 ? '+' : '') + e.ret_60d.toFixed(1) + '%' : '·'}</td>
+      <td style="font-weight:700; color:var(--gold);">${e.max_gain != null ? e.max_gain.toFixed(1) + '%' : '·'}</td>
+      <td style="font-weight:700; color:${stratColor};">${stratDisp}</td>
+      <td class="tl"><span class="tag ${tagCls}">${e.outcome || '·'}</span></td>
+      <td style="${e.ml_50 > 0.40 ? 'background-color:rgba(34, 197, 94, 0.2); font-weight:bold; color:#22c55e;' : ''}">${e.ml_50 != null ? (e.ml_50 * 100).toFixed(1) + '%' : '·'}</td>
+    </tr>`;
+  }).join('');
+
+  tbody.innerHTML = rows;
+}
+
+function onEslRowClick(sym, dt) {
+  selectedSym = sym;
+  selectedDate = dt;
+  renderTable();
+  const ev = filteredEvents.find(e => e.symbol === sym && e.date === dt);
+  if (ev) loadChart(ev);
+  closeEnlargedStockListModal();
+}
+
+function sortEslBy(col) {
+  sortBy(col);
+  renderEnlargedStockList();
+}
+
+function stepFilteredStock(delta) {
+  if (!filteredEvents || !filteredEvents.length) return;
+  let idx = filteredEvents.findIndex(e => e.symbol === selectedSym && e.date === selectedDate);
+  if (idx === -1) idx = 0;
+  else {
+    idx = (idx + delta + filteredEvents.length) % filteredEvents.length;
+  }
+  const nextEv = filteredEvents[idx];
+  if (nextEv) {
+    selectedSym = nextEv.symbol;
+    selectedDate = nextEv.date;
+    renderTable();
+    loadChart(nextEv);
+    const modal = document.getElementById('enlarged_stock_list_modal');
+    if (modal && modal.classList.contains('active')) {
+      renderEnlargedStockList();
+      setTimeout(() => {
+        const selRow = document.querySelector('#esl_table_body tr.selected');
+        if (selRow) selRow.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+      }, 50);
+    }
+  }
+}
+
 
 function loadChart(ev) {
   window._currentChartEvent = ev;

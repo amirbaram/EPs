@@ -945,6 +945,44 @@ class TestClimaxTrailer(unittest.TestCase):
         self.assertIn("sec_filings", d_cat)
 
 
+    def test_enlarged_chart_stock_list_modal_and_ticker_switching(self):
+        """Regression test: verifies enlarged chart stock list button, modal, in-modal filter,
+        and keyboard/button ticker navigation controls.
+        Seed: 20261011, Date: 2026-10-11.
+        """
+        import serve_ep
+        client = serve_ep.app.test_client()
+
+        # 1. Verify buttons and modal elements in HTML template
+        self.assertIn('id="btn_enlarged_stock_list"', serve_ep.HTML_TEMPLATE)
+        self.assertIn('id="lbl_enlarged_stock_count"', serve_ep.HTML_TEMPLATE)
+        self.assertIn('id="btn_chart_prev_ticker"', serve_ep.HTML_TEMPLATE)
+        self.assertIn('id="btn_chart_next_ticker"', serve_ep.HTML_TEMPLATE)
+        self.assertIn('id="enlarged_stock_list_modal"', serve_ep.HTML_TEMPLATE)
+        self.assertIn('id="esl_search"', serve_ep.HTML_TEMPLATE)
+        self.assertIn('id="esl_count"', serve_ep.HTML_TEMPLATE)
+        self.assertIn('id="esl_table_body"', serve_ep.HTML_TEMPLATE)
+
+        # 2. Verify JavaScript functions for modal operation
+        self.assertIn('function openEnlargedStockListModal(', serve_ep.HTML_TEMPLATE)
+        self.assertIn('function closeEnlargedStockListModal(', serve_ep.HTML_TEMPLATE)
+        self.assertIn('function filterEnlargedStockList(', serve_ep.HTML_TEMPLATE)
+        self.assertIn('function renderEnlargedStockList(', serve_ep.HTML_TEMPLATE)
+        self.assertIn('function onEslRowClick(', serve_ep.HTML_TEMPLATE)
+        self.assertIn('function sortEslBy(', serve_ep.HTML_TEMPLATE)
+        self.assertIn('function stepFilteredStock(', serve_ep.HTML_TEMPLATE)
+
+        # 3. Verify high z-index and fullscreen styling
+        self.assertIn('z-index: 100005 !important;', serve_ep.HTML_TEMPLATE)
+        self.assertIn('.workspace.fullscreen-chart-mode #btn_enlarged_stock_list', serve_ep.HTML_TEMPLATE)
+
+        # 4. Verify main page serves 200 with new modal elements
+        resp = client.get('/')
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn(b'id="btn_enlarged_stock_list"', resp.data)
+        self.assertIn(b'id="enlarged_stock_list_modal"', resp.data)
+
+
 if __name__ == "__main__":
     unittest.main()
 
