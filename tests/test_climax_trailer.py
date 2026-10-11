@@ -914,6 +914,36 @@ class TestClimaxTrailer(unittest.TestCase):
             self.assertGreater(val["pts"], 0.0)
             self.assertGreater(val["pct"], 0.0)
 
+    def test_historical_catalyst_and_sec_filings_enrichment(self):
+        """Regression test: verifies historical EP catalyst classification and SEC EDGAR filing attachment in /api/chart.
+        Seed: 20261011, Date: 2026-10-11.
+        """
+        import serve_ep
+        import ep_catalyst_enricher
+        client = serve_ep.app.test_client()
+
+        # 1. Verify ep_catalyst_enricher direct lookup
+        cat = ep_catalyst_enricher.get_catalyst_dossier("SMMT", "2026-09-03", sector="Biotechnology", theme="Biotechnology")
+        self.assertIsInstance(cat, dict)
+        self.assertEqual(cat["symbol"], "SMMT")
+        self.assertIn("category", cat)
+        self.assertIn("headline", cat)
+        self.assertIn("sec_filings", cat)
+        self.assertIsInstance(cat["sec_filings"], list)
+
+        # 2. Verify /api/chart returns dossier with catalyst and filings
+        resp = client.get("/api/chart?symbol=SMMT&date=2026-09-03")
+        self.assertEqual(resp.status_code, 200)
+        data = resp.get_json()
+        self.assertIn("dossier", data)
+        self.assertIn("catalyst", data["dossier"])
+        d_cat = data["dossier"]["catalyst"]
+        self.assertIn("category", d_cat)
+        self.assertIn("headline", d_cat)
+        self.assertIn("tier", d_cat)
+        self.assertIn("analysis", d_cat)
+        self.assertIn("sec_filings", d_cat)
+
 
 if __name__ == "__main__":
     unittest.main()

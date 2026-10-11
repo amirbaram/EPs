@@ -26,6 +26,7 @@ import indicators
 import scanner_core
 import thematic_engine
 from ep_ml_engine import engine
+import ep_catalyst_enricher
 
 app = Flask(__name__)
 
@@ -1115,6 +1116,31 @@ HTML_TEMPLATE = """<!DOCTYPE html>
              <div id="ai_reentry" style="color: #34d399; padding: 4px; border: 1px solid #34d399; border-radius: 4px; display: none; text-align: center; margin-top: 5px;">♻️ ML TRADE 2/3 RE-ENTRY: <span id="ai_reentry_val"></span></div>
          </div>
 
+      </div>
+    <!-- Card: Fundamental Catalyst & SEC EDGAR Filings -->
+    <div class="panel-card" id="card_catalyst" style="display:none; border-color:#8b5cf6;">
+      <div class="panel-card-title">
+        <span style="color:#c084fc;">📰 Fundamental Catalyst &amp; SEC EDGAR</span>
+        <span id="cat_tier_badge" class="pctile-badge pctile-high" style="background:#2e1065; color:#c4b5fd; border:1px solid #7c3aed; font-size:10px;">Tier-1 Catalyst</span>
+      </div>
+      <div style="display:flex; flex-direction:column; gap:8px;">
+        <div style="background:#131722; border-left:3px solid #8b5cf6; padding:8px 10px; border-radius:4px;">
+          <div style="font-size:10px; color:#94a3b8; text-transform:uppercase; font-weight:700;" id="cat_category">Catalyst Category</div>
+          <div style="font-size:12px; font-weight:700; color:#fff; margin-top:2px;" id="cat_headline">Headline Loading...</div>
+        </div>
+        <div style="font-size:11px; color:#cbd5e1; line-height:1.45; background:#0b0e14; padding:8px 10px; border-radius:4px; border:1px solid #1e283d;">
+          <div style="font-size:10px; color:#38bdf8; font-weight:700; margin-bottom:4px; text-transform:uppercase;">🏛️ Institutional Trajectory Analysis:</div>
+          <div id="cat_analysis">Institutional volume surge triggering structural repricing.</div>
+        </div>
+        <div>
+          <div style="font-size:10px; color:var(--muted); text-transform:uppercase; font-weight:700; margin-bottom:4px; display:flex; justify-content:space-between;">
+            <span>Official SEC EDGAR Filings (T-3 to T+1):</span>
+            <span id="filing_count_badge" style="color:#38bdf8;">0 Filings</span>
+          </div>
+          <div id="filings_list" style="display:flex; flex-direction:column; gap:4px; font-size:10.5px;">
+            <div style="color:var(--muted); font-style:italic;">No official SEC filings in window.</div>
+          </div>
+        </div>
       </div>
     </div>
 
@@ -3251,6 +3277,51 @@ function loadChart(ev) {
       document.getElementById('card_sec_thm').style.display = 'flex';
     }
 
+    // Fundamental Catalyst & SEC EDGAR Filings Card
+    if (d && d.catalyst) {
+      const cat = d.catalyst;
+      const catCard = document.getElementById('card_catalyst');
+      if (catCard) catCard.style.display = 'block';
+      const elCat = document.getElementById('cat_category');
+      if (elCat) elCat.textContent = cat.category || 'Institutional Event';
+      const elHead = document.getElementById('cat_headline');
+      if (elHead) elHead.textContent = cat.headline || `${ev.symbol} Institutional Repricing`;
+      const elAna = document.getElementById('cat_analysis');
+      if (elAna) elAna.textContent = cat.analysis || `${ev.symbol} experienced an episodic volume surge.`;
+      const elTier = document.getElementById('cat_tier_badge');
+      if (elTier) elTier.textContent = cat.tier || 'Tier-1 Catalyst';
+
+      const filingsList = document.getElementById('filings_list');
+      const filingsCountBadge = document.getElementById('filing_count_badge');
+      const filings = cat.sec_filings || [];
+      if (filingsCountBadge) filingsCountBadge.textContent = `${filings.length} Filing${filings.length === 1 ? '' : 's'}`;
+
+      if (filingsList) {
+        if (!filings.length) {
+          filingsList.innerHTML = '<div style="color:var(--muted); font-style:italic; padding:4px 0;">No official SEC filings within 3 days. Catalyst driven by press release, earnings release, or analyst upgrade.</div>';
+        } else {
+          filingsList.innerHTML = filings.map(f => {
+            const is8K = f.form && (f.form.includes('8-K') || f.form.includes('6-K'));
+            const badgeCol = is8K ? '#8b5cf6' : '#0284c7';
+            const itemsText = f.items ? `· Items: <b>${f.items}</b>` : '';
+            return `
+              <div style="background:#131826; border:1px solid #202b3f; border-radius:4px; padding:5px 8px; display:flex; justify-content:space-between; align-items:center;">
+                <div style="min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; margin-right:8px;">
+                  <span class="badge" style="background:${badgeCol}; color:#fff; font-size:9.5px; padding:1px 5px; border-radius:3px;">Form ${f.form}</span>
+                  <span style="color:#cbd5e1; margin-left:6px; font-weight:600;">${f.date}</span>
+                  <span style="color:#94a3b8; margin-left:4px; font-size:10px;">${itemsText}</span>
+                </div>
+                ${f.url ? `<a href="${f.url}" target="_blank" rel="noopener noreferrer" style="color:#38bdf8; text-decoration:none; font-weight:700; font-size:10.5px; flex-shrink:0;" title="View official SEC filing on EDGAR archive">View SEC EDGAR ↗</a>` : ''}
+              </div>
+            `;
+          }).join('');
+        }
+      }
+    } else {
+      const catCard = document.getElementById('card_catalyst');
+      if (catCard) catCard.style.display = 'none';
+    }
+
     // 2. Stepper & Trade 1 Dossier
     if (d && d.windows && d.trade_1) {
       const w = d.windows;
@@ -4243,6 +4314,19 @@ def api_events():
     q = q.sort_values("date", ascending=False)
     raw_records = q.to_dict(orient="records")
     records = [{k: _clean_val(v) for k, v in r.items()} for r in raw_records]
+    try:
+        hist_cats = ep_catalyst_enricher._load_json(ep_catalyst_enricher.HIST_CATALYSTS_PATH)
+        cur_cats = ep_catalyst_enricher._load_json(ep_catalyst_enricher.CURATED_CATALYSTS_PATH)
+        for r in records:
+            s = r.get("symbol", "")
+            d = r.get("date", "")
+            c = hist_cats.get(f"{s}_{d}") or cur_cats.get(s)
+            if c:
+                r["catalyst_category"] = c.get("category")
+                r["catalyst_headline"] = c.get("headline")
+                r["has_sec_filings"] = len(c.get("sec_filings", [])) > 0
+    except Exception:
+        pass
     return jsonify({"events": records, "kpis": kpis})
 
 def compute_dossier(sym: str, date_str: str, d: pd.DataFrame, pos: int, ev_row: dict | None,
@@ -5194,7 +5278,8 @@ def compute_dossier(sym: str, date_str: str, d: pd.DataFrame, pos: int, ev_row: 
         "windows": {"w1": w1, "w2": w2, "w3": w3, "w4": w4},
         "trade_1": trade_1,
         "trade_2": trade_2,
-        "trade_3": trade_3
+        "trade_3": trade_3,
+        "catalyst": ep_catalyst_enricher.get_catalyst_dossier(sym, date_str, sector=sec, theme=thm)
     }
 
 import ep_predictor
