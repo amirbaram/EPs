@@ -3491,7 +3491,8 @@ function loadChart(ev) {
         onSliderMove(5);
     }
 
-    if (d && d.sector_theme) {
+    try {
+      if (d && d.sector_theme) {
       const st = d.sector_theme;
       document.getElementById('ctx_sec_name').textContent = st.sector || 'Unknown';
       const sec1El = document.getElementById('ctx_sec_m1');
@@ -3567,6 +3568,7 @@ function loadChart(ev) {
         }
       }
 
+      const newsContainer = document.getElementById('sec_news_container');
       const newsList = document.getElementById('news_articles_list');
       const newsCountBadge = document.getElementById('news_count_badge');
       const rawArticles = cat.news_articles || [];
@@ -3841,8 +3843,11 @@ function loadChart(ev) {
       document.getElementById('t2_none_msg').style.display = 'block';
       cardT2.style.display = 'flex';
     }
+  } catch (dossierErr) {
+    console.error('Error populating dossier panels:', dossierErr);
+  }
 
-    // 4. Center Candlestick Chart
+  // 4. Center Candlestick Chart
     candleSeries.setData(data.bars);
     volSeries.setData(data.volume);
     window._lastVolMa20Data = data.vol_ma20 || [];
