@@ -930,19 +930,19 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             <div class="settings-sec-title">🎯 TRADE MARKINGS &amp; PRICE LINES</div>
             <div class="settings-row">
               <label class="toggle-control" style="margin:0; font-size:11px;" title="Show/hide Trade 1 Base EP entry arrow, stop loss, trigger, climax, and trailing stop lines">
-                <input type="checkbox" id="chk_mark_t1" checked onchange="onChartDisplaySettingChange()">
+                <input type="checkbox" id="chk_mark_t1" onchange="onChartDisplaySettingChange()">
                 <span class="toggle-label" style="color:#10b981;">Trade 1 Markers &amp; Stops</span>
               </label>
             </div>
             <div class="settings-row">
               <label class="toggle-control" style="margin:0; font-size:11px;" title="Show/hide Trade 2 Undercut &amp; Reclaim / Base Breakout entry arrow and stop loss">
-                <input type="checkbox" id="chk_mark_t2" checked onchange="onChartDisplaySettingChange()">
+                <input type="checkbox" id="chk_mark_t2" onchange="onChartDisplaySettingChange()">
                 <span class="toggle-label" style="color:#fbbf24;">Trade 2 Re-Entry Markers</span>
               </label>
             </div>
             <div class="settings-row">
               <label class="toggle-control" style="margin:0; font-size:11px;" title="Show/hide Trade 3 continuation entry arrow and stop loss">
-                <input type="checkbox" id="chk_mark_t3" checked onchange="onChartDisplaySettingChange()">
+                <input type="checkbox" id="chk_mark_t3" onchange="onChartDisplaySettingChange()">
                 <span class="toggle-label" style="color:#a855f7;">Trade 3 Continuation Markers</span>
               </label>
             </div>
@@ -1705,10 +1705,41 @@ let stratConfig = {
   climax_r_hurdle: 3.0
 };
 
-/* --- On-Chart Drawing Tools (Measure, Line, Text, Arrow) --- */
+/* --- On-Chart Drawing Tools (Measure, Line, Text, Arrow) with Disk Persistence --- */
 let currentDrawTool = 'cursor';
 let drawings = [];
 let drawStart = null;
+let currentChartSymbol = null;
+
+function saveCurrentDrawings() {
+  const sym = currentChartSymbol || (window._currentChartEvent ? window._currentChartEvent.symbol : null);
+  if (!sym) return;
+  fetch('/api/annotations', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ symbol: sym, drawings: drawings })
+  }).then(r => r.json()).catch(err => {
+    console.error('Failed to save drawings to disk:', err);
+  });
+}
+
+function loadDrawingsForSymbol(sym) {
+  if (!sym) return;
+  currentChartSymbol = sym;
+  fetch(`/api/annotations?symbol=${encodeURIComponent(sym)}`)
+    .then(r => r.json())
+    .then(res => {
+      if (currentChartSymbol === sym) {
+        drawings = (res && Array.isArray(res.drawings)) ? res.drawings : [];
+        renderAllDrawings();
+      }
+    })
+    .catch(err => {
+      console.warn('Could not load drawings for ' + sym, err);
+      drawings = [];
+      renderAllDrawings();
+    });
+}
 
 function toggleDrawToolbar() {
   const tb = document.getElementById('chart_draw_toolbar');
@@ -1740,6 +1771,7 @@ function clearAllDrawings() {
   drawStart = null;
   clearDrawPreview();
   renderAllDrawings();
+  saveCurrentDrawings();
 }
 
 function clearDrawPreview() {
@@ -1755,10 +1787,17 @@ function getCanvasCoords(e) {
   const y = e.clientY - rect.top;
   const price = candleSeries ? candleSeries.coordinateToPrice(y) : null;
   let time = chart ? chart.timeScale().coordinateToTime(x) : null;
-  if (time && typeof time === 'object' && time.year) {
-    const mm = String(time.month).padStart(2, '0');
-    const dd = String(time.day).padStart(2, '0');
-    time = `${time.year}-${mm}-${dd}`;
+  if (time) {
+    if (typeof time === 'object' && time.year) {
+      const mm = String(time.month).padStart(2, '0');
+      const dd = String(time.day).padStart(2, '0');
+      time = `${time.year}-${mm}-${dd}`;
+    } else if (typeof time === 'number') {
+      const dt = new Date(time * 1000);
+      if (!isNaN(dt.getTime())) {
+        time = dt.toISOString().split('T')[0];
+      }
+    }
   }
   return { x, y, price, time, w: rect.width || 1, h: rect.height || 1 };
 }
@@ -1799,6 +1838,7 @@ function onCanvasMouseDown(e) {
         text: note.trim()
       });
       renderAllDrawings();
+      saveCurrentDrawings();
     }
     setDrawTool('cursor');
     return;
@@ -1836,6 +1876,7 @@ function commitDrawing(p1, p2, tool) {
     y2_rel: p2.y / h
   });
   renderAllDrawings();
+  saveCurrentDrawings();
 }
 
 function renderPreviewDrawing(p1, p2, tool) {
@@ -3334,6 +3375,7 @@ function stepFilteredStock(delta) {
 
 function loadChart(ev) {
   window._currentChartEvent = ev;
+  loadDrawingsForSymbol(ev.symbol);
   document.getElementById('chart_sym').textContent = `${ev.symbol} — ${ev.date} (${(ev.subtype||'ep').toUpperCase()})`;
   document.getElementById('chart_sub').textContent =
     `Gap: +${(ev.gap_pct||0).toFixed(1)}% | RVOL: ${(ev.rvol||0).toFixed(1)}x | 20D: ${(ev.ret_20d||0).toFixed(1)}% | 60D: ${(ev.ret_60d||0).toFixed(1)}% | Peak: +${(ev.max_gain||0).toFixed(1)}%`;
@@ -3341,7 +3383,11 @@ function loadChart(ev) {
   const lFastest = document.getElementById('cfg_larsson_fastest') ? document.getElementById('cfg_larsson_fastest').value : '32';
   const v2Val = document.getElementById('f_v2') ? document.getElementById('f_v2').value : '';
   const prevGapVal = document.getElementById('f_prev_gap') ? document.getElementById('f_prev_gap').value : '';
-  const chartUrl = `/api/chart?symbol=${ev.symbol}&date=${ev.date}&t1_mode=${stratConfig.t1_mode}&use_trade1=${stratConfig.use_trade1?1:0}&use_pyramid=${stratConfig.use_pyramid?1:0}&use_ml_climax=${stratConfig.use_ml_climax?1:0}&use_ml_stop=${stratConfig.use_ml_stop?1:0}&use_multileg=${stratConfig.use_multileg?1:0}&use_multileg_ml=${stratConfig.use_multileg_ml?1:0}&climax_partial_pct=${stratConfig.climax_partial_pct}&climax_r_hurdle=${stratConfig.climax_r_hurdle}&larsson_fastest=${lFastest}&v2=${v2Val}&prev_gap=${prevGapVal}`;
+  const recentDaysEl = document.getElementById('f_recent_days');
+  const recentDaysVal = recentDaysEl ? recentDaysEl.value : '';
+  const recentDaysParam = (recentDaysVal === 'custom' && document.getElementById('f_recent_days_custom')) ? document.getElementById('f_recent_days_custom').value : recentDaysVal;
+  const subtypeVal = document.getElementById('f_subtype') ? document.getElementById('f_subtype').value : '';
+  const chartUrl = `/api/chart?symbol=${ev.symbol}&date=${ev.date}&t1_mode=${stratConfig.t1_mode}&use_trade1=${stratConfig.use_trade1?1:0}&use_pyramid=${stratConfig.use_pyramid?1:0}&use_ml_climax=${stratConfig.use_ml_climax?1:0}&use_ml_stop=${stratConfig.use_ml_stop?1:0}&use_multileg=${stratConfig.use_multileg?1:0}&use_multileg_ml=${stratConfig.use_multileg_ml?1:0}&climax_partial_pct=${stratConfig.climax_partial_pct}&climax_r_hurdle=${stratConfig.climax_r_hurdle}&larsson_fastest=${lFastest}&v2=${v2Val}&prev_gap=${prevGapVal}&recent_days=${encodeURIComponent(recentDaysParam)}&subtype=${encodeURIComponent(subtypeVal)}`;
 
   fetch(chartUrl).then(r => r.json()).then(data => {
     if (!data || !data.bars || !data.bars.length) return;
@@ -3928,9 +3974,9 @@ function renderChartMarkersAndLines(data) {
 
   const markers = [];
 
-  const showT1 = document.getElementById('chk_mark_t1') ? document.getElementById('chk_mark_t1').checked : true;
-  const showT2 = document.getElementById('chk_mark_t2') ? document.getElementById('chk_mark_t2').checked : true;
-  const showT3 = document.getElementById('chk_mark_t3') ? document.getElementById('chk_mark_t3').checked : true;
+  const showT1 = document.getElementById('chk_mark_t1') ? document.getElementById('chk_mark_t1').checked : false;
+  const showT2 = document.getElementById('chk_mark_t2') ? document.getElementById('chk_mark_t2').checked : false;
+  const showT3 = document.getElementById('chk_mark_t3') ? document.getElementById('chk_mark_t3').checked : false;
   const showAllEps = document.getElementById('chk_mark_all_eps') ? document.getElementById('chk_mark_all_eps').checked : (document.getElementById('chk_mark_eps') ? document.getElementById('chk_mark_eps').checked : true);
   const showFiltEps = document.getElementById('chk_mark_filt_eps') ? document.getElementById('chk_mark_filt_eps').checked : false;
 
@@ -4066,7 +4112,7 @@ function renderChartMarkersAndLines(data) {
       const gapStr = h.gap_pct != null ? `+${h.gap_pct.toFixed(0)}%` : '';
       const rvolStr = h.rvol != null ? `${h.rvol.toFixed(1)}x` : '';
       const gainStr = (h.max_gain != null && h.max_gain > 0) ? `(+${h.max_gain.toFixed(0)}% run)` : '';
-      const isQual = (h.is_qualified !== false);
+      const isQual = Boolean((h.is_qualified === true || h.is_qualified === 1) && (!h.disqualifications || h.disqualifications.length === 0) && (h.matches_filters !== false));
       const failReason = (h.disqualifications && h.disqualifications.length > 0) ? h.disqualifications[0] : (h.primary_reason || 'Filtered');
 
       let markerColor = '#06b6d4';
@@ -4084,15 +4130,20 @@ function renderChartMarkersAndLines(data) {
           markerText = `🚫 FILTERED: ${failReason} (${gapStr} RVOL ${rvolStr})`;
         }
       } else {
-        markerColor = showFiltEps ? '#c084fc' : '#06b6d4';
-        markerText = `⚡ EP: ${gapStr} (RVOL ${rvolStr}) ${gainStr}`;
+        if (isQual) {
+          markerColor = showFiltEps ? '#c084fc' : '#10b981';
+          markerText = `⚡ QUALIFIED EP: ${gapStr} (RVOL ${rvolStr}) ${gainStr}`;
+        } else {
+          markerColor = '#64748b';
+          markerText = `🚫 FILTERED EP: ${gapStr} (RVOL ${rvolStr})`;
+        }
       }
       
       markers.push({
         time: h.date,
         position: 'belowBar',
         color: markerColor,
-        shape: 'circle',
+        shape: isCur ? 'circle' : (isQual ? 'circle' : 'square'),
         text: markerText
       });
     });
@@ -5928,26 +5979,6 @@ def api_chart():
                 reasons.append(f"Subtype: {st}")
             return reasons
 
-        all_ticker_events = []
-        for _, h_row in df[df["symbol"] == sym].sort_values("date", ascending=False).iterrows():
-            disquals = _calc_disqualifications(h_row)
-            all_ticker_events.append({
-                "date": str(h_row["date"]),
-                "subtype": str(h_row.get("subtype", "ep")),
-                "gap_pct": round(float(h_row.get("gap_pct", 0.0)), 1),
-                "rvol": round(float(h_row.get("rvol", 0.0)), 1),
-                "close_pos": round(float(h_row.get("close_pos", 0.0)), 2),
-                "max_gain": round(float(h_row.get("max_gain", 0.0)), 1) if pd.notna(h_row.get("max_gain")) else None,
-                "ret_20d": round(float(h_row.get("ret_20d", 0.0)), 1) if pd.notna(h_row.get("ret_20d")) else 0.0,
-                "outcome": str(h_row.get("outcome", "")),
-                "violated_48h": bool(h_row.get("violated_48h", False)),
-                "prev_day_gap_up": bool(h_row.get("prev_day_gap_up", False)),
-                "ml_50": round(float(h_row.get("ml_50", 0.0)), 3) if pd.notna(h_row.get("ml_50")) else None,
-                "is_qualified": (len(disquals) == 0),
-                "disqualifications": disquals,
-                "primary_reason": disquals[0] if disquals else None
-            })
-
         # Extract historical valid EP events for this ticker across history, respecting active filters
         t_matches = df[df["symbol"] == sym].sort_values("date", ascending=False)
         v2_filter = request.args.get("v2", "")
@@ -5985,6 +6016,10 @@ def api_chart():
             except (ValueError, TypeError):
                 pass
 
+        subtype_filt = request.args.get("subtype", "")
+        if subtype_filt and subtype_filt != "all":
+            t_matches = t_matches[t_matches["subtype"] == subtype_filt]
+
         for _, h_row in t_matches.iterrows():
             disquals = _calc_disqualifications(h_row)
             ticker_history.append({
@@ -5999,7 +6034,34 @@ def api_chart():
                 "violated_48h": bool(h_row.get("violated_48h", False)),
                 "prev_day_gap_up": bool(h_row.get("prev_day_gap_up", False)),
                 "ml_50": round(float(h_row.get("ml_50", 0.0)), 3) if pd.notna(h_row.get("ml_50")) else None,
-                "is_qualified": (len(disquals) == 0),
+                "is_qualified": bool(len(disquals) == 0),
+                "matches_filters": True,
+                "disqualifications": disquals,
+                "primary_reason": disquals[0] if disquals else None
+            })
+
+        filtered_dates = set(t["date"] for t in ticker_history)
+        all_ticker_events = []
+        for _, h_row in df[df["symbol"] == sym].sort_values("date", ascending=False).iterrows():
+            h_date = str(h_row["date"])
+            disquals = _calc_disqualifications(h_row)
+            matches_filt = (h_date in filtered_dates)
+            if not matches_filt and len(disquals) == 0:
+                disquals.append("Outside Active Filter")
+            all_ticker_events.append({
+                "date": h_date,
+                "subtype": str(h_row.get("subtype", "ep")),
+                "gap_pct": round(float(h_row.get("gap_pct", 0.0)), 1),
+                "rvol": round(float(h_row.get("rvol", 0.0)), 1),
+                "close_pos": round(float(h_row.get("close_pos", 0.0)), 2),
+                "max_gain": round(float(h_row.get("max_gain", 0.0)), 1) if pd.notna(h_row.get("max_gain")) else None,
+                "ret_20d": round(float(h_row.get("ret_20d", 0.0)), 1) if pd.notna(h_row.get("ret_20d")) else 0.0,
+                "outcome": str(h_row.get("outcome", "")),
+                "violated_48h": bool(h_row.get("violated_48h", False)),
+                "prev_day_gap_up": bool(h_row.get("prev_day_gap_up", False)),
+                "ml_50": round(float(h_row.get("ml_50", 0.0)), 3) if pd.notna(h_row.get("ml_50")) else None,
+                "is_qualified": bool(len(disquals) == 0 and matches_filt),
+                "matches_filters": bool(matches_filt),
                 "disqualifications": disquals,
                 "primary_reason": disquals[0] if disquals else None
             })
@@ -6011,10 +6073,10 @@ def api_chart():
             return [clean_json(v) for v in obj]
         elif isinstance(obj, (np.floating, float)):
             return None if (pd.isna(obj) or np.isneginf(obj) or np.isposinf(obj)) else round(float(obj), 2)
-        elif isinstance(obj, (np.integer, int)):
-            return int(obj)
         elif isinstance(obj, (np.bool_, bool)):
             return bool(obj)
+        elif isinstance(obj, (np.integer, int)):
+            return int(obj)
         elif pd.isna(obj):
             return None
         return obj
@@ -6076,6 +6138,43 @@ def api_chart():
         "exhaustion": compute_daily_exhaustion(d, pos, max_bars=120)
     }
     return jsonify(clean_json(res))
+
+ANNOTATIONS_DIR = Path("data/annotations")
+ANNOTATIONS_DIR.mkdir(parents=True, exist_ok=True)
+
+@app.route("/api/annotations", methods=["GET", "POST"])
+def api_annotations():
+    if request.method == "GET":
+        sym = request.args.get("symbol", "").upper().strip()
+        if not sym:
+            return jsonify({"symbol": "", "drawings": []})
+        file_path = ANNOTATIONS_DIR / f"{sym}.json"
+        if file_path.exists():
+            try:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                return jsonify(data)
+            except Exception as e:
+                return jsonify({"symbol": sym, "drawings": [], "error": str(e)})
+        return jsonify({"symbol": sym, "drawings": []})
+
+    elif request.method == "POST":
+        try:
+            payload = request.get_json(force=True, silent=True) or {}
+            sym = str(payload.get("symbol", "")).upper().strip()
+            drawings = payload.get("drawings", [])
+            if not sym:
+                return jsonify({"success": False, "error": "Missing symbol"}), 400
+            file_path = ANNOTATIONS_DIR / f"{sym}.json"
+            if not drawings:
+                if file_path.exists():
+                    file_path.unlink()
+            else:
+                with open(file_path, "w", encoding="utf-8") as f:
+                    json.dump({"symbol": sym, "drawings": drawings}, f, indent=2)
+            return jsonify({"success": True, "count": len(drawings)})
+        except Exception as e:
+            return jsonify({"success": False, "error": str(e)}), 500
 
 def main():
     parser = argparse.ArgumentParser(description="EP Review Server")
