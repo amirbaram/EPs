@@ -24,6 +24,7 @@ import numpy as np
 import pandas as pd
 from flask import Flask, jsonify, render_template_string, request
 
+import build_rs_history
 import config
 import datastore
 import ep_catalyst_enricher
@@ -104,6 +105,22 @@ def compute_universe_rs(force: bool = False) -> pd.DataFrame:
 
     symbols = datastore.list_symbols()
 
+    def _normalize_split_seams(c: np.ndarray, o: np.ndarray, v: np.ndarray) -> np.ndarray:
+        n = len(c)
+        if n < 10:
+            return c
+        c_adj = c.copy()
+        v_series = pd.Series(v)
+        v_ma10 = v_series.shift(1).rolling(10, min_periods=3).median().to_numpy()
+        for i in range(n - 1):
+            if c_adj[i] <= 0 or o[i + 1] <= 0:
+                continue
+            rp = o[i + 1] / c_adj[i]
+            rv = v[i + 1] / v_ma10[i + 1] if v_ma10[i + 1] > 0 else 1.0
+            if (rp >= 1.85 and rv <= 0.70 and (rp * rv) <= 3.5) or (rp <= 0.55 and rv >= 1.4 and (rp * rv) <= 3.5):
+                c_adj[:i + 1] *= rp
+        return c_adj
+
     def _worker(sym: str) -> Optional[Dict[str, Any]]:
         try:
             df = datastore.load_bars(sym)
@@ -113,17 +130,21 @@ def compute_universe_rs(force: bool = False) -> pd.DataFrame:
             v = df["volume"].to_numpy(dtype=np.float64)
             h = df["high"].to_numpy(dtype=np.float64)
             l = df["low"].to_numpy(dtype=np.float64)
+            o = df["open"].to_numpy(dtype=np.float64)
             n = len(c)
             last_date = df.index[-1].strftime("%Y-%m-%d")
             last_close = c[-1]
 
-            r_1d = (c[-1] / c[-2] - 1.0) * 100 if n >= 2 else 0.0
-            r_1w = (c[-1] / c[-5] - 1.0) * 100 if n >= 5 else 0.0
-            r_1m = (c[-1] / c[-21] - 1.0) * 100 if n >= 21 else 0.0
-            r_3m = (c[-1] / c[-63] - 1.0) * 100 if n >= 63 else 0.0
-            r_6m = (c[-1] / c[-126] - 1.0) * 100 if n >= 126 else r_3m
-            r_9m = (c[-1] / c[-189] - 1.0) * 100 if n >= 189 else r_6m
-            r_1y = (c[-1] / c[-252] - 1.0) * 100 if n >= 252 else r_9m
+            # Normalize any unback-adjusted split seams
+            c_norm = _normalize_split_seams(c, o, v)
+
+            r_1d = (c_norm[-1] / c_norm[-2] - 1.0) * 100 if n >= 2 else 0.0
+            r_1w = (c_norm[-1] / c_norm[-5] - 1.0) * 100 if n >= 5 else 0.0
+            r_1m = (c_norm[-1] / c_norm[-21] - 1.0) * 100 if n >= 21 else 0.0
+            r_3m = (c_norm[-1] / c_norm[-63] - 1.0) * 100 if n >= 63 else 0.0
+            r_6m = (c_norm[-1] / c_norm[-126] - 1.0) * 100 if n >= 126 else r_3m
+            r_9m = (c_norm[-1] / c_norm[-189] - 1.0) * 100 if n >= 189 else r_6m
+            r_1y = (c_norm[-1] / c_norm[-252] - 1.0) * 100 if n >= 252 else r_9m
 
             # Weighted RS: 40% 3M, 20% 6M, 20% 9M, 20% 1Y
             raw_rs = 0.40 * r_3m + 0.20 * r_6m + 0.20 * r_9m + 0.20 * r_1y
@@ -256,13 +277,35 @@ def api_recompute_rs():
     })
 
 
+@app.route("/api/dates")
+def api_dates():
+    dates = build_rs_history.list_available_dates()
+    return jsonify({
+        "dates": dates,
+        "latest": dates[-1] if dates else "",
+        "count": len(dates),
+    })
+
+
 @app.route("/api/stocks")
 def api_stocks():
-    df = get_df()
+    target_date = request.args.get("date", "").strip()
+    is_historical = False
+    if target_date and target_date.lower() != "latest":
+        df = build_rs_history.load_rs_history(target_date)
+        if not df.empty:
+            is_historical = True
+        else:
+            df = get_df()
+    else:
+        df = get_df()
+
     if df.empty:
         return jsonify({
             "stocks": [],
             "total_count": 0,
+            "selected_date": target_date,
+            "is_historical": False,
             "kpis": {
                 "total": 0, "rs90_count": 0, "rs80_count": 0,
                 "stage2_count": 0, "near_high_count": 0,
@@ -274,14 +317,20 @@ def api_stocks():
     # SPY benchmark stats
     spy_bars = datastore.load_bars("SPY")
     if spy_bars is not None and not spy_bars.empty:
-        sc = spy_bars["close"].to_numpy(dtype=np.float64)
-        spy_1m = round(float((sc[-1] / sc[-21] - 1.0) * 100), 2) if len(sc) >= 21 else 0.0
-        spy_3m = round(float((sc[-1] / sc[-63] - 1.0) * 100), 2) if len(sc) >= 63 else 0.0
-        spy_1y = round(float((sc[-1] / sc[-252] - 1.0) * 100), 2) if len(sc) >= 252 else 0.0
+        spy_sub = spy_bars.loc[:target_date] if is_historical else spy_bars
+        if not spy_sub.empty:
+            sc = spy_sub["close"].to_numpy(dtype=np.float64)
+            spy_1m = round(float((sc[-1] / sc[-21] - 1.0) * 100), 2) if len(sc) >= 21 else 0.0
+            spy_3m = round(float((sc[-1] / sc[-63] - 1.0) * 100), 2) if len(sc) >= 63 else 0.0
+            spy_1y = round(float((sc[-1] / sc[-252] - 1.0) * 100), 2) if len(sc) >= 252 else 0.0
+        else:
+            spy_1m = spy_3m = spy_1y = 0.0
     else:
         spy_1m = spy_3m = spy_1y = 0.0
 
     q = df.copy()
+    if "last_date" not in q.columns and "date" in q.columns:
+        q["last_date"] = pd.to_datetime(q["date"]).dt.strftime("%Y-%m-%d")
 
     # Universe type filter
     u_type = request.args.get("universe_type", "common").strip().lower()
@@ -311,7 +360,10 @@ def api_stocks():
     # Theme filter
     theme_filt = request.args.get("theme", "").strip()
     if theme_filt and theme_filt != "all":
-        q = q[(q["theme"] == theme_filt) | q["themes"].str.contains(theme_filt, na=False)]
+        if "themes" in q.columns:
+            q = q[(q["theme"] == theme_filt) | q["themes"].str.contains(theme_filt, na=False)]
+        else:
+            q = q[q["theme"] == theme_filt]
 
     # Trend Posture filter
     trend = request.args.get("trend", "all").strip().lower()
@@ -361,9 +413,17 @@ def api_stocks():
     # Cap to top 1500 for snappy UI rendering
     top_stocks = q.head(1500).to_dict(orient="records")
 
+    active_date_str = target_date if is_historical else (
+        str(df["last_date"].iloc[0]) if "last_date" in df.columns and not df.empty else (
+            str(df["date"].iloc[0].strftime("%Y-%m-%d")) if "date" in df.columns and not df.empty else ""
+        )
+    )
+
     return jsonify({
         "stocks": top_stocks,
         "total_count": total_count,
+        "selected_date": active_date_str,
+        "is_historical": is_historical,
         "kpis": kpis,
         "sectors": all_sectors,
         "themes": all_themes,
@@ -376,11 +436,19 @@ def api_chart():
     if not sym:
         return jsonify({"error": "Missing symbol"}), 400
 
+    target_date = request.args.get("date", "").strip()
+    cut_chart = request.args.get("cut_chart", "false").lower() == "true"
+    is_historical = False
+
     df_full = datastore.load_bars(sym)
     if df_full is None or df_full.empty:
         return jsonify({"error": f"No bar data for {sym}"}), 404
 
     df = indicators.add_indicators(df_full)
+    if target_date and target_date.lower() != "latest" and cut_chart:
+        df = df.loc[:target_date]
+        if df.empty:
+            df = indicators.add_indicators(df_full)
 
     # Moving averages
     ema10_s = df["ema10"]
@@ -498,7 +566,15 @@ def api_chart():
             })
 
     # Stock info from RS dataset
-    dataset = get_df()
+    dataset = pd.DataFrame()
+    if target_date and target_date.lower() != "latest":
+        hist_df = build_rs_history.load_rs_history(target_date)
+        if not hist_df.empty:
+            is_historical = True
+            dataset = hist_df
+    if dataset.empty:
+        dataset = get_df()
+
     stock_row = None
     if not dataset.empty:
         matches = dataset[dataset["symbol"] == sym]
@@ -639,6 +715,9 @@ def api_chart():
         "sector": sector_payload,
         "theme": theme_payload,
         "catalyst": catalyst_dossier,
+        "target_date": target_date if is_historical else None,
+        "is_historical": is_historical,
+        "cut_chart": cut_chart,
     })
 
 
@@ -968,6 +1047,17 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <span class="badge">Port 8786</span>
     <span class="badge" style="color:#38bdf8; border-color:#0284c7;">IBD 1-99 System</span>
   </div>
+
+  <!-- Historical Session Navigation Bar -->
+  <div style="display:flex; align-items:center; gap:8px; background:#11151f; padding:4px 10px; border-radius:6px; border:1px solid var(--border);">
+    <span style="font-size:11px; color:#94a3b8; font-weight:600; text-transform:uppercase; letter-spacing:0.5px;">Session:</span>
+    <button class="btn-filter-chip" onclick="stepDate(-1)" title="Previous Trading Day" style="padding:2px 8px;">◀</button>
+    <input type="date" id="historical_date_picker" onchange="onDatePicked(this.value)" style="background:#0c0f16; color:#e2e8f0; border:1px solid #334155; border-radius:4px; padding:3px 7px; font-size:12px; font-family:monospace; cursor:pointer;">
+    <button class="btn-filter-chip" onclick="stepDate(1)" title="Next Trading Day" style="padding:2px 8px;">▶</button>
+    <button class="btn-filter-chip active" id="btn_latest_date" onclick="setLatestDate()" style="padding:2px 8px;">Latest</button>
+    <span id="date_mode_badge" class="badge" style="background:#065f46; color:#34d399; font-weight:700;">LIVE SESSION</span>
+  </div>
+
   <div style="display:flex; align-items:center; gap:10px;">
     <button class="reload-btn" onclick="recomputeRS()" title="Re-scan and recalculate RS for all tickers in universe">
       <span>🔄</span> Recalculate RS
@@ -1060,6 +1150,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       <option value="all">All Themes</option>
     </select>
   </div>
+  <div style="margin-left:auto; display:flex; align-items:center; gap:6px;">
+    <button class="btn-filter-chip" onclick="openTradingViewExportModal()" title="Export top N symbols to TradingView Watchlist" style="background:#1e293b; color:#38bdf8; border-color:#0284c7; font-weight:600; padding:4px 10px; display:flex; align-items:center; gap:5px;">
+      <span>📺</span> Export to TradingView
+    </button>
+  </div>
 </div>
 
 <!-- 3-Pane Workspace -->
@@ -1107,6 +1202,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           <button class="btn-chart-enlarge" onclick="stepStock(-1)">◀ Prev</button>
           <button class="btn-chart-enlarge" onclick="stepStock(1)">Next ▶</button>
         </div>
+        <button id="btn_toggle_cut_chart" class="btn-chart-enlarge" onclick="toggleCutChart()" title="Toggle cutting chart at historical date (zero lookahead replay)">✂️ Full Chart</button>
         <button id="btn_chart_settings" class="btn-chart-enlarge" onclick="toggleSettingsPanel()">⚙️ Settings</button>
         <button id="btn_toggle_draw" class="btn-chart-enlarge" onclick="toggleDrawToolbar()">✏️ Tools</button>
         <button class="btn-chart-enlarge" onclick="resetChart()">⟲ Reset</button>
@@ -1153,6 +1249,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           <div class="settings-sec-title">Markers & Volume</div>
           <div class="settings-row"><label class="toggle-control"><input type="checkbox" id="cfg_volume" checked onchange="updateVisibility()"><span>Volume Histogram + 20-MA</span></label></div>
           <div class="settings-row"><label class="toggle-control"><input type="checkbox" id="cfg_ep_markers" checked onchange="updateVisibility()"><span>EP Historical Catalyst Markers</span></label></div>
+          <div class="settings-row"><label class="toggle-control"><input type="checkbox" id="cfg_cut_chart" onchange="toggleCutChart()"><span style="color:#c084fc;">Cut Chart at Replay Date (Zero Lookahead)</span></label></div>
         </div>
       </div>
     </div>
@@ -1319,6 +1416,67 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   </div>
 </div>
 
+<!-- TradingView Watchlist Export Modal -->
+<div class="modal-overlay" id="tv_export_modal" style="display:none;" onclick="closeTVExportModal(event)">
+  <div class="modal-card" style="max-width:540px; width:90%;" onclick="event.stopPropagation()">
+    <div class="modal-header">
+      <div style="display:flex; align-items:center; gap:8px;">
+        <span style="font-size:16px;">📺</span>
+        <span style="font-weight:700; color:#fff; font-size:13px;">Export to TradingView Watchlist</span>
+      </div>
+      <button class="panel-close-btn" onclick="document.getElementById('tv_export_modal').style.display='none'">✕</button>
+    </div>
+    <div class="modal-body" style="display:flex; flex-direction:column; gap:12px;">
+
+      <!-- Top N Controls -->
+      <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:8px;">
+        <div style="display:flex; align-items:center; gap:6px;">
+          <label style="font-size:12px; font-weight:600; color:#cbd5e1;">Top Names:</label>
+          <input type="number" id="tv_export_n" min="1" max="1500" value="30" oninput="updateTVExportPreview()" style="width:65px; background:#0c0f16; border:1px solid #334155; color:#fff; padding:4px 8px; border-radius:4px; font-size:12px; font-family:monospace;">
+        </div>
+        <div style="display:flex; gap:4px;">
+          <button class="btn-filter-chip active" id="btn_chip_tv_30" onclick="setTVExportN(30)">Top 30</button>
+          <button class="btn-filter-chip" id="btn_chip_tv_50" onclick="setTVExportN(50)">Top 50</button>
+          <button class="btn-filter-chip" id="btn_chip_tv_100" onclick="setTVExportN(100)">Top 100</button>
+          <button class="btn-filter-chip" id="btn_chip_tv_all" onclick="setTVExportN(filteredStocks.length)">All (<span id="tv_export_all_count">0</span>)</button>
+        </div>
+      </div>
+
+      <!-- Format options & summary -->
+      <div style="display:flex; align-items:center; justify-content:space-between; font-size:11.5px; color:#94a3b8; background:#0f131a; padding:6px 10px; border-radius:4px; border:1px solid #1e293b;">
+        <span id="tv_export_stats_lbl">Selected 30 symbols from current view</span>
+        <div style="display:flex; gap:10px;">
+          <label style="display:flex; align-items:center; gap:4px; cursor:pointer;">
+            <input type="radio" name="tv_format" value="comma" checked onchange="updateTVExportPreview()"> Comma-separated
+          </label>
+          <label style="display:flex; align-items:center; gap:4px; cursor:pointer;">
+            <input type="radio" name="tv_format" value="newline" onchange="updateTVExportPreview()"> One per line
+          </label>
+        </div>
+      </div>
+
+      <!-- Preview Textarea -->
+      <textarea id="tv_export_preview" readonly rows="6" style="width:100%; background:#0c0f16; border:1px solid #334155; color:#38bdf8; font-family:monospace; font-size:12px; padding:8px; border-radius:4px; resize:vertical; outline:none;" onclick="this.select()"></textarea>
+
+      <!-- Action Buttons -->
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-top:4px;">
+        <div style="font-size:11px; color:#64748b;">
+          💡 Tip: Click copy, then in TradingView press <kbd style="background:#1e293b; padding:1px 4px; border-radius:3px; color:#94a3b8;">Ctrl+V</kbd> inside your watchlist
+        </div>
+        <div style="display:flex; gap:8px;">
+          <button id="btn_copy_tv" class="reload-btn" onclick="copyTVExportToClipboard()" style="padding:6px 14px; font-weight:700;">
+            <span id="lbl_copy_tv">📋 Copy to Clipboard</span>
+          </button>
+          <button class="reload-btn" onclick="downloadTVExportFile()" style="padding:6px 14px; background:#1e293b; color:#38bdf8; border-color:#0284c7;">
+            <span>💾</span> Download .txt
+          </button>
+        </div>
+      </div>
+
+    </div>
+  </div>
+</div>
+
 <script>
 let allStocks = [];
 let filteredStocks = [];
@@ -1327,6 +1485,99 @@ let currentChartData = null;
 let selectedMinRS = '';
 let currentSortBy = 'rs_score';
 let currentSortDir = 'desc';
+
+// Historical Date Replay State
+let availableDates = [];
+let currentDate = '';
+let cutChart = false;
+
+function loadAvailableDates() {
+  fetch('/api/dates')
+    .then(r => r.json())
+    .then(d => {
+      availableDates = d.dates || [];
+      const picker = document.getElementById('historical_date_picker');
+      if (availableDates.length > 0 && picker) {
+        picker.min = availableDates[0];
+        picker.max = availableDates[availableDates.length - 1];
+        if (!currentDate) {
+          picker.value = availableDates[availableDates.length - 1];
+        }
+      }
+    })
+    .catch(e => console.error('Failed to load dates:', e));
+}
+
+function onDatePicked(val) {
+  if (!val) return;
+  currentDate = val;
+  updateDateUI();
+  loadStocks();
+}
+
+function setLatestDate() {
+  currentDate = '';
+  const picker = document.getElementById('historical_date_picker');
+  if (availableDates.length > 0 && picker) {
+    picker.value = availableDates[availableDates.length - 1];
+  }
+  updateDateUI();
+  loadStocks();
+}
+
+function stepDate(delta) {
+  if (!availableDates || availableDates.length === 0) return;
+  let cur = currentDate || availableDates[availableDates.length - 1];
+  let idx = availableDates.indexOf(cur);
+  if (idx === -1) {
+    idx = availableDates.length - 1;
+  }
+  let newIdx = idx + delta;
+  if (newIdx >= 0 && newIdx < availableDates.length) {
+    if (newIdx === availableDates.length - 1 && !currentDate) {
+      return;
+    }
+    currentDate = availableDates[newIdx];
+    const picker = document.getElementById('historical_date_picker');
+    if (picker) picker.value = currentDate;
+    updateDateUI();
+    loadStocks();
+  }
+}
+
+function updateDateUI() {
+  const badge = document.getElementById('date_mode_badge');
+  const btnLatest = document.getElementById('btn_latest_date');
+  if (!currentDate || (availableDates.length > 0 && currentDate === availableDates[availableDates.length - 1])) {
+    if (badge) {
+      badge.textContent = 'LIVE SESSION';
+      badge.style.background = '#065f46';
+      badge.style.color = '#34d399';
+    }
+    if (btnLatest) btnLatest.classList.add('active');
+  } else {
+    if (badge) {
+      badge.textContent = `REPLAY: ${currentDate}`;
+      badge.style.background = '#854d0e';
+      badge.style.color = '#fde047';
+    }
+    if (btnLatest) btnLatest.classList.remove('active');
+  }
+}
+
+function toggleCutChart() {
+  cutChart = !cutChart;
+  const btn = document.getElementById('btn_toggle_cut_chart');
+  const chk = document.getElementById('cfg_cut_chart');
+  if (btn) {
+    btn.textContent = cutChart ? '✂️ Cut at Date: ON' : '✂️ Full Chart';
+    btn.style.color = cutChart ? '#c084fc' : '#94a3b8';
+  }
+  if (chk) chk.checked = cutChart;
+  if (currentStock) {
+    selectStock(currentStock.symbol);
+  }
+}
 
 // Chart globals
 let chart = null;
@@ -1357,7 +1608,7 @@ function loadStocks() {
   const sec = document.getElementById('filter_sector').value;
   const thm = document.getElementById('filter_theme').value;
 
-  const url = `/api/stocks?universe_type=${encodeURIComponent(uType)}` +
+  let url = `/api/stocks?universe_type=${encodeURIComponent(uType)}` +
     `&min_rs=${encodeURIComponent(selectedMinRS)}` +
     `&min_dvol=${encodeURIComponent(dvol)}` +
     `&trend=${encodeURIComponent(trend)}` +
@@ -1366,6 +1617,10 @@ function loadStocks() {
     `&search=${encodeURIComponent(search)}` +
     `&sort_by=${encodeURIComponent(currentSortBy)}` +
     `&sort_dir=${encodeURIComponent(currentSortDir)}`;
+
+  if (currentDate) {
+    url += `&date=${encodeURIComponent(currentDate)}`;
+  }
 
   fetch(url)
     .then(r => r.json())
@@ -1424,27 +1679,36 @@ function renderTable() {
     else if (s.rs_score >= 80) rsClass = 'pill-rs-leader';
     else if (s.rs_score >= 70) rsClass = 'pill-rs-mid';
 
-    const d1Color = s.ret_1d >= 0 ? '#34d399' : '#f87171';
-    const w1Color = s.ret_1w >= 0 ? '#34d399' : '#f87171';
-    const m1Color = s.ret_1m >= 0 ? '#34d399' : '#f87171';
-    const m3Color = s.ret_3m >= 0 ? '#34d399' : '#f87171';
-    const y1Color = s.ret_1y >= 0 ? '#34d399' : '#f87171';
+    const d1Color = (s.ret_1d != null && s.ret_1d >= 0) ? '#34d399' : '#f87171';
+    const w1Color = (s.ret_1w != null && s.ret_1w >= 0) ? '#34d399' : '#f87171';
+    const m1Color = (s.ret_1m != null && s.ret_1m >= 0) ? '#34d399' : '#f87171';
+    const m3Color = (s.ret_3m != null && s.ret_3m >= 0) ? '#34d399' : '#f87171';
+    const y1Color = (s.ret_1y != null && s.ret_1y >= 0) ? '#34d399' : '#f87171';
+
+    const closeStr = (s.close != null) ? `$${Number(s.close).toFixed(2)}` : '-';
+    const d1Str = (s.ret_1d != null) ? `${s.ret_1d > 0 ? '+' : ''}${Number(s.ret_1d).toFixed(1)}%` : '-';
+    const w1Str = (s.ret_1w != null) ? `${s.ret_1w > 0 ? '+' : ''}${Number(s.ret_1w).toFixed(1)}%` : '-';
+    const m1Str = (s.ret_1m != null) ? `${s.ret_1m > 0 ? '+' : ''}${Number(s.ret_1m).toFixed(1)}%` : '-';
+    const m3Str = (s.ret_3m != null) ? `${s.ret_3m > 0 ? '+' : ''}${Number(s.ret_3m).toFixed(1)}%` : '-';
+    const y1Str = (s.ret_1y != null) ? `${s.ret_1y > 0 ? '+' : ''}${Number(s.ret_1y).toFixed(1)}%` : '-';
+    const adrStr = (s.adr_pct != null) ? `${Number(s.adr_pct).toFixed(1)}%` : '-';
+    const dvolStr = (s.dvol_m != null) ? `$${Number(s.dvol_m).toFixed(1)}M` : '-';
 
     tr.innerHTML = `
       <td style="color:var(--muted);">${s.rank || (idx + 1)}</td>
       <td class="tl"><strong style="color:#fff;">${s.symbol}</strong></td>
-      <td class="tl" style="max-width:140px; overflow:hidden; text-overflow:ellipsis;" title="${s.name}">${s.name}</td>
-      <td><span class="${rsClass}">${s.rs_score}</span></td>
-      <td>$${s.close.toFixed(2)}</td>
-      <td style="color:${d1Color};">${s.ret_1d > 0 ? '+' : ''}${s.ret_1d.toFixed(1)}%</td>
-      <td style="color:${w1Color};">${s.ret_1w > 0 ? '+' : ''}${s.ret_1w.toFixed(1)}%</td>
-      <td style="color:${m1Color};">${s.ret_1m > 0 ? '+' : ''}${s.ret_1m.toFixed(1)}%</td>
-      <td style="color:${m3Color};">${s.ret_3m > 0 ? '+' : ''}${s.ret_3m.toFixed(1)}%</td>
-      <td style="color:${y1Color};">${s.ret_1y > 0 ? '+' : ''}${s.ret_1y.toFixed(1)}%</td>
-      <td>${s.adr_pct.toFixed(1)}%</td>
-      <td>$${s.dvol_m.toFixed(1)}M</td>
-      <td class="tl" style="color:var(--muted); max-width:110px; overflow:hidden; text-overflow:ellipsis;">${s.sector}</td>
-      <td class="tl" style="color:var(--muted); max-width:110px; overflow:hidden; text-overflow:ellipsis;">${s.theme}</td>
+      <td class="tl" style="max-width:140px; overflow:hidden; text-overflow:ellipsis;" title="${s.name || s.symbol}">${s.name || s.symbol}</td>
+      <td><span class="${rsClass}">${s.rs_score != null ? s.rs_score : 50}</span></td>
+      <td>${closeStr}</td>
+      <td style="color:${d1Color};">${d1Str}</td>
+      <td style="color:${w1Color};">${w1Str}</td>
+      <td style="color:${m1Color};">${m1Str}</td>
+      <td style="color:${m3Color};">${m3Str}</td>
+      <td style="color:${y1Color};">${y1Str}</td>
+      <td>${adrStr}</td>
+      <td>${dvolStr}</td>
+      <td class="tl" style="color:var(--muted); max-width:110px; overflow:hidden; text-overflow:ellipsis;">${s.sector || 'Unknown'}</td>
+      <td class="tl" style="color:var(--muted); max-width:110px; overflow:hidden; text-overflow:ellipsis;">${s.theme || 'General'}</td>
     `;
 
     tr.onclick = () => selectStock(s.symbol);
@@ -1462,7 +1726,14 @@ function selectStock(sym) {
   }
 
   const lFastest = document.getElementById('cfg_larsson_fastest').value || 32;
-  fetch(`/api/chart?symbol=${encodeURIComponent(sym)}&larsson_fastest=${encodeURIComponent(lFastest)}`)
+  let chartUrl = `/api/chart?symbol=${encodeURIComponent(sym)}&larsson_fastest=${encodeURIComponent(lFastest)}`;
+  if (currentDate) {
+    chartUrl += `&date=${encodeURIComponent(currentDate)}`;
+  }
+  if (cutChart) {
+    chartUrl += `&cut_chart=true`;
+  }
+  fetch(chartUrl)
     .then(r => r.json())
     .then(data => {
       if (data.error) {
@@ -1656,19 +1927,29 @@ function renderChart(data) {
   window._currentLarssonData = data.larsson;
   scheduleLarssonRender();
 
-  // Markers for historical EPs
+  // Markers for historical EPs and Replay Snapshot
+  const markers = [];
   if (data.eps && data.eps.length > 0 && document.getElementById('cfg_ep_markers').checked) {
-    const markers = data.eps.map(ep => ({
-      time: ep.date,
-      position: 'aboveBar',
-      color: '#10b981',
-      shape: 'arrowDown',
-      text: `EP +${ep.gap_pct}%`,
-    }));
-    candleSeries.setMarkers(markers);
-  } else {
-    candleSeries.setMarkers([]);
+    data.eps.forEach(ep => {
+      markers.push({
+        time: ep.date,
+        position: 'aboveBar',
+        color: '#10b981',
+        shape: 'arrowDown',
+        text: `EP +${ep.gap_pct}%`,
+      });
+    });
   }
+  if (data.target_date && !data.cut_chart) {
+    markers.push({
+      time: data.target_date,
+      position: 'belowBar',
+      color: '#fbbf24',
+      shape: 'arrowUp',
+      text: `RS ${data.stock.rs_score} (${data.target_date})`,
+    });
+  }
+  candleSeries.setMarkers(markers);
 
   chart.timeScale().fitContent();
   updateVisibility();
@@ -2156,6 +2437,101 @@ function saveAnnotations() {
   });
 }
 
+// TradingView Watchlist Export Functions
+function openTradingViewExportModal() {
+  const modal = document.getElementById('tv_export_modal');
+  if (!modal) return;
+  modal.style.display = 'flex';
+  const allCountEl = document.getElementById('tv_export_all_count');
+  if (allCountEl) allCountEl.textContent = filteredStocks.length;
+  updateTVExportPreview();
+}
+
+function closeTVExportModal(e) {
+  if (e.target.id === 'tv_export_modal') {
+    document.getElementById('tv_export_modal').style.display = 'none';
+  }
+}
+
+function setTVExportN(n) {
+  const input = document.getElementById('tv_export_n');
+  if (input) input.value = n;
+  ['30', '50', '100', 'all'].forEach(k => {
+    const chip = document.getElementById(`btn_chip_tv_${k}`);
+    if (chip) chip.classList.remove('active');
+  });
+  if (n === 30) document.getElementById('btn_chip_tv_30')?.classList.add('active');
+  else if (n === 50) document.getElementById('btn_chip_tv_50')?.classList.add('active');
+  else if (n === 100) document.getElementById('btn_chip_tv_100')?.classList.add('active');
+  else if (n >= filteredStocks.length) document.getElementById('btn_chip_tv_all')?.classList.add('active');
+  updateTVExportPreview();
+}
+
+function updateTVExportPreview() {
+  const input = document.getElementById('tv_export_n');
+  let n = parseInt(input ? input.value : 30) || 30;
+  n = Math.max(1, Math.min(n, filteredStocks.length || 1));
+
+  const formatEl = document.querySelector('input[name="tv_format"]:checked');
+  const isNewline = formatEl && formatEl.value === 'newline';
+  const delimiter = isNewline ? String.fromCharCode(10) : ', ';
+
+  const topNStocks = filteredStocks.slice(0, n);
+  const symbols = topNStocks.map(s => s.symbol);
+  const previewText = symbols.join(delimiter);
+
+  const previewEl = document.getElementById('tv_export_preview');
+  if (previewEl) previewEl.value = previewText;
+
+  const statsEl = document.getElementById('tv_export_stats_lbl');
+  if (statsEl) {
+    const activeDate = currentDate || 'Latest';
+    statsEl.textContent = `Selected top ${symbols.length} of ${filteredStocks.length} symbols (${activeDate})`;
+  }
+}
+
+function copyTVExportToClipboard() {
+  const previewEl = document.getElementById('tv_export_preview');
+  if (!previewEl || !previewEl.value) return;
+
+  navigator.clipboard.writeText(previewEl.value).then(() => {
+    const lbl = document.getElementById('lbl_copy_tv');
+    if (lbl) {
+      const orig = lbl.textContent;
+      lbl.textContent = '✅ Copied to Clipboard!';
+      lbl.style.color = '#34d399';
+      setTimeout(() => {
+        lbl.textContent = orig;
+        lbl.style.color = '';
+      }, 2000);
+    }
+  }).catch(err => {
+    console.error('Clipboard copy failed:', err);
+    previewEl.select();
+    document.execCommand('copy');
+  });
+}
+
+function downloadTVExportFile() {
+  const previewEl = document.getElementById('tv_export_preview');
+  if (!previewEl || !previewEl.value) return;
+
+  const input = document.getElementById('tv_export_n');
+  const n = parseInt(input ? input.value : 30) || 30;
+  const activeDate = currentDate || new Date().toISOString().slice(0, 10);
+  const filename = `TradingView_Watchlist_RS_Top_${n}_${activeDate}.txt`;
+
+  const blob = new Blob([previewEl.value], { type: 'text/plain;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
 function recomputeRS() {
   if (!confirm('Re-calculate Relative Strength scores across the universe?')) return;
   fetch('/api/recompute_rs', { method: 'POST' })
@@ -2180,6 +2556,8 @@ window.addEventListener('keydown', e => {
     openStockPickerModal();
   } else if (e.key === 'Escape') {
     document.getElementById('stock_picker_modal').style.display = 'none';
+    const tvModal = document.getElementById('tv_export_modal');
+    if (tvModal) tvModal.style.display = 'none';
     document.getElementById('chart_settings_panel').style.display = 'none';
     document.getElementById('chart_draw_toolbar').style.display = 'none';
   }
@@ -2188,6 +2566,7 @@ window.addEventListener('keydown', e => {
 // Boot
 window.addEventListener('DOMContentLoaded', () => {
   initChart();
+  loadAvailableDates();
   loadStocks();
 });
 </script>

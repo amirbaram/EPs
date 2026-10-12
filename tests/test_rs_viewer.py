@@ -131,6 +131,49 @@ class TestRSViewer(unittest.TestCase):
         self.assertEqual(len(data.get("drawings", [])), 1)
         self.assertEqual(data["drawings"][0]["price"], 125.5)
 
+    def test_api_dates_endpoint(self):
+        """Verifies /api/dates returns available historical dates."""
+        res = self.client.get("/api/dates")
+        self.assertEqual(res.status_code, 200)
+        data = res.get_json()
+        self.assertIn("dates", data)
+        self.assertIn("latest", data)
+        self.assertIn("count", data)
+        self.assertGreater(data["count"], 1000)
+        self.assertIn("2024-05-23", data["dates"])
+
+    def test_api_stocks_historical_query(self):
+        """Verifies /api/stocks?date=YYYY-MM-DD returns correct historical leaderboard."""
+        res = self.client.get("/api/stocks?date=2024-05-23")
+        self.assertEqual(res.status_code, 200)
+        data = res.get_json()
+        self.assertIn("stocks", data)
+        self.assertEqual(data["selected_date"], "2024-05-23")
+        self.assertTrue(data["is_historical"])
+        self.assertGreater(len(data["stocks"]), 500)
+        # Check sorted by RS score
+        self.assertGreaterEqual(data["stocks"][0]["rs_score"], 95)
+
+    def test_api_chart_historical_query(self):
+        """Verifies /api/chart with date and cut_chart returns historical snapshot."""
+        # Full chart with marker
+        res = self.client.get("/api/chart?symbol=NVDA&date=2024-05-23")
+        self.assertEqual(res.status_code, 200)
+        data = res.get_json()
+        self.assertEqual(data["target_date"], "2024-05-23")
+        self.assertTrue(data["is_historical"])
+        self.assertEqual(data["stock"]["symbol"], "NVDA")
+        self.assertGreaterEqual(data["stock"]["rs_score"], 90)
+
+        # Cut chart at date
+        res_cut = self.client.get("/api/chart?symbol=NVDA&date=2024-05-23&cut_chart=true")
+        self.assertEqual(res_cut.status_code, 200)
+        data_cut = res_cut.get_json()
+        self.assertTrue(data_cut["cut_chart"])
+        # The last bar time must not exceed 2024-05-23
+        last_bar_time = data_cut["bars"][-1]["time"]
+        self.assertLessEqual(last_bar_time, "2024-05-23")
+
     def test_index_ui_elements(self):
         """Verifies HTML template contains 3-pane layout, controls, and table."""
         res = self.client.get("/")
@@ -148,7 +191,89 @@ class TestRSViewer(unittest.TestCase):
         self.assertIn("dos_returns_body", html)
         self.assertIn("dos_sector_peers", html)
         self.assertIn("dos_theme_peers", html)
+        self.assertIn("historical_date_picker", html)
+        self.assertIn("date_mode_badge", html)
+        self.assertIn("btn_toggle_cut_chart", html)
+        self.assertIn("openTradingViewExportModal()", html)
+        self.assertIn("tv_export_modal", html)
+        self.assertIn("tv_export_preview", html)
+        self.assertIn("copyTVExportToClipboard()", html)
+        self.assertIn("downloadTVExportFile()", html)
+
+
+
+class TestServeEPRelativeStrengthIntegration(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import serve_ep
+        cls.serve_ep = serve_ep
+        cls.ep_client = serve_ep.app.test_client()
+
+    def test_serve_ep_ui_elements_for_rs(self):
+        """Verifies HTML template contains b_rs90 booster chip, f_rs dropdown, and right-pane badges."""
+        res = self.ep_client.get("/")
+        self.assertEqual(res.status_code, 200)
+        html = res.data.decode("utf-8")
+        self.assertIn("id=\"b_rs90\"", html)
+        self.assertIn("class=\"booster-chip active\"", html)
+        self.assertIn("id=\"f_rs\"", html)
+        self.assertIn("value=\"rs90_posture\" selected", html)
+        self.assertIn("id=\"ctx_rs_badge\"", html)
+        self.assertIn("id=\"ctx_stage2_badge\"", html)
+        self.assertIn("id=\"ctx_dist52_badge\"", html)
+
+    def test_serve_ep_rs_filter_and_booster_contract(self):
+        """Verifies /api/events filters by RS rating and structural posture."""
+        # 1. Default rs90_posture
+        res = self.ep_client.get("/api/events?rs=rs90_posture")
+        self.assertEqual(res.status_code, 200)
+        events = res.get_json()["events"]
+        self.assertGreater(len(events), 0)
+        for ev in events[:50]:
+            self.assertGreaterEqual(ev["rs_score"], 90.0)
+            self.assertTrue(ev["stage2"] or (ev["dist_52w_high"] is not None and ev["dist_52w_high"] >= -15.0))
+
+        # 2. Booster cond_rs90=1
+        res_b = self.ep_client.get("/api/events?cond_rs90=1")
+        self.assertEqual(res_b.status_code, 200)
+        events_b = res_b.get_json()["events"]
+        self.assertGreater(len(events_b), 0)
+        for ev in events_b[:50]:
+            self.assertGreaterEqual(ev["rs_score"], 90.0)
+            self.assertTrue(ev["stage2"] or (ev["dist_52w_high"] is not None and ev["dist_52w_high"] >= -15.0))
+
+        # 3. Stage 2 Only filter
+        res_s2 = self.ep_client.get("/api/events?rs=stage2")
+        self.assertEqual(res_s2.status_code, 200)
+        for ev in res_s2.get_json()["events"][:50]:
+            self.assertTrue(ev["stage2"])
+
+        # 4. Within 15% 52W High Only filter
+        res_hi15 = self.ep_client.get("/api/events?rs=hi15")
+        self.assertEqual(res_hi15.status_code, 200)
+        for ev in res_hi15.get_json()["events"][:50]:
+            self.assertGreaterEqual(ev["dist_52w_high"], -15.0)
+
+    def test_serve_ep_api_chart_rs_payload_and_disqualifications(self):
+        """Verifies /api/chart returns rs_score, stage2, and dist_52w_high in payload and ticker history."""
+        res = self.ep_client.get("/api/chart?symbol=NVDA&date=2024-05-23&rs=rs90_posture")
+        self.assertEqual(res.status_code, 200)
+        d = res.get_json()
+        self.assertIn("rs_score", d)
+        self.assertGreaterEqual(d["rs_score"], 90.0)
+        self.assertIn("stage2", d)
+        self.assertTrue(d["stage2"])
+        self.assertIn("dist_52w_high", d)
+
+        # Check ticker history
+        self.assertIn("ticker_history", d)
+        self.assertGreater(len(d["ticker_history"]), 0)
+        first_h = d["ticker_history"][0]
+        self.assertIn("rs_score", first_h)
+        self.assertIn("stage2", first_h)
+        self.assertIn("dist_52w_high", first_h)
 
 
 if __name__ == "__main__":
     unittest.main()
+

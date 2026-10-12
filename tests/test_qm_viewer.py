@@ -376,6 +376,66 @@ class TestQMViewer(unittest.TestCase):
         self.assertIn("onEslRowClick", html)
         self.assertIn("updateEnlargedStockCount()", html)
 
+    def test_qm_rs_score_and_posture_filtering(self):
+        """Verifies RS score and Stage 2 / Near-ATH posture filtering, KPIs, and dossier metadata."""
+        client = serve_qm.app.test_client()
+
+        # 1. Default API call: rs_filter=rs90_stage2_or_15
+        res_default = client.get("/api/events")
+        self.assertEqual(res_default.status_code, 200)
+        data_default = res_default.get_json()
+        events_default = data_default.get("events", [])
+        self.assertGreater(len(events_default), 0)
+
+        # Verify that all events returned satisfy RS >= 90 and posture (Stage 2 OR within 15% 52W high)
+        for ev in events_default[:50]:
+            rs = ev.get("rs_score")
+            s2 = ev.get("stage2")
+            d52 = ev.get("dist_52w_high")
+            self.assertIsNotNone(rs, f"Event {ev['symbol']} missing rs_score")
+            self.assertGreaterEqual(rs, 90.0)
+            self.assertTrue(bool(s2) or (d52 is not None and d52 >= -15.0),
+                            f"Event {ev['symbol']} fails posture requirement: stage2={s2}, dist_52w={d52}")
+
+        kpis = data_default.get("kpis", {})
+        self.assertIn("rs_leader_pct", kpis)
+        self.assertEqual(kpis["rs_leader_pct"], 100.0)
+
+        # 2. Unfiltered API call: rs_filter=all
+        res_all = client.get("/api/events?rs_filter=all")
+        self.assertEqual(res_all.status_code, 200)
+        data_all = res_all.get_json()
+        self.assertGreater(data_all["kpis"]["total"], data_default["kpis"]["total"])
+
+        # 3. Stage 2 Only API call
+        res_s2 = client.get("/api/events?rs_filter=stage2_only")
+        self.assertEqual(res_s2.status_code, 200)
+        events_s2 = res_s2.get_json().get("events", [])
+        for ev in events_s2[:30]:
+            self.assertTrue(ev.get("stage2"), f"Event {ev['symbol']} should be stage2")
+
+        # 4. Chart endpoint includes RS technicals in setup payload
+        res_chart = client.get("/api/chart?symbol=NVDA&date=2024-05-23")
+        self.assertEqual(res_chart.status_code, 200)
+        d_chart = res_chart.get_json()
+        setup = d_chart.get("setup", {})
+        self.assertIn("rs_score", setup)
+        self.assertIn("stage2", setup)
+        self.assertIn("dist_52w_high", setup)
+
+        # 5. UI Elements present in HTML
+        res_idx = client.get("/")
+        self.assertEqual(res_idx.status_code, 200)
+        html = res_idx.data.decode("utf-8")
+        self.assertIn("sel_rs", html)
+        self.assertIn("rs90_stage2_or_15", html)
+        self.assertIn("kpi_rs_leader", html)
+        self.assertIn("card_rs_technicals", html)
+        self.assertIn("dos_rs_score", html)
+        self.assertIn("dos_stage2", html)
+        self.assertIn("dos_dist_52w", html)
+        self.assertIn("dos_rs_posture_status", html)
+
 
 if __name__ == "__main__":
     unittest.main()

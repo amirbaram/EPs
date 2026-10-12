@@ -60,6 +60,30 @@ def load_ep_reference_map() -> Dict[str, List[Dict[str, Any]]]:
     return ep_map
 
 
+def _enrich_with_rs_technicals(df: pd.DataFrame) -> pd.DataFrame:
+    """Enriches QM setups with institutional Relative Strength (RS), Stage 2, and 52W High distance."""
+    rs_dir = Path("data/rs_history")
+    if not rs_dir.exists():
+        return df
+    rs_files = sorted(rs_dir.glob("rs_*.parquet"))
+    if not rs_files:
+        return df
+    try:
+        cols = ["date", "symbol", "rs_score", "stage2", "dist_52w_high"]
+        rs_dfs = [pd.read_parquet(p, columns=cols) for p in rs_files]
+        all_rs = pd.concat(rs_dfs, ignore_index=True)
+        all_rs["date"] = all_rs["date"].dt.strftime("%Y-%m-%d")
+        for c in ["rs_score", "stage2", "dist_52w_high"]:
+            if c in df.columns:
+                df = df.drop(columns=[c])
+        enriched = df.merge(all_rs, on=["symbol", "date"], how="left")
+        print(f"Enriched {len(enriched)} setups with RS metrics (matched: {enriched['rs_score'].notna().sum()})")
+        return enriched
+    except Exception as e:
+        print(f"Warning: Failed to enrich setups with RS metrics: {e}")
+        return df
+
+
 def _init_worker(ep_map: Dict[str, List[Dict[str, Any]]]) -> None:
     global _GLOBAL_EP_MAP
     _GLOBAL_EP_MAP = ep_map
@@ -384,6 +408,7 @@ def main() -> None:
 
     print("Consolidating streamed parquet parts...")
     res_df = pd.concat([pd.read_parquet(pf) for pf in part_files], ignore_index=True)
+    res_df = _enrich_with_rs_technicals(res_df)
     out_p = Path(args.output)
     out_p.parent.mkdir(parents=True, exist_ok=True)
     res_df.to_parquet(out_p, index=False)

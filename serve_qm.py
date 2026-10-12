@@ -39,6 +39,29 @@ DF: Optional[pd.DataFrame] = None
 EP_DF: Optional[pd.DataFrame] = None
 
 
+def _enrich_with_rs_technicals(df: pd.DataFrame) -> pd.DataFrame:
+    """Enriches QM setups with institutional Relative Strength (RS), Stage 2, and 52W High distance."""
+    rs_dir = Path("data/rs_history")
+    if not rs_dir.exists() or df.empty:
+        return df
+    rs_files = sorted(rs_dir.glob("rs_*.parquet"))
+    if not rs_files:
+        return df
+    try:
+        cols = ["date", "symbol", "rs_score", "stage2", "dist_52w_high"]
+        rs_dfs = [pd.read_parquet(p, columns=cols) for p in rs_files]
+        all_rs = pd.concat(rs_dfs, ignore_index=True)
+        all_rs["date"] = all_rs["date"].dt.strftime("%Y-%m-%d")
+        for c in ["rs_score", "stage2", "dist_52w_high"]:
+            if c in df.columns:
+                df = df.drop(columns=[c])
+        enriched = df.merge(all_rs, on=["symbol", "date"], how="left")
+        return enriched
+    except Exception as e:
+        print(f"Warning: Failed to enrich setups with RS metrics: {e}")
+        return df
+
+
 def get_df() -> pd.DataFrame:
     global DF
     if DF is None:
@@ -50,6 +73,8 @@ def get_df() -> pd.DataFrame:
             DF["sector"] = DF["sector"].fillna("Unknown")
             DF["pattern"] = DF["pattern"].fillna("other")
             DF["ep_badge"] = DF["ep_badge"].fillna("Pure Technical QM")
+            if "rs_score" not in DF.columns or "stage2" not in DF.columns or "dist_52w_high" not in DF.columns:
+                DF = _enrich_with_rs_technicals(DF)
             print(f"Loaded {len(DF)} QM historical setups.")
         else:
             print(f"Warning: {DATA_PATH} not found. Running with empty dataset.")
@@ -208,6 +233,40 @@ def api_events():
     if search_q:
         q = q[q["symbol"].str.contains(search_q, case=False, na=False)]
 
+    # Relative Strength (RS) Score & Posture Filter
+    # Default: RS >= 90 for stage 2 bullish (stage2 == True) or within 15% 52w high (dist_52w_high >= -15.0)
+    rs_f = request.args.get("rs_filter", "rs90_stage2_or_15").strip()
+    if rs_f in ["rs90_stage2_or_15", "default"]:
+        q = q[(q["rs_score"] >= 90) & ((q["stage2"] == True) | (q["dist_52w_high"] >= -15.0))]
+    elif rs_f == "rs95_stage2_or_15":
+        q = q[(q["rs_score"] >= 95) & ((q["stage2"] == True) | (q["dist_52w_high"] >= -15.0))]
+    elif rs_f == "rs80_stage2_or_15":
+        q = q[(q["rs_score"] >= 80) & ((q["stage2"] == True) | (q["dist_52w_high"] >= -15.0))]
+    elif rs_f == "rs70_stage2_or_15":
+        q = q[(q["rs_score"] >= 70) & ((q["stage2"] == True) | (q["dist_52w_high"] >= -15.0))]
+    elif rs_f == "rs90_any":
+        q = q[q["rs_score"] >= 90]
+    elif rs_f == "rs80_any":
+        q = q[q["rs_score"] >= 80]
+    elif rs_f == "stage2_only":
+        q = q[q["stage2"] == True]
+    elif rs_f == "near_ath_only":
+        q = q[q["dist_52w_high"] >= -15.0]
+    elif rs_f == "all":
+        pass
+
+    min_rs = request.args.get("min_rs", "").strip()
+    if min_rs:
+        try:
+            val_rs = float(min_rs)
+            req_posture = request.args.get("rs_posture", "1") in ["1", "true", "True"]
+            if req_posture:
+                q = q[(q["rs_score"] >= val_rs) & ((q["stage2"] == True) | (q["dist_52w_high"] >= -15.0))]
+            else:
+                q = q[q["rs_score"] >= val_rs]
+        except (ValueError, TypeError):
+            pass
+
     # Sort default by date descending
     sort_col = request.args.get("sort", "date")
     sort_asc = request.args.get("asc", "0") == "1"
@@ -227,6 +286,7 @@ def api_events():
     lead_sec_cnt = int(q["sector"].isin(lead_secs).sum())
     lead_thm_cnt = int((q["theme"].isin(lead_thms) | q["themes"].apply(lambda x: any(t in str(x) for t in lead_thms) if pd.notna(x) else False)).sum())
     emerg_thm_cnt = int((q["theme"].isin(emerg_thms) | q["themes"].apply(lambda x: any(t in str(x) for t in emerg_thms) if pd.notna(x) else False)).sum())
+    rs_lead_cnt = int(((q["rs_score"] >= 90) & ((q["stage2"] == True) | (q["dist_52w_high"] >= -15.0))).sum()) if not q.empty else 0
 
     kpis = {
         "total": total_count,
@@ -240,6 +300,7 @@ def api_events():
         "leading_themes_count": lead_thm_cnt,
         "emerging_themes_count": emerg_thm_cnt,
         "thematic_lead_pct": round((max(lead_thm_cnt, lead_sec_cnt) / total_count * 100), 1) if total_count > 0 else 0.0,
+        "rs_leader_pct": round((rs_lead_cnt / total_count * 100), 1) if total_count > 0 else 0.0,
     }
 
     # Distinct categories for filter dropdowns
@@ -268,6 +329,9 @@ def api_events():
             "symbol": str(row["symbol"]),
             "date": str(row["date"]),
             "state": str(row["state"]),
+            "rs_score": int(row["rs_score"]) if pd.notna(row.get("rs_score")) else None,
+            "stage2": bool(row.get("stage2", False)) if pd.notna(row.get("stage2")) else False,
+            "dist_52w_high": round(float(row["dist_52w_high"]), 1) if pd.notna(row.get("dist_52w_high")) else None,
             "move_pct": round(float(row["move_pct"]), 1),
             "cons_bars": int(row["cons_bars"]),
             "pullback_pct": round(float(row["pullback_pct"]), 1),
@@ -549,6 +613,9 @@ def api_chart():
         "symbol": sym,
         "date": date_str,
         "state": str(setup_row.get("state", "building")) if setup_row else "building",
+        "rs_score": int(setup_row["rs_score"]) if setup_row and pd.notna(setup_row.get("rs_score")) else None,
+        "stage2": bool(setup_row.get("stage2", False)) if setup_row and pd.notna(setup_row.get("stage2")) else False,
+        "dist_52w_high": round(float(setup_row["dist_52w_high"]), 1) if setup_row and pd.notna(setup_row.get("dist_52w_high")) else None,
         "move_pct": round(float(setup_row.get("move_pct", 0.0)), 1) if setup_row else 0.0,
         "cons_bars": int(setup_row.get("cons_bars", 0)) if setup_row else 0,
         "pullback_pct": round(float(setup_row.get("pullback_pct", 0.0)), 1) if setup_row else 0.0,
@@ -981,10 +1048,30 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <div class="kpi-val" style="color:#c084fc;" id="kpi_thematic_lead">--%</div>
     <div class="kpi-sub">Leading / Emerging group</div>
   </div>
+  <div class="kpi-card">
+    <div class="kpi-label">RS LEADER (≥90)</div>
+    <div class="kpi-val" style="color:#38bdf8;" id="kpi_rs_leader">--%</div>
+    <div class="kpi-sub">Stage 2 / ≤15% 52W High</div>
+  </div>
 </div>
 
 <!-- Filter Toolbar -->
 <div class="toolbar">
+  <div class="filter-group">
+    <label>⚡ RS &amp; Posture:</label>
+    <select id="sel_rs" onchange="fetchEvents()" style="background:#0f172a; border-color:#0284c7; color:#38bdf8; font-weight:700;">
+      <option value="rs90_stage2_or_15" selected>⚡ RS ≥ 90 (Stage 2 or ≤15% 52W High) — Default</option>
+      <option value="rs95_stage2_or_15">🔥 RS ≥ 95 (Stage 2 or ≤15% 52W High)</option>
+      <option value="rs80_stage2_or_15">📈 RS ≥ 80 (Stage 2 or ≤15% 52W High)</option>
+      <option value="rs70_stage2_or_15">📊 RS ≥ 70 (Stage 2 or ≤15% 52W High)</option>
+      <option value="rs90_any">RS ≥ 90 (Any Posture)</option>
+      <option value="rs80_any">RS ≥ 80 (Any Posture)</option>
+      <option value="stage2_only">Stage 2 Bullish Stack Only</option>
+      <option value="near_ath_only">Within 15% 52W High Only</option>
+      <option value="all">All RS Scores &amp; Postures</option>
+    </select>
+  </div>
+
   <div class="filter-group">
     <label>State:</label>
     <button class="btn-filter-chip active" id="f_state_all" onclick="setStateFilter('all')">All</button>
@@ -1084,6 +1171,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           <th class="tl" onclick="sortTable('symbol')">Symbol</th>
           <th class="tl" onclick="sortTable('date')">Date</th>
           <th class="tl" onclick="sortTable('state')">State</th>
+          <th onclick="sortTable('rs_score')" style="color:#38bdf8; cursor:pointer;" title="1-99 Institutional Relative Strength Score & Posture">RS ↕</th>
           <th onclick="sortTable('move_pct')">Pole Move</th>
           <th onclick="sortTable('cons_bars')">Cons</th>
           <th onclick="sortTable('pullback_pct')">Pullback</th>
@@ -1092,7 +1180,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         </tr>
       </thead>
       <tbody id="events_tbody">
-        <tr><td colspan="8" style="text-align:center; padding:30px; color:var(--muted);">Loading QM setups...</td></tr>
+        <tr><td colspan="9" style="text-align:center; padding:30px; color:var(--muted);">Loading QM setups...</td></tr>
       </tbody>
     </table>
   </div>
@@ -1300,6 +1388,30 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       </div>
     </div>
 
+    <!-- Institutional Relative Strength & Posture Card -->
+    <div class="dossier-card" id="card_rs_technicals" style="border-color:#0284c7;">
+      <div class="dossier-title">
+        <span>⚡ INSTITUTIONAL RELATIVE STRENGTH</span>
+        <span id="dos_rs_badge" class="pctile-badge pctile-high">RS --</span>
+      </div>
+      <div class="dossier-row">
+        <span class="dossier-label">Cross-Sectional RS Score:</span>
+        <span class="dossier-val" id="dos_rs_score" style="font-weight:700; color:#38bdf8;">--</span>
+      </div>
+      <div class="dossier-row">
+        <span class="dossier-label">Stage 2 Bullish Stack:</span>
+        <span class="dossier-val" id="dos_stage2">--</span>
+      </div>
+      <div class="dossier-row">
+        <span class="dossier-label">Distance from 52W High:</span>
+        <span class="dossier-val" id="dos_dist_52w">--</span>
+      </div>
+      <div class="dossier-row">
+        <span class="dossier-label">Posture Status:</span>
+        <span class="dossier-val" id="dos_rs_posture_status">--</span>
+      </div>
+    </div>
+
     <!-- QM Technical Profile -->
     <div class="dossier-card">
       <div class="dossier-title">
@@ -1456,6 +1568,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             <th class="tl" onclick="sortEslBy('symbol')" style="cursor:pointer;" title="Sort by Symbol">Symbol ↕</th>
             <th class="tl" onclick="sortEslBy('date')" style="cursor:pointer;" title="Sort by Date">Date ↕</th>
             <th class="tl" onclick="sortEslBy('state')" style="cursor:pointer; width:90px;" title="Sort by State">State ↕</th>
+            <th onclick="sortEslBy('rs_score')" style="cursor:pointer; color:#38bdf8;" title="Sort by Relative Strength Score & Posture">RS ↕</th>
             <th onclick="sortEslBy('move_pct')" style="cursor:pointer;" title="Sort by Pole Move %">Move % ↕</th>
             <th onclick="sortEslBy('cons_bars')" style="cursor:pointer;" title="Sort by Consolidation Bars">Cons ↕</th>
             <th onclick="sortEslBy('pullback_pct')" style="cursor:pointer;" title="Sort by Pullback %">Pullback ↕</th>
@@ -1988,6 +2101,9 @@ function fetchEvents() {
   const thm = document.getElementById('sel_theme').value;
   if (thm !== 'all') p.set('theme', thm);
 
+  const rsEl = document.getElementById('sel_rs');
+  if (rsEl) p.set('rs_filter', rsEl.value);
+
   const srch = document.getElementById('inp_search').value.trim();
   if (srch) p.set('search', srch);
 
@@ -2033,6 +2149,9 @@ function updateKPIs(k) {
   document.getElementById('kpi_avg_move').textContent = '+' + (k.avg_move || 0).toFixed(1) + '%';
   if (document.getElementById('kpi_thematic_lead')) {
     document.getElementById('kpi_thematic_lead').textContent = (k.thematic_lead_pct != null ? k.thematic_lead_pct.toFixed(1) : '0.0') + '%';
+  }
+  if (document.getElementById('kpi_rs_leader')) {
+    document.getElementById('kpi_rs_leader').textContent = (k.rs_leader_pct != null ? k.rs_leader_pct.toFixed(1) : '0.0') + '%';
   }
 }
 
@@ -2106,7 +2225,7 @@ function renderTable() {
   tbody.innerHTML = '';
 
   if (allEvents.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="8" style="text-align:center; padding:30px; color:var(--muted);">No matching QM setups found.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="9" style="text-align:center; padding:30px; color:var(--muted);">No matching QM setups found.</td></tr>';
     return;
   }
 
@@ -2118,6 +2237,21 @@ function renderTable() {
     const isBk = (ev.state === 'breakout');
     const statePill = isBk ? '<span class="pill-breakout">BREAKOUT</span>' : '<span class="pill-building">BUILDING</span>';
     
+    // Relative Strength (RS) score & posture badge
+    let rsPill = '·';
+    if (ev.rs_score != null) {
+      let rsColor = '#94a3b8';
+      let rsSub = '';
+      if (ev.rs_score >= 90) {
+        rsColor = '#38bdf8';
+        if (ev.stage2) rsSub = ' <span style="color:#10b981; font-size:9.5px; font-weight:700;" title="Stage 2 Bullish Stack">S2</span>';
+        else if (ev.dist_52w_high != null && ev.dist_52w_high >= -15.0) rsSub = ' <span style="color:#f59e0b; font-size:9.5px; font-weight:700;" title="Within 15% of 52W High">ATH</span>';
+      } else if (ev.rs_score >= 80) {
+        rsColor = '#34d399';
+      }
+      rsPill = `<span style="font-weight:700; color:${rsColor};">${ev.rs_score}</span>${rsSub}`;
+    }
+
     // EP badge pill
     let epBadgeHtml = '<span class="badge-ep-tech">⚪ Pure Technical</span>';
     if (ev.has_prior_ep && ev.has_post_ep) {
@@ -2142,6 +2276,7 @@ function renderTable() {
       <td class="tl"><strong style="color:#38bdf8;">${ev.symbol}</strong>${macroBadge}</td>
       <td class="tl" style="font-family:monospace; color:#94a3b8;">${ev.date}</td>
       <td class="tl">${statePill}</td>
+      <td style="text-align:center;">${rsPill}</td>
       <td style="color:#34d399; font-weight:600;">+${ev.move_pct.toFixed(1)}%</td>
       <td>${ev.cons_bars}d</td>
       <td style="color:${ev.pullback_pct > 25 ? '#f87171' : '#cbd5e1'}">-${ev.pullback_pct.toFixed(1)}%</td>
@@ -2389,6 +2524,61 @@ function renderDossier(s, eps, st, cat) {
     descEl.textContent = st.macro_desc;
   }
 
+  // Institutional Relative Strength & Posture Card
+  const rsScoreEl = document.getElementById('dos_rs_score');
+  const rsBadgeEl = document.getElementById('dos_rs_badge');
+  const stage2El = document.getElementById('dos_stage2');
+  const dist52wEl = document.getElementById('dos_dist_52w');
+  const postureEl = document.getElementById('dos_rs_posture_status');
+
+  if (s.rs_score != null) {
+    if (rsScoreEl) rsScoreEl.textContent = `${s.rs_score} / 99`;
+    if (rsBadgeEl) {
+      if (s.rs_score >= 90) {
+        rsBadgeEl.className = 'pctile-badge pctile-high';
+        rsBadgeEl.textContent = `RS ${s.rs_score} 🔥 Top Decile`;
+      } else if (s.rs_score >= 80) {
+        rsBadgeEl.className = 'pctile-badge pctile-high';
+        rsBadgeEl.textContent = `RS ${s.rs_score} Strong`;
+      } else {
+        rsBadgeEl.className = 'pctile-badge pctile-mid';
+        rsBadgeEl.textContent = `RS ${s.rs_score}`;
+      }
+    }
+  } else {
+    if (rsScoreEl) rsScoreEl.textContent = '·';
+    if (rsBadgeEl) {
+      rsBadgeEl.className = 'pctile-badge pctile-low';
+      rsBadgeEl.textContent = 'RS ·';
+    }
+  }
+
+  if (stage2El) {
+    stage2El.innerHTML = s.stage2
+      ? '<span style="color:#10b981; font-weight:700;">✓ Bullish (C ≥ 10 ≥ 20 ≥ 50 ≥ 200)</span>'
+      : '<span style="color:#94a3b8;">✗ Neutral / Non-Stage 2</span>';
+  }
+
+  if (dist52wEl) {
+    if (s.dist_52w_high != null) {
+      const isAth15 = s.dist_52w_high >= -15.0;
+      dist52wEl.innerHTML = `<span style="color:${isAth15 ? '#34d399' : '#cbd5e1'}; font-weight:${isAth15 ? '700' : '400'};">${s.dist_52w_high > 0 ? '+' : ''}${s.dist_52w_high.toFixed(1)}% ${isAth15 ? '🏆 (Within 15% ATH)' : ''}</span>`;
+    } else {
+      dist52wEl.textContent = '·';
+    }
+  }
+
+  if (postureEl) {
+    const isQual = (s.rs_score != null && s.rs_score >= 90) && (s.stage2 || (s.dist_52w_high != null && s.dist_52w_high >= -15.0));
+    if (isQual) {
+      postureEl.innerHTML = '<span class="diag-pill diag-tailwind" style="display:inline-block; font-size:10px; padding:2px 8px;">🌟 Institutional Leader (RS ≥ 90 + S2/ATH)</span>';
+    } else if (s.rs_score != null && s.rs_score >= 90) {
+      postureEl.innerHTML = '<span class="diag-pill diag-neutral" style="display:inline-block; font-size:10px; padding:2px 8px;">⚠️ High RS but Lacks Stage 2 / Near-ATH</span>';
+    } else {
+      postureEl.innerHTML = '<span style="color:var(--muted); font-size:11px;">Standard Momentum Setup</span>';
+    }
+  }
+
   document.getElementById('dos_pattern').textContent = (s.pattern || 'other').toUpperCase();
   document.getElementById('dos_pole_move').textContent = `+${s.move_pct.toFixed(1)}%`;
   document.getElementById('dos_pole_dates').textContent = `${s.qm_pole_start} → ${s.qm_pole_end}`;
@@ -2618,7 +2808,7 @@ function renderEnlargedStockList(query) {
   }
 
   if (!list.length) {
-    tbody.innerHTML = '<tr><td colspan="10" style="text-align:center; padding:30px; color:var(--muted);">No matching QM setups found.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="11" style="text-align:center; padding:30px; color:var(--muted);">No matching QM setups found.</td></tr>';
     return;
   }
 
@@ -2626,6 +2816,19 @@ function renderEnlargedStockList(query) {
     const isSel = (currentEvent && ev.symbol === currentEvent.symbol && ev.date === currentEvent.date);
     const isBk = (ev.state === 'breakout');
     const statePill = isBk ? '<span class="pill-breakout">BREAKOUT</span>' : '<span class="pill-building">BUILDING</span>';
+
+    // RS pill
+    let rsPill = '<span style="color:#64748b; font-size:11px;">--</span>';
+    if (ev.rs_score != null) {
+      const rsVal = Math.round(ev.rs_score);
+      const isLeader = (rsVal >= 90);
+      const color = isLeader ? '#38bdf8' : (rsVal >= 70 ? '#94a3b8' : '#64748b');
+      const fw = isLeader ? 'bold' : 'normal';
+      let postBadges = '';
+      if (ev.stage2) postBadges += ' <span style="font-size:9px; background:#065f46; color:#a7f3d0; padding:1px 3px; border-radius:2px;" title="Stage 2 Bullish Alignment">S2</span>';
+      if (ev.dist_52w_high != null && ev.dist_52w_high >= -15.0) postBadges += ' <span style="font-size:9px; background:#1e3a8a; color:#bfdbfe; padding:1px 3px; border-radius:2px;" title="Within 15% of 52W High">ATH</span>';
+      rsPill = `<span style="color:${color}; font-weight:${fw}; font-family:monospace;">${rsVal}</span>${postBadges}`;
+    }
 
     // EP badge pill
     let epBadgeHtml = '<span class="badge-ep-tech">⚪ Pure Technical</span>';
@@ -2651,6 +2854,7 @@ function renderEnlargedStockList(query) {
       <td class="tl"><strong style="color:#38bdf8;">${ev.symbol}</strong>${macroBadge}</td>
       <td class="tl" style="font-family:monospace; color:#94a3b8;">${ev.date}</td>
       <td class="tl">${statePill}</td>
+      <td style="text-align:center;">${rsPill}</td>
       <td style="color:#34d399; font-weight:600;">+${(ev.move_pct || 0).toFixed(1)}%</td>
       <td>${ev.cons_bars}d</td>
       <td style="color:${(ev.pullback_pct || 0) > 25 ? '#f87171' : '#cbd5e1'}">-${(ev.pullback_pct || 0).toFixed(1)}%</td>
@@ -2715,6 +2919,14 @@ function clearDossier() {
   document.getElementById('dos_sector').textContent = '--';
   document.getElementById('dos_themes').textContent = '--';
   document.getElementById('dos_pole_move').textContent = '--';
+  if (document.getElementById('dos_rs_score')) document.getElementById('dos_rs_score').textContent = '--';
+  if (document.getElementById('dos_rs_badge')) {
+    document.getElementById('dos_rs_badge').className = 'pctile-badge pctile-low';
+    document.getElementById('dos_rs_badge').textContent = 'RS --';
+  }
+  if (document.getElementById('dos_stage2')) document.getElementById('dos_stage2').textContent = '--';
+  if (document.getElementById('dos_dist_52w')) document.getElementById('dos_dist_52w').textContent = '--';
+  if (document.getElementById('dos_rs_posture_status')) document.getElementById('dos_rs_posture_status').textContent = '--';
 }
 
 // Filter Actions
@@ -2809,6 +3021,7 @@ function resetFilters() {
     const btn = document.getElementById(`f_macro_${m}`);
     if (btn) btn.classList.toggle('active', m === 'all');
   });
+  if (document.getElementById('sel_rs')) document.getElementById('sel_rs').value = 'rs90_stage2_or_15';
   document.getElementById('sel_pattern').value = 'all';
   document.getElementById('sel_move').value = '';
   document.getElementById('sel_cons').value = 'all';

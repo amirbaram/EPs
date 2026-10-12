@@ -43,8 +43,14 @@ bash scripts/check.sh                 # Byte-compiles core EP modules + runs tes
 | Live Multi-Quarter Tracker Server | `serve_ep_tracker.py` (port 8783) |
 | QM Setup & EP Cross-Reference Server | `serve_qm.py` (port 8785) |
 | Relative Strength (RS) Universe Server | `serve_rs.py` (port 8786) |
-| Precomputed RS Universe Scores | `data/simulations/rs_universe_scores.parquet` |
+| Daily Historical RS Engine & Query API | `build_rs_history.py` |
+| Automated RS Database Incremental Updater | `update_rs_database.py` |
+| RS Database Architecture & Agent Guide | `RS_DATABASE.md` |
+| 10-Year Daily Historical RS Database | `data/rs_history/rs_<YEAR>.parquet` |
+| Precomputed RS Universe Scores (Latest) | `data/simulations/rs_universe_scores.parquet` |
 | Historical QM Mining & EP Linkage Pipeline | `mine_qm_setups.py` |
+| Automated QM Database Incremental Updater | `update_qm_database.py` |
+| QM System Architecture & Pipeline Guide | `docs/QM_SYSTEM_GUIDE.md` |
 | Precomputed QM Setups Dataset | `data/simulations/qm_historical_setups.parquet` |
 | Machine Learning Engine & Feature Extractors | `ep_ml_engine.py` |
 | Technical Indicators & Intermediate Ribbons | `scanner_core.py`, `indicators.py` |

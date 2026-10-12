@@ -213,6 +213,40 @@ def build_ep_row(sym: str, dt_str: str, subtype: str, thm_engine) -> dict | None
             prev_day_gap_pct = float(prev_gap)
             prev_day_gap_up = bool(prev_day_gap_pct > (0.33 * adr_pct_val))
 
+    # Institutional RS Score & Structural Posture (1-99 RS rating, Stage 2, 52W High distance)
+    rs_score = 50.0
+    stage2 = False
+    dist_52w_high = -20.0
+    try:
+        rs_file = Path(f"data/rs_history/rs_{dt_str[:4]}.parquet")
+        if rs_file.exists():
+            rs_df = pd.read_parquet(
+                rs_file,
+                filters=[("symbol", "==", sym), ("date", "==", pd.Timestamp(dt_str))],
+                columns=["rs_score", "stage2", "dist_52w_high"]
+            )
+            if not rs_df.empty:
+                rs_score = float(rs_df["rs_score"].iloc[0])
+                stage2 = bool(rs_df["stage2"].iloc[0])
+                dist_52w_high = float(rs_df["dist_52w_high"].iloc[0])
+    except Exception:
+        pass
+    if rs_score == 50.0 and pos >= 0:
+        try:
+            c = float(d["close"].iloc[pos])
+            h52 = float(d["high"].iloc[max(0, pos - 252):pos + 1].max()) if pos > 0 else c
+            dist_52w_high = float((c / h52 - 1.0) * 100.0) if h52 > 0 else 0.0
+            if "ema10" in d.columns and "ema20" in d.columns and "sma50" in d.columns and "sma200" in d.columns:
+                c_val = float(d["close"].iloc[pos])
+                e10 = float(d["ema10"].iloc[pos])
+                e20 = float(d["ema20"].iloc[pos])
+                s50 = float(d["sma50"].iloc[pos])
+                s200 = float(d["sma200"].iloc[pos])
+                if pd.notna(e10) and pd.notna(e20) and pd.notna(s50) and pd.notna(s200):
+                    stage2 = bool(c_val >= e10 >= e20 >= s50 >= s200)
+        except Exception:
+            pass
+
     # Forward tracking window
     fwd = d.iloc[pos:].copy()
     n_fwd = len(fwd)
@@ -440,7 +474,10 @@ def build_ep_row(sym: str, dt_str: str, subtype: str, thm_engine) -> dict | None
         "is_month_end": trading_calendar.is_month_end(dt_str),
         "is_quarter_end": trading_calendar.is_quarter_end(dt_str),
         "is_mechanical_volume_date": trading_calendar.is_mechanical_volume_date(dt_str),
-        "calendar_anomaly": trading_calendar.get_calendar_anomaly_type(dt_str)
+        "calendar_anomaly": trading_calendar.get_calendar_anomaly_type(dt_str),
+        "rs_score": round(rs_score, 1),
+        "stage2": stage2,
+        "dist_52w_high": round(dist_52w_high, 2)
     }
 
 

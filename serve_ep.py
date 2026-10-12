@@ -551,6 +551,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <span>🛡️ Clean Pivot (No Gap &gt; 0.33×ADR)</span>
     <span class="booster-pill">Trap Avoidance</span>
   </div>
+  <div class="booster-chip active" id="b_rs90" onclick="toggleBooster('rs90')" title="Requires stock to have Relative Strength (RS) score >= 90 combined with Stage 2 Bullish stack or within 15% of 52-week highs. Avoids bottom-fisher rebound traps.">
+    <span>🏆 RS ≥ 90 (Stage 2 / ≤15% 52W)</span>
+    <span class="booster-pill">+0.31 R Exp</span>
+  </div>
   <button class="booster-reset" onclick="resetBoosters()">Clear Boosters</button>
 </div>
 
@@ -679,6 +683,21 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       <option value="quad">⚠️ Quad Witching</option>
       <option value="russell">⚠️ Russell Reconstitution</option>
       <option value="month_end">⚠️ Month / Quarter-End</option>
+    </select>
+  </div>
+
+  <div class="filter-group">
+    <label title="Filter by Institutional Relative Strength (RS) rating (1-99) &amp; structural posture">RS Score</label>
+    <select id="f_rs" style="color:var(--green); font-weight:700;">
+      <option value="">All RS Scores</option>
+      <option value="rs90_posture" selected>🏆 RS ≥ 90 (Stage 2 / ≤15% 52W)</option>
+      <option value="rs80_posture">⭐ RS ≥ 80 (Stage 2 / ≤15% 52W)</option>
+      <option value="rs90">🔥 RS ≥ 90 (All)</option>
+      <option value="rs80">📈 RS ≥ 80 (All)</option>
+      <option value="rs70">📊 RS ≥ 70 (All)</option>
+      <option value="stage2">🟢 Stage 2 Bullish Only</option>
+      <option value="hi15">🎯 Within 15% 52W High Only</option>
+      <option value="sub70">⚠️ RS &lt; 70 (Lagging / Traps)</option>
     </select>
   </div>
 
@@ -1220,6 +1239,16 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         </div>
         <div class="diag-pill diag-tailwind" id="ctx_diag_desc">
           Top decile institutional money flow sponsorship. High multi-quarter PEAD continuation potential.
+        </div>
+        <div style="display:flex; align-items:center; justify-content:space-between; margin-top:8px; padding-top:6px; border-top:1px solid #1e293b; font-size:11px;">
+          <div style="display:flex; align-items:center; gap:6px;">
+            <span style="color:var(--muted); text-transform:uppercase; font-size:10px; font-weight:700;">RS Rating:</span>
+            <span id="ctx_rs_badge" style="background:#1e1b4b; color:#c084fc; border:1px solid #6366f1; padding:1px 6px; border-radius:4px; font-weight:800;">RS --</span>
+          </div>
+          <div style="display:flex; align-items:center; gap:6px;">
+            <span id="ctx_stage2_badge" style="background:#064e3b; color:#34d399; border:1px solid #059669; padding:1px 6px; border-radius:4px; font-size:10px; font-weight:700;">Stage 2</span>
+            <span id="ctx_dist52_badge" style="background:#0c2340; color:#38bdf8; border:1px solid #0284c7; padding:1px 6px; border-radius:4px; font-size:10px; font-weight:700;">-0.0% 52W</span>
+          </div>
         </div>
       </div>
     </div>
@@ -2297,7 +2326,8 @@ let activeBoosters = {
   '48h': false,
   elite_close: false,
   held_5d: false,
-  no_prev_gap: false
+  no_prev_gap: false,
+  rs90: true
 };
 
 const INSIGHT_PRESETS = {
@@ -2474,6 +2504,9 @@ function toggleBooster(key) {
   if (key === 'no_prev_gap' && document.getElementById('f_prev_gap')) {
     document.getElementById('f_prev_gap').value = activeBoosters[key] ? 'no_gap' : '';
   }
+  if (key === 'rs90' && document.getElementById('f_rs')) {
+    document.getElementById('f_rs').value = activeBoosters[key] ? 'rs90_posture' : '';
+  }
   fetchEvents();
 }
 
@@ -2485,6 +2518,7 @@ function resetBoosters() {
   }
   if (document.getElementById('f_prev_gap')) document.getElementById('f_prev_gap').value = '';
   if (document.getElementById('f_calendar')) document.getElementById('f_calendar').value = '';
+  if (document.getElementById('f_rs')) document.getElementById('f_rs').value = '';
   fetchEvents();
 }
 
@@ -2509,6 +2543,18 @@ function setPreset(p) {
     document.getElementById('f_recent_days').value = '';
     const cEl = document.getElementById('f_recent_days_custom');
     if (cEl) { cEl.value = ''; cEl.style.display = 'none'; }
+  }
+
+  if (p === 'all') {
+    if (document.getElementById('f_rs')) document.getElementById('f_rs').value = '';
+    activeBoosters.rs90 = false;
+    const elRs = document.getElementById('b_rs90');
+    if (elRs) elRs.classList.remove('active');
+  } else if (p === 'pinnacle') {
+    if (document.getElementById('f_rs')) document.getElementById('f_rs').value = 'rs90_posture';
+    activeBoosters.rs90 = true;
+    const elRs = document.getElementById('b_rs90');
+    if (elRs) elRs.classList.add('active');
   }
 
   fetchEvents();
@@ -3086,6 +3132,7 @@ function fetchEvents() {
     v2: document.getElementById('f_v2') ? document.getElementById('f_v2').value : '',
     prev_gap: document.getElementById('f_prev_gap') ? document.getElementById('f_prev_gap').value : '',
     calendar: document.getElementById('f_calendar') ? document.getElementById('f_calendar').value : '',
+    rs: document.getElementById('f_rs') ? document.getElementById('f_rs').value : '',
     search: document.getElementById('f_search').value.trim().toUpperCase(),
     cond_veto_headwind: activeBoosters.veto_headwind ? '1' : '0',
     cond_win_sectors: activeBoosters.win_sectors ? '1' : '0',
@@ -3094,6 +3141,7 @@ function fetchEvents() {
     cond_elite_close: activeBoosters.elite_close ? '1' : '0',
     cond_held_5d: activeBoosters.held_5d ? '1' : '0',
     cond_no_prev_gap: activeBoosters.no_prev_gap ? '1' : '0',
+    cond_rs90: activeBoosters.rs90 ? '1' : '0',
     t1_mode: stratConfig.t1_mode,
     use_trade1: stratConfig.use_trade1 ? '1' : '0',
     use_pyramid: stratConfig.use_pyramid ? '1' : '0',
@@ -3216,9 +3264,14 @@ function renderTable() {
       ? `<br><span style="color:#c084fc; font-size:9px; font-weight:600;" title="Special Volume Date: ${e.calendar_anomaly}">📅 ${e.calendar_anomaly}</span>`
       : '';
 
+    const rsBadge = e.rs_score != null ? `<span style="font-size:9.5px; font-weight:700; padding:1px 4px; border-radius:3px; background:${e.rs_score >= 90 ? 'rgba(34,197,94,0.18); color:#4ade80; border:1px solid #16a34a;' : (e.rs_score >= 70 ? 'rgba(56,189,248,0.15); color:#38bdf8;' : 'rgba(148,163,184,0.15); color:#94a3b8;')}">RS ${Math.round(e.rs_score)}</span>` : '';
+    const s2Badge = e.stage2 ? `<span style="font-size:9px; font-weight:700; color:#34d399;" title="Stage 2 Bullish Alignment">S2</span>` : '';
+    const h15Badge = (e.dist_52w_high != null && e.dist_52w_high >= -15.0) ? `<span style="font-size:9px; font-weight:700; color:#38bdf8;" title="Within 15% 52W High">52W</span>` : '';
+    const rsGroup = (rsBadge || s2Badge || h15Badge) ? `<br><div style="display:inline-flex; align-items:center; gap:3px; margin-top:2px;">${rsBadge}${s2Badge}${h15Badge}</div>` : '';
+
     return `<tr class="${isSel ? 'selected' : ''}" onclick="onRowClick('${e.symbol}','${e.date}')">
       <td class="tl">${e.date}${calBadge}</td>
-      <td class="tl" style="font-weight:700; color:#fff;">${e.symbol}</td>
+      <td class="tl" style="font-weight:700; color:#fff;">${e.symbol}${rsGroup}</td>
       <td class="tl" style="max-width:130px; overflow:hidden; text-overflow:ellipsis;"><span style="color:#38bdf8; cursor:pointer; text-decoration:underline dotted;" title="Click to view ${e.sector} Stock Leaderboard" onclick="event.stopPropagation(); openGroupStocksModal('${e.sector}', 'sector')">${e.sector || '·'}</span></td>
       <td class="tl" style="max-width:130px; overflow:hidden; text-overflow:ellipsis;"><span style="color:#c084fc; cursor:pointer; text-decoration:underline dotted;" title="Click to view ${e.theme} Stock Leaderboard" onclick="event.stopPropagation(); openGroupStocksModal('${e.theme}', 'theme')">${e.theme || '·'}</span></td>
       <td>${e.gap_pct != null ? e.gap_pct.toFixed(1) + '%' + prevGapBadge : '·'}</td>
@@ -3338,13 +3391,18 @@ function renderEnlargedStockList(query) {
       ? `<br><span style="color:#c084fc; font-size:9px; font-weight:600;" title="Special Volume Date: ${e.calendar_anomaly}">📅 ${e.calendar_anomaly}</span>`
       : '';
 
+    const rsBadge = e.rs_score != null ? `<span style="font-size:9px; font-weight:700; padding:1px 4px; border-radius:3px; background:${e.rs_score >= 90 ? 'rgba(34,197,94,0.18); color:#4ade80; border:1px solid #16a34a;' : (e.rs_score >= 70 ? 'rgba(56,189,248,0.15); color:#38bdf8;' : 'rgba(148,163,184,0.15); color:#94a3b8;')}">RS ${Math.round(e.rs_score)}</span>` : '';
+    const s2Badge = e.stage2 ? `<span style="font-size:8.5px; font-weight:700; color:#34d399;" title="Stage 2 Bullish Alignment">S2</span>` : '';
+    const h15Badge = (e.dist_52w_high != null && e.dist_52w_high >= -15.0) ? `<span style="font-size:8.5px; font-weight:700; color:#38bdf8;" title="Within 15% 52W High">52W</span>` : '';
+    const rsGroup = (rsBadge || s2Badge || h15Badge) ? `<br><div style="display:inline-flex; align-items:center; gap:3px; margin-top:2px;">${rsBadge}${s2Badge}${h15Badge}</div>` : '';
+
     const subBadge = (e.subtype === 'dre')
       ? '<span style="background:rgba(244,63,94,0.2); color:#fb7185; padding:1px 4px; border-radius:3px; font-size:9px; font-weight:700;">DRE</span>'
       : '<span style="background:rgba(56,189,248,0.2); color:#38bdf8; padding:1px 4px; border-radius:3px; font-size:9px; font-weight:700;">EP</span>';
 
     return `<tr class="${isSel ? 'selected' : ''}" onclick="onEslRowClick('${e.symbol}','${e.date}')">
       <td class="tl">${e.date}${calBadge}</td>
-      <td class="tl" style="font-weight:700; color:#fff; font-size:12px;">${e.symbol}</td>
+      <td class="tl" style="font-weight:700; color:#fff; font-size:12px;">${e.symbol}${rsGroup}</td>
       <td class="tl">${subBadge}</td>
       <td class="tl" style="max-width:120px; overflow:hidden; text-overflow:ellipsis; color:#38bdf8;">${e.sector || '·'}</td>
       <td class="tl" style="max-width:120px; overflow:hidden; text-overflow:ellipsis; color:#c084fc;">${e.theme || '·'}</td>
@@ -3407,18 +3465,21 @@ function loadChart(ev) {
   window._currentChartEvent = ev;
   loadDrawingsForSymbol(ev.symbol);
   document.getElementById('chart_sym').textContent = `${ev.symbol} — ${ev.date} (${(ev.subtype||'ep').toUpperCase()})`;
+  const rsStr = (ev.rs_score != null) ? ` | RS: ${Math.round(ev.rs_score)}` : '';
+  const s2Str = ev.stage2 ? ' (Stage 2)' : ((ev.dist_52w_high != null && ev.dist_52w_high >= -15.0) ? ' (≤15% 52W)' : '');
   document.getElementById('chart_sub').textContent =
-    `Gap: +${(ev.gap_pct||0).toFixed(1)}% | RVOL: ${(ev.rvol||0).toFixed(1)}x | 20D: ${(ev.ret_20d||0).toFixed(1)}% | 60D: ${(ev.ret_60d||0).toFixed(1)}% | Peak: +${(ev.max_gain||0).toFixed(1)}%`;
+    `Gap: +${(ev.gap_pct||0).toFixed(1)}% | RVOL: ${(ev.rvol||0).toFixed(1)}x${rsStr}${s2Str} | 20D: ${(ev.ret_20d||0).toFixed(1)}% | 60D: ${(ev.ret_60d||0).toFixed(1)}% | Peak: +${(ev.max_gain||0).toFixed(1)}%`;
 
   const lFastest = document.getElementById('cfg_larsson_fastest') ? document.getElementById('cfg_larsson_fastest').value : '32';
   const v2Val = document.getElementById('f_v2') ? document.getElementById('f_v2').value : '';
   const prevGapVal = document.getElementById('f_prev_gap') ? document.getElementById('f_prev_gap').value : '';
   const calendarVal = document.getElementById('f_calendar') ? document.getElementById('f_calendar').value : '';
+  const rsVal = document.getElementById('f_rs') ? document.getElementById('f_rs').value : '';
   const recentDaysEl = document.getElementById('f_recent_days');
   const recentDaysVal = recentDaysEl ? recentDaysEl.value : '';
   const recentDaysParam = (recentDaysVal === 'custom' && document.getElementById('f_recent_days_custom')) ? document.getElementById('f_recent_days_custom').value : recentDaysVal;
   const subtypeVal = document.getElementById('f_subtype') ? document.getElementById('f_subtype').value : '';
-  const chartUrl = `/api/chart?symbol=${ev.symbol}&date=${ev.date}&t1_mode=${stratConfig.t1_mode}&use_trade1=${stratConfig.use_trade1?1:0}&use_pyramid=${stratConfig.use_pyramid?1:0}&use_ml_climax=${stratConfig.use_ml_climax?1:0}&use_ml_stop=${stratConfig.use_ml_stop?1:0}&use_multileg=${stratConfig.use_multileg?1:0}&use_multileg_ml=${stratConfig.use_multileg_ml?1:0}&climax_partial_pct=${stratConfig.climax_partial_pct}&climax_r_hurdle=${stratConfig.climax_r_hurdle}&larsson_fastest=${lFastest}&v2=${v2Val}&prev_gap=${prevGapVal}&calendar=${encodeURIComponent(calendarVal)}&recent_days=${encodeURIComponent(recentDaysParam)}&subtype=${encodeURIComponent(subtypeVal)}`;
+  const chartUrl = `/api/chart?symbol=${ev.symbol}&date=${ev.date}&t1_mode=${stratConfig.t1_mode}&use_trade1=${stratConfig.use_trade1?1:0}&use_pyramid=${stratConfig.use_pyramid?1:0}&use_ml_climax=${stratConfig.use_ml_climax?1:0}&use_ml_stop=${stratConfig.use_ml_stop?1:0}&use_multileg=${stratConfig.use_multileg?1:0}&use_multileg_ml=${stratConfig.use_multileg_ml?1:0}&climax_partial_pct=${stratConfig.climax_partial_pct}&climax_r_hurdle=${stratConfig.climax_r_hurdle}&larsson_fastest=${lFastest}&v2=${v2Val}&prev_gap=${prevGapVal}&calendar=${encodeURIComponent(calendarVal)}&rs=${encodeURIComponent(rsVal)}&recent_days=${encodeURIComponent(recentDaysParam)}&subtype=${encodeURIComponent(subtypeVal)}`;
 
   fetch(chartUrl).then(r => r.json()).then(data => {
     if (!data || !data.bars || !data.bars.length) return;
@@ -3442,8 +3503,10 @@ function loadChart(ev) {
       document.getElementById('chart_sym').innerHTML = `${data.symbol} — ${data.date} (${(data.subtype || 'EP').toUpperCase()})${calPill}`;
       const mfeVal = data.forward_mfe_20d != null ? data.forward_mfe_20d : (data.dossier && data.dossier.ai_scores && data.dossier.ai_scores.forward_mfe_20d != null ? data.dossier.ai_scores.forward_mfe_20d : null);
       const mfeSub = mfeVal != null ? ` | 🎯 20D MFE: +${Number(mfeVal).toFixed(1)}%` : '';
+      const rsStrSrv = (data.rs_score != null) ? ` | RS: ${Math.round(data.rs_score)}` : ((ev.rs_score != null) ? ` | RS: ${Math.round(ev.rs_score)}` : '');
+      const s2StrSrv = (data.stage2 || ev.stage2) ? ' (Stage 2)' : (((data.dist_52w_high != null && data.dist_52w_high >= -15.0) || (ev.dist_52w_high != null && ev.dist_52w_high >= -15.0)) ? ' (≤15% 52W)' : '');
       document.getElementById('chart_sub').textContent =
-        `Gap: +${(data.gap_pct || 0).toFixed(1)}% | RVOL: ${(data.rvol || 0).toFixed(1)}x | 20D: ${(data.ret_20d || 0).toFixed(1)}% | 60D: ${(data.ret_60d || 0).toFixed(1)}% | Peak: +${(data.max_gain != null ? data.max_gain : 0).toFixed(1)}%${mfeSub}`;
+        `Gap: +${(data.gap_pct || 0).toFixed(1)}% | RVOL: ${(data.rvol || 0).toFixed(1)}x${rsStrSrv}${s2StrSrv} | 20D: ${(data.ret_20d || 0).toFixed(1)}% | 60D: ${(data.ret_60d || 0).toFixed(1)}% | Peak: +${(data.max_gain != null ? data.max_gain : 0).toFixed(1)}%${mfeSub}`;
     }
 
     // 1. Sector / Theme Context (Right Pane)
@@ -3602,6 +3665,47 @@ function loadChart(ev) {
       const descEl = document.getElementById('ctx_diag_desc');
       descEl.className = 'diag-pill ' + (st.macro_status === 'tailwind' ? 'diag-tailwind' : (st.macro_status === 'drag' ? 'diag-drag' : 'diag-neutral'));
       descEl.textContent = st.macro_desc;
+
+      const rsScore = data.rs_score != null ? data.rs_score : (ev.rs_score != null ? ev.rs_score : null);
+      const stage2 = data.stage2 != null ? data.stage2 : (ev.stage2 != null ? ev.stage2 : null);
+      const dist52 = data.dist_52w_high != null ? data.dist_52w_high : (ev.dist_52w_high != null ? ev.dist_52w_high : null);
+
+      const rsEl = document.getElementById('ctx_rs_badge');
+      if (rsEl) {
+        if (rsScore != null) {
+          rsEl.textContent = `RS ${Math.round(rsScore)}`;
+          rsEl.style.background = rsScore >= 90 ? 'rgba(34,197,94,0.2)' : (rsScore >= 70 ? 'rgba(56,189,248,0.2)' : 'rgba(239,68,68,0.2)');
+          rsEl.style.color = rsScore >= 90 ? '#4ade80' : (rsScore >= 70 ? '#38bdf8' : '#f87171');
+          rsEl.style.borderColor = rsScore >= 90 ? '#16a34a' : (rsScore >= 70 ? '#0284c7' : '#dc2626');
+        } else {
+          rsEl.textContent = 'RS --';
+        }
+      }
+      const s2El = document.getElementById('ctx_stage2_badge');
+      if (s2El) {
+        if (stage2) {
+          s2El.textContent = 'Stage 2 Bullish';
+          s2El.style.background = '#064e3b';
+          s2El.style.color = '#34d399';
+          s2El.style.borderColor = '#059669';
+        } else {
+          s2El.textContent = 'Non-Stage 2';
+          s2El.style.background = '#1e293b';
+          s2El.style.color = '#94a3b8';
+          s2El.style.borderColor = '#334155';
+        }
+      }
+      const d52El = document.getElementById('ctx_dist52_badge');
+      if (d52El) {
+        if (dist52 != null) {
+          d52El.textContent = `${dist52 >= 0 ? '+' : ''}${dist52.toFixed(1)}% 52W`;
+          d52El.style.background = dist52 >= -15.0 ? '#0c2340' : '#1e293b';
+          d52El.style.color = dist52 >= -15.0 ? '#38bdf8' : '#94a3b8';
+          d52El.style.borderColor = dist52 >= -15.0 ? '#0284c7' : '#334155';
+        } else {
+          d52El.textContent = '--% 52W';
+        }
+      }
       document.getElementById('card_sec_thm').style.display = 'flex';
     }
 
@@ -4186,7 +4290,7 @@ function renderChartMarkersAndLines(data) {
 }
 
 // Attach filter listeners
-['f_outcome', 'f_milestone', 'f_sector', 'f_theme', 'f_retrace', 'f_cpos', 'f_subtype', 'f_year', 'f_v2', 'f_prev_gap', 'f_calendar', 'f_recent_days'].forEach(id => {
+['f_outcome', 'f_milestone', 'f_sector', 'f_theme', 'f_retrace', 'f_cpos', 'f_subtype', 'f_year', 'f_v2', 'f_prev_gap', 'f_calendar', 'f_recent_days', 'f_rs'].forEach(id => {
   const el = document.getElementById(id);
   if (el) el.addEventListener('change', (e) => {
     if (id === 'f_recent_days') {
@@ -4200,6 +4304,16 @@ function renderChartMarkersAndLines(data) {
           customEl.value = '';
         }
       }
+    }
+    if (id === 'f_rs') {
+      activeBoosters.rs90 = (e.target.value === 'rs90_posture');
+      const bEl = document.getElementById('b_rs90');
+      if (bEl) bEl.classList.toggle('active', activeBoosters.rs90);
+    }
+    if (id === 'f_prev_gap') {
+      activeBoosters.no_prev_gap = (e.target.value === 'no_gap');
+      const bEl = document.getElementById('b_no_prev_gap');
+      if (bEl) bEl.classList.toggle('active', activeBoosters.no_prev_gap);
     }
     fetchEvents();
   });
@@ -4343,6 +4457,9 @@ def api_events():
             q = q[q["prev_day_gap_pct"] <= 0.33 * q["adr_pct"]]
         elif "prev_day_gap_pct" in q.columns:
             q = q[q["prev_day_gap_pct"] <= 1.5]
+    if request.args.get("cond_rs90") == "1":
+        if "rs_score" in q.columns and "stage2" in q.columns and "dist_52w_high" in q.columns:
+            q = q[(q["rs_score"] >= 90) & ((q["stage2"] == True) | (q["dist_52w_high"] >= -15.0))]
 
     outcome = request.args.get("outcome")
     if outcome:
@@ -4455,6 +4572,25 @@ def api_events():
                 q = q[q["date"] >= cutoff_dt]
         except (ValueError, TypeError):
             pass
+
+    rs_filter = request.args.get("rs")
+    if rs_filter and "rs_score" in q.columns:
+        if rs_filter == "rs90_posture":
+            q = q[(q["rs_score"] >= 90) & ((q["stage2"] == True) | (q["dist_52w_high"] >= -15.0))]
+        elif rs_filter == "rs80_posture":
+            q = q[(q["rs_score"] >= 80) & ((q["stage2"] == True) | (q["dist_52w_high"] >= -15.0))]
+        elif rs_filter == "rs90":
+            q = q[q["rs_score"] >= 90]
+        elif rs_filter == "rs80":
+            q = q[q["rs_score"] >= 80]
+        elif rs_filter == "rs70":
+            q = q[q["rs_score"] >= 70]
+        elif rs_filter == "stage2":
+            q = q[q["stage2"] == True]
+        elif rs_filter == "hi15":
+            q = q[q["dist_52w_high"] >= -15.0]
+        elif rs_filter == "sub70":
+            q = q[q["rs_score"] < 70]
 
     n = len(q)
     def _safe_float(val, default=0.0):
@@ -6036,6 +6172,35 @@ def api_chart():
                 reasons.append(f"Volume Anomaly Date ({cal_anom})")
             if st not in ("classic", "dre", "ep9m", "bigmove"):
                 reasons.append(f"Subtype: {st}")
+
+            rs_val = float(h_row.get("rs_score", 50.0)) if pd.notna(h_row.get("rs_score")) else 50.0
+            s2_val = bool(h_row.get("stage2", False)) if pd.notna(h_row.get("stage2")) else False
+            d52_val = float(h_row.get("dist_52w_high", -20.0)) if pd.notna(h_row.get("dist_52w_high")) else -20.0
+
+            rs_param = request.args.get("rs", "")
+            if rs_param == "rs90_posture" or request.args.get("cond_rs90") == "1":
+                if rs_val < 90.0:
+                    reasons.append(f"Sub-90 RS ({int(rs_val)})")
+                elif not (s2_val or d52_val >= -15.0):
+                    reasons.append(f"Bottom-Fisher Posture ({d52_val:.0f}% 52W)")
+            elif rs_param == "rs80_posture":
+                if rs_val < 80.0:
+                    reasons.append(f"Sub-80 RS ({int(rs_val)})")
+                elif not (s2_val or d52_val >= -15.0):
+                    reasons.append("Bottom-Fisher Posture")
+            elif rs_param == "rs90" and rs_val < 90.0:
+                reasons.append(f"Sub-90 RS ({int(rs_val)})")
+            elif rs_param == "rs80" and rs_val < 80.0:
+                reasons.append(f"Sub-80 RS ({int(rs_val)})")
+            elif rs_param == "rs70" and rs_val < 70.0:
+                reasons.append(f"Sub-70 RS ({int(rs_val)})")
+            elif rs_param == "stage2" and not s2_val:
+                reasons.append("Not Stage 2 Bullish")
+            elif rs_param == "hi15" and d52_val < -15.0:
+                reasons.append(f">15% From 52W High ({d52_val:.1f}%)")
+            elif rs_param == "sub70" and rs_val >= 70.0:
+                reasons.append(f"High RS ({int(rs_val)})")
+
             return reasons
 
         # Extract historical valid EP events for this ticker across history, respecting active filters
@@ -6100,6 +6265,25 @@ def api_chart():
             if "is_month_end" in t_matches.columns and "is_quarter_end" in t_matches.columns:
                 t_matches = t_matches[t_matches["is_month_end"] | t_matches["is_quarter_end"]]
 
+        rs_filter = request.args.get("rs", "")
+        if rs_filter and "rs_score" in t_matches.columns:
+            if rs_filter == "rs90_posture":
+                t_matches = t_matches[(t_matches["rs_score"] >= 90) & ((t_matches["stage2"] == True) | (t_matches["dist_52w_high"] >= -15.0))]
+            elif rs_filter == "rs80_posture":
+                t_matches = t_matches[(t_matches["rs_score"] >= 80) & ((t_matches["stage2"] == True) | (t_matches["dist_52w_high"] >= -15.0))]
+            elif rs_filter == "rs90":
+                t_matches = t_matches[t_matches["rs_score"] >= 90]
+            elif rs_filter == "rs80":
+                t_matches = t_matches[t_matches["rs_score"] >= 80]
+            elif rs_filter == "rs70":
+                t_matches = t_matches[t_matches["rs_score"] >= 70]
+            elif rs_filter == "stage2":
+                t_matches = t_matches[t_matches["stage2"] == True]
+            elif rs_filter == "hi15":
+                t_matches = t_matches[t_matches["dist_52w_high"] >= -15.0]
+            elif rs_filter == "sub70":
+                t_matches = t_matches[t_matches["rs_score"] < 70]
+
         for _, h_row in t_matches.iterrows():
             disquals = _calc_disqualifications(h_row)
             ticker_history.append({
@@ -6118,6 +6302,9 @@ def api_chart():
                 "ml_50": round(float(h_row.get("ml_50", 0.0)), 3) if pd.notna(h_row.get("ml_50")) else None,
                 "is_mechanical_volume_date": bool(h_row.get("is_mechanical_volume_date", False)),
                 "calendar_anomaly": str(h_row.get("calendar_anomaly", "")) if pd.notna(h_row.get("calendar_anomaly")) else None,
+                "rs_score": round(float(h_row.get("rs_score", 50.0)), 1) if pd.notna(h_row.get("rs_score")) else None,
+                "stage2": bool(h_row.get("stage2", False)) if pd.notna(h_row.get("stage2")) else False,
+                "dist_52w_high": round(float(h_row.get("dist_52w_high", -20.0)), 1) if pd.notna(h_row.get("dist_52w_high")) else None,
                 "is_qualified": bool(len(disquals) == 0),
                 "matches_filters": True,
                 "disqualifications": disquals,
@@ -6148,6 +6335,9 @@ def api_chart():
                 "ml_50": round(float(h_row.get("ml_50", 0.0)), 3) if pd.notna(h_row.get("ml_50")) else None,
                 "is_mechanical_volume_date": bool(h_row.get("is_mechanical_volume_date", False)),
                 "calendar_anomaly": str(h_row.get("calendar_anomaly", "")) if pd.notna(h_row.get("calendar_anomaly")) else None,
+                "rs_score": round(float(h_row.get("rs_score", 50.0)), 1) if pd.notna(h_row.get("rs_score")) else None,
+                "stage2": bool(h_row.get("stage2", False)) if pd.notna(h_row.get("stage2")) else False,
+                "dist_52w_high": round(float(h_row.get("dist_52w_high", -20.0)), 1) if pd.notna(h_row.get("dist_52w_high")) else None,
                 "is_qualified": bool(len(disquals) == 0 and matches_filt),
                 "matches_filters": bool(matches_filt),
                 "disqualifications": disquals,
@@ -6195,6 +6385,43 @@ def api_chart():
     max_gain_val = round(float(ev_row_dict.get("max_gain", 0.0)), 1) if (ev_row_dict and pd.notna(ev_row_dict.get("max_gain"))) else None
     subtype_val = str(ev_row_dict.get("subtype", "ep")) if ev_row_dict else "ep"
 
+    rs_score_val = None
+    stage2_val = False
+    dist_52w_val = None
+    if ev_row_dict and pd.notna(ev_row_dict.get("rs_score")):
+        rs_score_val = float(ev_row_dict["rs_score"])
+        stage2_val = bool(ev_row_dict.get("stage2", False))
+        dist_52w_val = float(ev_row_dict["dist_52w_high"]) if pd.notna(ev_row_dict.get("dist_52w_high")) else None
+    else:
+        try:
+            rs_file = Path(f"data/rs_history/rs_{date_str[:4]}.parquet")
+            if rs_file.exists():
+                rs_df = pd.read_parquet(
+                    rs_file,
+                    filters=[("symbol", "==", sym), ("date", "==", pd.Timestamp(date_str))],
+                    columns=["rs_score", "stage2", "dist_52w_high"]
+                )
+                if not rs_df.empty:
+                    rs_score_val = float(rs_df["rs_score"].iloc[0])
+                    stage2_val = bool(rs_df["stage2"].iloc[0])
+                    dist_52w_val = float(rs_df["dist_52w_high"].iloc[0])
+        except Exception:
+            pass
+        if rs_score_val is None and pos >= 0 and len(d) > 0:
+            try:
+                c = float(d["close"].iloc[pos])
+                h52 = float(d["high"].iloc[max(0, pos - 252):pos + 1].max()) if pos > 0 else c
+                dist_52w_val = float((c / h52 - 1.0) * 100.0) if h52 > 0 else 0.0
+                if "ema10" in d.columns and "ema20" in d.columns and "sma50" in d.columns and "sma200" in d.columns:
+                    e10 = float(d["ema10"].iloc[pos])
+                    e20 = float(d["ema20"].iloc[pos])
+                    s50 = float(d["sma50"].iloc[pos])
+                    s200 = float(d["sma200"].iloc[pos])
+                    if pd.notna(e10) and pd.notna(e20) and pd.notna(s50) and pd.notna(s200):
+                        stage2_val = bool(c >= e10 >= e20 >= s50 >= s200)
+            except Exception:
+                pass
+
     res = {
         "symbol": sym,
         "date": date_str,
@@ -6206,6 +6433,9 @@ def api_chart():
         "max_gain": max_gain_val,
         "is_mechanical_volume_date": bool(ev_row_dict.get("is_mechanical_volume_date", False)) if ev_row_dict else False,
         "calendar_anomaly": str(ev_row_dict.get("calendar_anomaly", "")) if ev_row_dict and pd.notna(ev_row_dict.get("calendar_anomaly")) else None,
+        "rs_score": rs_score_val,
+        "stage2": stage2_val,
+        "dist_52w_high": dist_52w_val,
         "forward_mfe_20d": dossier.get("ai_scores", {}).get("forward_mfe_20d"),
         "forward_mae_20d": dossier.get("ai_scores", {}).get("forward_mae_20d"),
         "prob_mfe_first": dossier.get("ai_scores", {}).get("prob_mfe_first"),
