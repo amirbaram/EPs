@@ -88,6 +88,23 @@ def api_group_stocks():
     return jsonify(eng.get_group_stocks(group, kind))
 
 
+def get_thematic_macro_sets():
+    eng = thematic_engine.get_thematic_engine()
+    if not eng:
+        return set(), set(), set()
+    summ = eng.get_emerging_summary()
+    lead_secs = set([s["name"] for s in summ.get("emerging_sectors", [])])
+    lead_thms = set([t["name"] for t in summ.get("all_themes_ranked", []) if t.get("score", 0) >= 65.0])
+    emerg_thms = set([
+        t["name"] for t in summ.get("emerging_themes", [])
+        if "Velocity Surge" in t.get("archetypes", [])
+        or "Acceleration Cascade" in t.get("archetypes", [])
+        or t.get("badge_type") in ["surge", "acceleration"]
+        or t.get("score", 0) >= 70.0
+    ])
+    return lead_secs, lead_thms, emerg_thms
+
+
 @app.route("/api/events")
 def api_events():
     df = get_df()
@@ -157,16 +174,33 @@ def api_events():
         except (ValueError, TypeError):
             pass
 
-    # 7. Sector & Theme Filters
+    lead_secs, lead_thms, emerg_thms = get_thematic_macro_sets()
+
+    # 7. Thematic / Macro Flow Filter (Leading Sectors, Leading Themes, Emerging Themes)
+    macro_f = request.args.get("macro", "all")
+    if macro_f == "leading_sectors":
+        q = q[q["sector"].isin(lead_secs)]
+    elif macro_f == "leading_themes":
+        q = q[q["theme"].isin(lead_thms) | q["themes"].apply(lambda x: any(t in str(x) for t in lead_thms) if pd.notna(x) else False)]
+    elif macro_f == "emerging_themes":
+        q = q[q["theme"].isin(emerg_thms) | q["themes"].apply(lambda x: any(t in str(x) for t in emerg_thms) if pd.notna(x) else False)]
+
+    # 8. Sector & Theme Filters
     sec_f = request.args.get("sector", "all")
-    if sec_f != "all" and sec_f:
+    if sec_f == "leading_sectors":
+        q = q[q["sector"].isin(lead_secs)]
+    elif sec_f != "all" and sec_f:
         q = q[q["sector"] == sec_f]
 
     thm_f = request.args.get("theme", "all")
-    if thm_f != "all" and thm_f:
+    if thm_f == "leading_themes":
+        q = q[q["theme"].isin(lead_thms) | q["themes"].apply(lambda x: any(t in str(x) for t in lead_thms) if pd.notna(x) else False)]
+    elif thm_f == "emerging_themes":
+        q = q[q["theme"].isin(emerg_thms) | q["themes"].apply(lambda x: any(t in str(x) for t in emerg_thms) if pd.notna(x) else False)]
+    elif thm_f != "all" and thm_f:
         q = q[q["themes"].str.contains(thm_f, case=False, na=False) | (q["theme"] == thm_f)]
 
-    # 8. Search Symbol
+    # 9. Search Symbol
     search_q = request.args.get("search", "").strip().upper()
     if search_q:
         q = q[q["symbol"].str.contains(search_q, case=False, na=False)]
@@ -187,6 +221,10 @@ def api_events():
     ignited_cnt = int(q["ep_badge"].str.contains("Ignited", case=False, na=False).sum())
     avg_move = round(float(q["move_pct"].mean()), 1) if not q.empty else 0.0
 
+    lead_sec_cnt = int(q["sector"].isin(lead_secs).sum())
+    lead_thm_cnt = int((q["theme"].isin(lead_thms) | q["themes"].apply(lambda x: any(t in str(x) for t in lead_thms) if pd.notna(x) else False)).sum())
+    emerg_thm_cnt = int((q["theme"].isin(emerg_thms) | q["themes"].apply(lambda x: any(t in str(x) for t in emerg_thms) if pd.notna(x) else False)).sum())
+
     kpis = {
         "total": total_count,
         "breakouts": bks,
@@ -195,6 +233,10 @@ def api_events():
         "post_pct": round((post_cnt / total_count * 100), 1) if total_count > 0 else 0.0,
         "ignited_pct": round((ignited_cnt / total_count * 100), 1) if total_count > 0 else 0.0,
         "avg_move": avg_move,
+        "leading_sectors_count": lead_sec_cnt,
+        "leading_themes_count": lead_thm_cnt,
+        "emerging_themes_count": emerg_thm_cnt,
+        "thematic_lead_pct": round((max(lead_thm_cnt, lead_sec_cnt) / total_count * 100), 1) if total_count > 0 else 0.0,
     }
 
     # Distinct categories for filter dropdowns
@@ -211,6 +253,13 @@ def api_events():
             st_levels = st_levels.tolist()
         elif not isinstance(st_levels, (list, tuple)):
             st_levels = []
+
+        sec_val = str(row.get("sector", ""))
+        thm_val = str(row.get("theme", ""))
+        thms_val = str(row.get("themes", ""))
+        is_lead_sec = sec_val in lead_secs
+        is_lead_thm = (thm_val in lead_thms) or any(t in thms_val for t in lead_thms)
+        is_emerg_thm = (thm_val in emerg_thms) or any(t in thms_val for t in emerg_thms)
 
         rec = {
             "symbol": str(row["symbol"]),
@@ -231,8 +280,11 @@ def api_events():
             "qm_cons_start": str(row.get("qm_cons_start", "")),
             "qm_cons_end": str(row.get("qm_cons_end", "")),
             "stack_levels": [round(float(x), 2) for x in st_levels],
-            "sector": str(row.get("sector", "")),
-            "theme": str(row.get("theme", "")),
+            "sector": sec_val,
+            "theme": thm_val,
+            "is_leading_sector": is_lead_sec,
+            "is_leading_theme": is_lead_thm,
+            "is_emerging_theme": is_emerg_thm,
             "has_prior_ep": bool(row.get("has_prior_ep", False)),
             "prior_ep_date": str(row["prior_ep_date"]) if pd.notna(row.get("prior_ep_date")) and row.get("prior_ep_date") else None,
             "prior_ep_days_ago": int(row["prior_ep_days_ago"]) if pd.notna(row.get("prior_ep_days_ago")) and row.get("prior_ep_days_ago") is not None else None,
@@ -257,6 +309,9 @@ def api_events():
         "sectors": all_sectors,
         "themes": all_themes,
         "patterns": all_patterns,
+        "leading_sectors": sorted(list(lead_secs)),
+        "leading_themes": sorted(list(lead_thms)),
+        "emerging_themes": sorted(list(emerg_thms)),
     })
 
 
@@ -690,6 +745,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <div class="kpi-val" style="color:#e2e8f0;" id="kpi_avg_move">--%</div>
     <div class="kpi-sub">Launch to pole peak</div>
   </div>
+  <div class="kpi-card">
+    <div class="kpi-label">THEMATIC LEADER</div>
+    <div class="kpi-val" style="color:#c084fc;" id="kpi_thematic_lead">--%</div>
+    <div class="kpi-sub">Leading / Emerging group</div>
+  </div>
 </div>
 
 <!-- Filter Toolbar -->
@@ -708,6 +768,14 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <button class="btn-filter-chip" id="f_ep_boosted" onclick="setEpFilter('boosted')">🚀 Boosted</button>
     <button class="btn-filter-chip" id="f_ep_both" onclick="setEpFilter('both')">⚡🚀 Both</button>
     <button class="btn-filter-chip" id="f_ep_none" onclick="setEpFilter('none')">⚪ Pure Technical</button>
+  </div>
+
+  <div class="filter-group">
+    <label>Thematic Flow:</label>
+    <button class="btn-filter-chip active" id="f_macro_all" onclick="setMacroFilter('all')">All</button>
+    <button class="btn-filter-chip" id="f_macro_leading_sectors" onclick="setMacroFilter('leading_sectors')">🏭 Leading Sectors</button>
+    <button class="btn-filter-chip" id="f_macro_leading_themes" onclick="setMacroFilter('leading_themes')">🚀 Leading Themes</button>
+    <button class="btn-filter-chip" id="f_macro_emerging_themes" onclick="setMacroFilter('emerging_themes')">🌟 Emerging Themes</button>
   </div>
 
   <div class="filter-group">
@@ -752,15 +820,18 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
   <div class="filter-group">
     <label>Sector:</label>
-    <select id="sel_sector" onchange="fetchEvents()">
+    <select id="sel_sector" onchange="onSectorChange()">
       <option value="all">All Sectors</option>
+      <option value="leading_sectors">🏭 All Leading Sectors (Score ≥ 65)</option>
     </select>
   </div>
 
   <div class="filter-group">
     <label>Theme:</label>
-    <select id="sel_theme" onchange="fetchEvents()">
+    <select id="sel_theme" onchange="onThemeChange()">
       <option value="all">All Themes</option>
+      <option value="leading_themes">🚀 All Leading Themes (Score ≥ 65)</option>
+      <option value="emerging_themes">🌟 All Emerging Themes (Velocity Surge)</option>
     </select>
   </div>
 
@@ -1009,6 +1080,7 @@ let currentChartData = null;
 let currentSort = { col: 'date', asc: false };
 let activeStateFilter = 'all';
 let activeEpFilter = 'all';
+let activeMacroFilter = 'all';
 let searchDebounceTimer = null;
 
 // Chart state
@@ -1184,6 +1256,7 @@ function fetchEvents() {
   const p = new URLSearchParams();
   p.set('state', activeStateFilter);
   p.set('ep_link', activeEpFilter);
+  p.set('macro', activeMacroFilter);
 
   const pat = document.getElementById('sel_pattern').value;
   if (pat !== 'all') p.set('pattern', pat);
@@ -1214,7 +1287,14 @@ function fetchEvents() {
     .then(data => {
       allEvents = data.events || [];
       updateKPIs(data.kpis || {});
-      populateDropdowns(data.sectors || [], data.themes || [], data.patterns || []);
+      populateDropdowns(
+        data.sectors || [],
+        data.themes || [],
+        data.patterns || [],
+        data.leading_sectors || [],
+        data.leading_themes || [],
+        data.emerging_themes || []
+      );
       renderTable();
       if (allEvents.length > 0) {
         selectEvent(allEvents[0]);
@@ -1234,23 +1314,62 @@ function updateKPIs(k) {
   document.getElementById('kpi_ignited').textContent = (k.ignited_pct || 0).toFixed(1) + '%';
   document.getElementById('kpi_post').textContent = (k.post_pct || 0).toFixed(1) + '%';
   document.getElementById('kpi_avg_move').textContent = '+' + (k.avg_move || 0).toFixed(1) + '%';
+  if (document.getElementById('kpi_thematic_lead')) {
+    document.getElementById('kpi_thematic_lead').textContent = (k.thematic_lead_pct != null ? k.thematic_lead_pct.toFixed(1) : '0.0') + '%';
+  }
 }
 
-function populateDropdowns(sectors, themes, patterns) {
+function populateDropdowns(sectors, themes, patterns, leadingSectors, leadingThemes, emergingThemes) {
+  const leadSecSet = new Set(leadingSectors || []);
+  const leadThmSet = new Set(leadingThemes || []);
+  const emergThmSet = new Set(emergingThemes || []);
+
   const selSec = document.getElementById('sel_sector');
-  if (selSec.options.length <= 1) {
-    sectors.forEach(s => {
+  if (selSec.options.length <= 2) {
+    const sortedSecs = [...sectors].sort((a, b) => {
+      const aL = leadSecSet.has(a) ? 1 : 0;
+      const bL = leadSecSet.has(b) ? 1 : 0;
+      if (aL !== bL) return bL - aL;
+      return a.localeCompare(b);
+    });
+
+    sortedSecs.forEach(s => {
       const opt = document.createElement('option');
-      opt.value = s; opt.textContent = s;
+      opt.value = s;
+      if (leadSecSet.has(s)) {
+        opt.textContent = `🏭 ${s} (Leading)`;
+        opt.style.color = '#38bdf8';
+        opt.style.fontWeight = '600';
+      } else {
+        opt.textContent = s;
+      }
       selSec.appendChild(opt);
     });
   }
 
   const selThm = document.getElementById('sel_theme');
-  if (selThm.options.length <= 1) {
-    themes.forEach(t => {
+  if (selThm.options.length <= 3) {
+    const sortedThms = [...themes].sort((a, b) => {
+      const aRank = emergThmSet.has(a) ? 2 : (leadThmSet.has(a) ? 1 : 0);
+      const bRank = emergThmSet.has(b) ? 2 : (leadThmSet.has(b) ? 1 : 0);
+      if (aRank !== bRank) return bRank - aRank;
+      return a.localeCompare(b);
+    });
+
+    sortedThms.forEach(t => {
       const opt = document.createElement('option');
-      opt.value = t; opt.textContent = t;
+      opt.value = t;
+      if (emergThmSet.has(t)) {
+        opt.textContent = `🌟 ${t} (Emerging)`;
+        opt.style.color = '#fbbf24';
+        opt.style.fontWeight = '600';
+      } else if (leadThmSet.has(t)) {
+        opt.textContent = `🚀 ${t} (Leading)`;
+        opt.style.color = '#c084fc';
+        opt.style.fontWeight = '600';
+      } else {
+        opt.textContent = t;
+      }
       selThm.appendChild(opt);
     });
   }
@@ -1292,8 +1411,18 @@ function renderTable() {
       epBadgeHtml = `<span class="badge-ep-boosted">🚀 Post EP (${ev.post_ep_days_later}d later, +${ev.post_ep_gap_pct}%)</span>`;
     }
 
+    // Macro flow badge
+    let macroBadge = '';
+    if (ev.is_emerging_theme) {
+      macroBadge = ' <span class="badge" style="background:#78350f; color:#fde68a; font-size:9.5px; margin-left:4px;" title="Emerging Theme: Velocity Surge / Acceleration">🌟 Emerging</span>';
+    } else if (ev.is_leading_theme) {
+      macroBadge = ' <span class="badge" style="background:#4c1d95; color:#ddd6fe; font-size:9.5px; margin-left:4px;" title="Leading Theme: Score ≥ 65">🚀 Leading</span>';
+    } else if (ev.is_leading_sector) {
+      macroBadge = ' <span class="badge" style="background:#1e3a8a; color:#bfdbfe; font-size:9.5px; margin-left:4px;" title="Leading Sector: Score ≥ 65">🏭 Leading</span>';
+    }
+
     tr.innerHTML = `
-      <td class="tl"><strong style="color:#38bdf8;">${ev.symbol}</strong></td>
+      <td class="tl"><strong style="color:#38bdf8;">${ev.symbol}</strong>${macroBadge}</td>
       <td class="tl" style="font-family:monospace; color:#94a3b8;">${ev.date}</td>
       <td class="tl">${statePill}</td>
       <td style="color:#34d399; font-weight:600;">+${ev.move_pct.toFixed(1)}%</td>
@@ -1681,6 +1810,58 @@ function setEpFilter(ep) {
   fetchEvents();
 }
 
+function setMacroFilter(mf) {
+  activeMacroFilter = mf;
+  ['all', 'leading_sectors', 'leading_themes', 'emerging_themes'].forEach(m => {
+    const btn = document.getElementById(`f_macro_${m}`);
+    if (btn) btn.classList.toggle('active', m === mf);
+  });
+  if (mf === 'leading_sectors') {
+    document.getElementById('sel_sector').value = 'leading_sectors';
+    document.getElementById('sel_theme').value = 'all';
+  } else if (mf === 'leading_themes') {
+    document.getElementById('sel_theme').value = 'leading_themes';
+    document.getElementById('sel_sector').value = 'all';
+  } else if (mf === 'emerging_themes') {
+    document.getElementById('sel_theme').value = 'emerging_themes';
+    document.getElementById('sel_sector').value = 'all';
+  } else {
+    document.getElementById('sel_sector').value = 'all';
+    document.getElementById('sel_theme').value = 'all';
+  }
+  fetchEvents();
+}
+
+function onSectorChange() {
+  const v = document.getElementById('sel_sector').value;
+  if (v === 'leading_sectors') {
+    activeMacroFilter = 'leading_sectors';
+  } else {
+    activeMacroFilter = 'all';
+  }
+  ['all', 'leading_sectors', 'leading_themes', 'emerging_themes'].forEach(m => {
+    const btn = document.getElementById(`f_macro_${m}`);
+    if (btn) btn.classList.toggle('active', m === activeMacroFilter);
+  });
+  fetchEvents();
+}
+
+function onThemeChange() {
+  const v = document.getElementById('sel_theme').value;
+  if (v === 'leading_themes') {
+    activeMacroFilter = 'leading_themes';
+  } else if (v === 'emerging_themes') {
+    activeMacroFilter = 'emerging_themes';
+  } else {
+    activeMacroFilter = 'all';
+  }
+  ['all', 'leading_sectors', 'leading_themes', 'emerging_themes'].forEach(m => {
+    const btn = document.getElementById(`f_macro_${m}`);
+    if (btn) btn.classList.toggle('active', m === activeMacroFilter);
+  });
+  fetchEvents();
+}
+
 function onSearchInput() {
   clearTimeout(searchDebounceTimer);
   searchDebounceTimer = setTimeout(fetchEvents, 300);
@@ -1689,6 +1870,7 @@ function onSearchInput() {
 function resetFilters() {
   activeStateFilter = 'all';
   activeEpFilter = 'all';
+  activeMacroFilter = 'all';
   ['all', 'breakout', 'building'].forEach(s => {
     const btn = document.getElementById(`f_state_${s}`);
     if (btn) btn.classList.toggle('active', s === 'all');
@@ -1696,6 +1878,10 @@ function resetFilters() {
   ['all', 'ignited', 'boosted', 'both', 'none'].forEach(e => {
     const btn = document.getElementById(`f_ep_${e}`);
     if (btn) btn.classList.toggle('active', e === 'all');
+  });
+  ['all', 'leading_sectors', 'leading_themes', 'emerging_themes'].forEach(m => {
+    const btn = document.getElementById(`f_macro_${m}`);
+    if (btn) btn.classList.toggle('active', m === 'all');
   });
   document.getElementById('sel_pattern').value = 'all';
   document.getElementById('sel_move').value = '';

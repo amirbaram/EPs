@@ -246,7 +246,58 @@ class TestQMViewer(unittest.TestCase):
         self.assertIn(b"group_stocks_modal", res_idx.data)
         self.assertIn(b"openGroupStocksModal", res_idx.data)
 
+    def test_serve_qm_macro_flow_filters(self):
+        """Verifies filtering by leading sectors, leading themes, and emerging themes."""
+        client = serve_qm.app.test_client()
+
+        # 1. Macro Filter: leading_sectors
+        res_secs = client.get("/api/events?macro=leading_sectors")
+        self.assertEqual(res_secs.status_code, 200)
+        d_secs = res_secs.get_json()
+        self.assertIn("leading_sectors", d_secs)
+        self.assertGreater(len(d_secs["leading_sectors"]), 0)
+        for ev in d_secs["events"][:20]:
+            self.assertTrue(ev["is_leading_sector"])
+
+        # 2. Macro Filter: leading_themes
+        res_thms = client.get("/api/events?macro=leading_themes")
+        self.assertEqual(res_thms.status_code, 200)
+        d_thms = res_thms.get_json()
+        self.assertIn("leading_themes", d_thms)
+        self.assertGreater(len(d_thms["leading_themes"]), 0)
+        for ev in d_thms["events"][:20]:
+            self.assertTrue(ev["is_leading_theme"])
+
+        # 3. Macro Filter: emerging_themes
+        res_emrg = client.get("/api/events?macro=emerging_themes")
+        self.assertEqual(res_emrg.status_code, 200)
+        d_emrg = res_emrg.get_json()
+        self.assertIn("emerging_themes", d_emrg)
+        self.assertGreater(len(d_emrg["emerging_themes"]), 0)
+        for ev in d_emrg["events"][:20]:
+            self.assertTrue(ev["is_emerging_theme"])
+
+        # 4. Sector & Theme Dropdown Special Values
+        res_drop_sec = client.get("/api/events?sector=leading_sectors")
+        self.assertEqual(res_drop_sec.status_code, 200)
+        self.assertEqual(len(res_drop_sec.get_json()["events"]), len(d_secs["events"]))
+
+        res_drop_emrg = client.get("/api/events?theme=emerging_themes")
+        self.assertEqual(res_drop_emrg.status_code, 200)
+        self.assertEqual(len(res_drop_emrg.get_json()["events"]), len(d_emrg["events"]))
+
+        # 5. UI Elements
+        res_idx = client.get("/")
+        self.assertEqual(res_idx.status_code, 200)
+        self.assertIn(b"f_macro_leading_sectors", res_idx.data)
+        self.assertIn(b"f_macro_leading_themes", res_idx.data)
+        self.assertIn(b"f_macro_emerging_themes", res_idx.data)
+        self.assertIn(b"kpi_thematic_lead", res_idx.data)
+        self.assertIn(b"onSectorChange()", res_idx.data)
+        self.assertIn(b"onThemeChange()", res_idx.data)
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
