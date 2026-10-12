@@ -23,6 +23,7 @@ import framecache
 import patterns
 import regime
 import trendlab
+import trading_calendar
 
 # per-frame EMA-rider memo keyed by frame identity (NOT df.attrs — see framecache.py).
 _EMA_RIDER_CACHE = framecache.FrameCache()
@@ -163,10 +164,24 @@ def _is_ep_event(r, base_dvol: float | None = None) -> str | None:
     leader = (pd.notna(r.get("dollar_vol"))
               and float(r["dollar_vol"]) >= config.EP_LEADER_DVOL_B * 1e9)
     rvol_req = config.EP_LEADER_RVOL if leader else config.EP_MIN_RVOL
-    vol_mult = config.EP_LEADER_RVOL if leader else config.EP_VOL_MULT
+    # Mechanical volume anomaly check: Quad Witching, Monthly OpEx, Russell Reconstitution, Month/Quarter-End
+    dt_val = getattr(r, "name", None)
+    if dt_val is None and hasattr(r, "get"):
+        dt_val = r.get("date")
+    is_mech_vol = False
+    if dt_val is not None:
+        try:
+            is_mech_vol = trading_calendar.is_mechanical_volume_date(dt_val)
+        except Exception:
+            is_mech_vol = False
+
     if pd.notna(r["gap_pct"]) and r["gap_pct"] >= config.EP_MIN_GAP and r["rvol"] >= rvol_req:
         return "classic"
     if pd.notna(r["chg_pct"]) and liquid:
+        # On mechanical volume dates, volume spikes are passive closing cross artifacts.
+        # EP-9M and pure bigmove volume spikes must be disregarded.
+        if is_mech_vol:
+            return None
         if r["chg_pct"] >= config.EP9M_MIN_CHG and float(r["volume"]) >= config.EP_MIN_SHARES \
                 and r["rvol"] >= vol_mult:
             return "ep9m"

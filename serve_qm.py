@@ -25,12 +25,15 @@ import datastore
 import ep_catalyst_enricher
 import indicators
 import labels
+import scanner_core
 import thematic_engine
 
 app = Flask(__name__)
 
 DATA_PATH = Path("data/simulations/qm_historical_setups.parquet")
 EP_STUDY_PATH = Path("data/simulations/ep_combined_study_scored.parquet")
+ANNOTATIONS_DIR = Path("data/annotations")
+ANNOTATIONS_DIR.mkdir(parents=True, exist_ok=True)
 
 DF: Optional[pd.DataFrame] = None
 EP_DF: Optional[pd.DataFrame] = None
@@ -315,6 +318,37 @@ def api_events():
     })
 
 
+@app.route("/api/annotations", methods=["GET", "POST"])
+def api_annotations():
+    if request.method == "GET":
+        sym = request.args.get("symbol", "").upper().strip()
+        if not sym:
+            return jsonify({"symbol": "", "drawings": []})
+        file_path = ANNOTATIONS_DIR / f"{sym}.json"
+        if file_path.exists():
+            try:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                return jsonify(data)
+            except Exception as e:
+                return jsonify({"symbol": sym, "drawings": [], "error": str(e)})
+        return jsonify({"symbol": sym, "drawings": []})
+
+    data = request.get_json(silent=True) or {}
+    sym = data.get("symbol", "").upper().strip()
+    drawings = data.get("drawings", [])
+    if not sym:
+        return jsonify({"ok": False, "error": "Missing symbol"}), 400
+
+    file_path = ANNOTATIONS_DIR / f"{sym}.json"
+    try:
+        with open(file_path, "w", encoding="utf-8") as f:
+            json.dump({"symbol": sym, "drawings": drawings}, f, indent=2)
+        return jsonify({"ok": True, "count": len(drawings)})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 @app.route("/api/chart")
 def api_chart():
     sym = request.args.get("symbol", "").strip().upper()
@@ -334,6 +368,44 @@ def api_chart():
     ema20_s = df["ema20"]
     sma50_s = df["sma50"]
     sma200_s = df["sma200"] if "sma200" in df.columns else df["close"].rolling(200).mean()
+
+    # Larsson Line Ribbon calculation
+    try:
+        larsson_fastest = int(request.args.get("larsson_fastest", "32"))
+    except (ValueError, TypeError):
+        larsson_fastest = 32
+    larsson_fastest = max(2, min(100, larsson_fastest))
+
+    if larsson_fastest == 32:
+        larsson_spans = (32, 35, 50, 58)
+    elif larsson_fastest <= 20:
+        s1 = larsson_fastest
+        s2 = int(round(larsson_fastest * 1.5))
+        s3 = int(round(larsson_fastest * 2.0))
+        s4 = int(round(larsson_fastest * 2.625))
+        larsson_spans = (s1, s2, s3, s4)
+    else:
+        s1 = larsson_fastest
+        s2 = int(round(larsson_fastest * 35.0 / 32.0))
+        s3 = int(round(larsson_fastest * 50.0 / 32.0))
+        s4 = int(round(larsson_fastest * 58.0 / 32.0))
+        larsson_spans = (s1, s2, s3, s4)
+
+    s1, s2, s3, s4 = larsson_spans
+    e1 = scanner_core._pine_ema(df['close'], s1)
+    e2 = scanner_core._pine_ema(df['close'], s2)
+    e3 = scanner_core._pine_ema(df['close'], s3)
+    e4 = scanner_core._pine_ema(df['close'], s4)
+
+    bullish = (e1 >= e2) & (e2 >= e3) & (e3 >= e4)
+    bearish = (e1 < e2) & (e2 < e3) & (e3 < e4)
+    valid_l = e1.notna() & e2.notna() & e3.notna() & e4.notna()
+
+    l_state = pd.Series('gray', index=df.index)
+    l_state[valid_l & bullish] = 'yellow'
+    l_state[valid_l & bearish] = 'blue'
+
+    vol_sma20 = df["volume"].rolling(20).mean()
 
     # Determine event row
     dataset = get_df()
@@ -361,10 +433,12 @@ def api_chart():
 
     bars = []
     volume = []
+    vol_ma20_data = []
     ema10_data = []
     ema20_data = []
     sma50_data = []
     sma200_data = []
+    larsson_data = []
 
     for i, (idx, r) in enumerate(sub.iterrows()):
         t = idx.strftime("%Y-%m-%d")
@@ -377,6 +451,8 @@ def api_chart():
             "color": "rgba(16,185,129,0.55)" if c >= o else "rgba(239,68,68,0.55)",
         })
 
+        if pd.notna(vol_sma20.iloc[i]):
+            vol_ma20_data.append({"time": t, "value": round(float(vol_sma20.iloc[i]), 0)})
         if pd.notna(ema10_s.loc[idx]):
             ema10_data.append({"time": t, "value": round(float(ema10_s.loc[idx]), 2)})
         if pd.notna(ema20_s.loc[idx]):
@@ -385,6 +461,16 @@ def api_chart():
             sma50_data.append({"time": t, "value": round(float(sma50_s.loc[idx]), 2)})
         if pd.notna(sma200_s.loc[idx]):
             sma200_data.append({"time": t, "value": round(float(sma200_s.loc[idx]), 2)})
+
+        f_val = round(float(e1.iloc[i]), 2) if pd.notna(e1.iloc[i]) else None
+        s_val = round(float(e4.iloc[i]), 2) if pd.notna(e4.iloc[i]) else None
+        larsson_data.append({
+            "time": t,
+            "fast": f_val,
+            "slow": s_val,
+            "value": f_val,
+            "state": str(l_state.iloc[i]),
+        })
 
     # Fetch all historical EPs for this symbol for markers
     ep_df = get_ep_df()
@@ -503,10 +589,13 @@ def api_chart():
         "date": date_str,
         "bars": bars,
         "volume": volume,
+        "vol_ma20": vol_ma20_data,
         "ema10": ema10_data,
         "ema20": ema20_data,
         "sma50": sma50_data,
         "sma200": sma200_data,
+        "larsson": larsson_data,
+        "larsson_spans": list(larsson_spans),
         "setup": setup_payload,
         "sector_theme": sector_theme_payload,
         "catalyst": catalyst_dossier,
@@ -604,14 +693,134 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   tr.selected { background: #1e293b; outline: 1px solid var(--accent); }
 
   /* Center Pane: Full-Height Chart */
-  .chart-pane { flex: 1.5; min-width: 500px; min-height: 0; display: flex; flex-direction: column; background: #0c0f16; border-right: 1px solid var(--border); position: relative; overflow: hidden; }
+  .chart-pane { flex: 1.5; min-width: 480px; min-height: 0; display: flex; flex-direction: column; background: #0c0f16; border-right: 1px solid var(--border); position: relative; overflow: hidden; }
 
   .chart-header {
     background: #11151f; border-bottom: 1px solid var(--border);
     padding: 6px 14px; display: flex; justify-content: space-between; align-items: center; flex-shrink: 0;
+    gap: 8px;
   }
-  .chart-title-box { display: flex; align-items: center; gap: 8px; font-weight: 700; font-size: 14px; }
-  .chart-controls { display: flex; align-items: center; gap: 6px; }
+  .chart-title-box {
+    display: flex; align-items: center; gap: 8px; font-weight: 700; font-size: 13.5px;
+    min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; padding-right: 8px;
+  }
+  .chart-controls { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
+
+  .btn-chart-enlarge {
+    background: #1e293b; color: #38bdf8; border: 1px solid #0284c7;
+    padding: 3px 8px; border-radius: 4px; font-size: 11px; font-weight: 700;
+    cursor: pointer; display: inline-flex; align-items: center; gap: 4px;
+    transition: all 0.15s ease;
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+  .btn-chart-enlarge:hover {
+    background: #0284c7; color: #fff;
+  }
+  .btn-chart-enlarge.active {
+    background: #0284c7; color: #fff; border-color: #38bdf8;
+    box-shadow: 0 0 8px rgba(56, 189, 248, 0.4);
+  }
+  .btn-chart-expand-main {
+    background: #0369a1;
+    color: #f0f9ff;
+    border-color: #38bdf8;
+  }
+  .btn-chart-expand-main:hover {
+    background: #0284c7;
+  }
+
+  /* Chart header controls visible only when enlarged */
+  .chart-enlarged-only-controls {
+    display: none !important;
+  }
+  .workspace.fullscreen-chart-mode .chart-enlarged-only-controls {
+    display: inline-flex !important;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: nowrap;
+  }
+  .workspace.fullscreen-chart-mode #btn_enlarged_stock_list {
+    background: #0284c7 !important;
+    color: #fff !important;
+    border-color: #38bdf8 !important;
+    box-shadow: 0 0 10px rgba(56, 189, 248, 0.4);
+  }
+
+  /* Enlarged Stock List Table */
+  .esl-table { width: 100%; border-collapse: collapse; font-size: 11.5px; }
+  .esl-table th {
+    padding: 7px 10px; background: #161e2e; color: #94a3b8; font-weight: 700;
+    text-transform: uppercase; font-size: 10px; letter-spacing: 0.5px;
+    border-bottom: 1px solid #283548; user-select: none;
+  }
+  .esl-table th.tl { text-align: left; }
+  .esl-table td { padding: 6px 10px; border-bottom: 1px solid #1a2333; }
+  .esl-table td.tl { text-align: left; }
+  .esl-table tr { cursor: pointer; transition: background 0.12s ease; }
+  .esl-table tr:hover { background: rgba(56, 189, 248, 0.08); }
+  .esl-table tr.selected { background: rgba(2, 132, 199, 0.22) !important; border-left: 3px solid #38bdf8; }
+
+  /* Chart Settings Floating Panel */
+  .chart-settings-panel {
+    position: absolute; top: 10px; right: 14px; z-index: 60;
+    width: 290px; background: rgba(15, 23, 42, 0.95); border: 1px solid #334155;
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.7); border-radius: 8px;
+    backdrop-filter: blur(10px); overflow: hidden; display: flex; flex-direction: column;
+    animation: fadeIn 0.15s ease-out;
+  }
+  .settings-panel-header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 8px 12px; background: #111827; border-bottom: 1px solid #1f2937;
+  }
+  .panel-close-btn {
+    background: transparent; border: none; color: #94a3b8; font-size: 16px;
+    font-weight: 700; cursor: pointer; line-height: 1; padding: 2px 6px; border-radius: 4px;
+  }
+  .panel-close-btn:hover { color: #fff; background: #334155; }
+  .settings-panel-body {
+    padding: 10px 12px; display: flex; flex-direction: column; gap: 10px;
+    max-height: 480px; overflow-y: auto;
+  }
+  .settings-section {
+    border-bottom: 1px solid #1e293b; padding-bottom: 8px;
+  }
+  .settings-section:last-child { border-bottom: none; padding-bottom: 0; }
+  .settings-sec-title {
+    font-size: 9.5px; font-weight: 800; color: #64748b; letter-spacing: 0.5px;
+    margin-bottom: 6px; text-transform: uppercase;
+  }
+  .settings-row {
+    display: flex; align-items: center; margin-bottom: 4px;
+  }
+  .settings-row:last-child { margin-bottom: 0; }
+  .toggle-control {
+    display: inline-flex; align-items: center; gap: 6px; cursor: pointer; user-select: none;
+  }
+  .toggle-label {
+    font-weight: 600;
+  }
+
+  /* Chart Drawing Toolbar */
+  .chart-draw-toolbar {
+    position: absolute; top: 10px; left: 10px; z-index: 50;
+    background: rgba(15, 23, 42, 0.92); border: 1px solid #334155;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.6); border-radius: 6px;
+    padding: 3px 6px; display: flex; align-items: center; gap: 4px;
+    backdrop-filter: blur(8px);
+  }
+  .draw-btn {
+    background: #1e293b; color: #cbd5e1; border: 1px solid #334155;
+    padding: 3px 8px; border-radius: 4px; font-size: 11px; font-weight: 600;
+    cursor: pointer; display: inline-flex; align-items: center; gap: 4px;
+    transition: all 0.15s ease;
+  }
+  .draw-btn:hover { background: #334155; color: #fff; }
+  .draw-btn.active {
+    background: #0284c7; color: #fff; border-color: #38bdf8;
+    box-shadow: 0 0 8px rgba(56, 189, 248, 0.5);
+  }
+  .draw-btn-danger:hover { background: #991b1b; border-color: #ef4444; color: #fff; }
 
   .chart-container-rel { flex: 1; position: relative; width: 100%; height: 100%; overflow: hidden; }
   #chart_tv { width: 100%; height: 100%; }
@@ -655,8 +864,30 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .badge-ep-tech { background: #1e293b; color: #94a3b8; border: 1px solid #334155; padding: 2px 6px; border-radius: 4px; font-size: 10px; font-weight: 600; }
 
   /* Fullscreen Mode */
+  .workspace.fullscreen-chart-mode {
+    position: fixed !important;
+    inset: 0 !important;
+    z-index: 9999 !important;
+    width: 100vw !important;
+    height: 100vh !important;
+    background: #0b0e14 !important;
+    overflow: hidden !important;
+  }
   .workspace.fullscreen-chart-mode .table-pane { display: none !important; }
-  .workspace.fullscreen-chart-mode .chart-pane { flex: 1 !important; }
+  .workspace.fullscreen-chart-mode .chart-pane {
+    flex: 1 !important;
+    min-width: 0 !important;
+    height: 100vh !important;
+    border-right: 1px solid var(--border) !important;
+    position: relative !important;
+  }
+  .workspace.fullscreen-chart-mode .dossier-pane {
+    flex: 0 0 420px !important;
+    width: 420px !important;
+    max-width: 460px !important;
+    height: 100vh !important;
+    overflow-y: auto !important;
+  }
 
   /* Sector/Theme Context & Momentum Backdrop */
   .ctx-row { display: flex; flex-direction: column; gap: 6px; font-size: 12px; }
@@ -876,14 +1107,19 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <span id="chart_ep_badge"></span>
       </div>
       <div class="chart-controls">
-        <label class="btn-filter-chip active" style="font-size:10px;"><input type="checkbox" id="chk_ema10" checked onchange="toggleEma10()" style="display:none;"> EMA 10</label>
-        <label class="btn-filter-chip active" style="font-size:10px;"><input type="checkbox" id="chk_ema20" checked onchange="toggleEma20()" style="display:none;"> EMA 20</label>
-        <label class="btn-filter-chip active" style="font-size:10px;"><input type="checkbox" id="chk_sma50" checked onchange="toggleSma50()" style="display:none;"> SMA 50</label>
-        <label class="btn-filter-chip active" style="font-size:10px;"><input type="checkbox" id="chk_sma200" checked onchange="toggleSma200()" style="display:none;"> SMA 200</label>
-        <label class="btn-filter-chip active" style="font-size:10px;"><input type="checkbox" id="chk_pole_box" checked onchange="togglePoleBox()" style="display:none;"> Pole Box</label>
-        <label class="btn-filter-chip active" style="font-size:10px;"><input type="checkbox" id="chk_cons_box" checked onchange="toggleConsBox()" style="display:none;"> Base Box</label>
-        <button class="btn-filter-chip" onclick="resetChartScale()" title="Auto-scale Y-axis and reset view">⟲ Reset Scale</button>
-        <button class="btn-filter-chip" onclick="toggleFullscreen()" title="Enlarge Chart View">⛶ Fullscreen</button>
+        <div class="chart-enlarged-only-controls">
+          <button id="btn_enlarged_stock_list" class="btn-chart-enlarge" onclick="openEnlargedStockListModal()" title="Choose a different stock from current list (Ctrl/Cmd+K)">
+            📋 Choose Stock (<span id="lbl_enlarged_stock_count">0</span>)
+          </button>
+          <div style="display:inline-flex; align-items:center; gap:2px;">
+            <button id="btn_chart_prev_ticker" class="btn-chart-enlarge" onclick="stepFilteredStock(-1)" title="Previous setup in list (Arrow Left / Arrow Up)" style="padding:3px 8px;">◀ Prev</button>
+            <button id="btn_chart_next_ticker" class="btn-chart-enlarge" onclick="stepFilteredStock(1)" title="Next setup in list (Arrow Right / Arrow Down)" style="padding:3px 8px;">Next ▶</button>
+          </div>
+        </div>
+        <button id="btn_chart_settings" class="btn-chart-enlarge" onclick="toggleChartSettings()" title="Configure Chart Displays, Markers, and Parameters">⚙️ Settings</button>
+        <button id="btn_toggle_draw" class="btn-chart-enlarge" onclick="toggleDrawToolbar()" title="Toggle on-chart drawing tools (Measure, Line, Text, Arrow)">✏️ Tools</button>
+        <button class="btn-chart-enlarge" onclick="resetChartScale()" title="Auto-scale Y-axis and reset view">⟲ Reset</button>
+        <button id="btn_chart_fullscreen" class="btn-chart-enlarge btn-chart-expand-main" onclick="toggleChartFullscreen()" title="Toggle full-screen chart display (Esc to exit)" style="flex-shrink:0;">⛶ Enlarge</button>
       </div>
     </div>
 
@@ -891,6 +1127,124 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       <div id="chart_hud" class="chart-hud" style="display:none;"></div>
       <div id="chart_tv"></div>
       <canvas id="chart_canvas_overlay"></canvas>
+
+      <svg id="larsson_ribbon_svg" style="position:absolute; inset:0; width:100%; height:100%; pointer-events:none; z-index:12; overflow:hidden;">
+        <g id="larsson_ribbon_group"></g>
+      </svg>
+      <svg id="draw_canvas" style="position:absolute; inset:0; width:100%; height:100%; pointer-events:none; z-index:20; overflow:hidden;">
+        <defs>
+          <marker id="arrowhead" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto">
+            <polygon points="0 0, 9 3.5, 0 7" fill="#38bdf8" />
+          </marker>
+        </defs>
+        <g id="draw_elements"></g>
+        <g id="draw_preview"></g>
+      </svg>
+
+      <!-- Floating Chart Drawing Toolbar -->
+      <div id="chart_draw_toolbar" class="chart-draw-toolbar" style="display:none;">
+        <button type="button" class="draw-btn active" id="btn_tool_cursor" onclick="setDrawTool('cursor')" title="Pan &amp; Zoom Chart (Normal Mode)"><span style="font-size:12px;">🖐️</span> Pan</button>
+        <button type="button" class="draw-btn" id="btn_tool_measure" onclick="setDrawTool('measure')" title="Measure Price % &amp; Bars (Click 2 points)"><span style="font-size:12px;">📏</span> Measure</button>
+        <button type="button" class="draw-btn" id="btn_tool_line" onclick="setDrawTool('line')" title="Trendline (Click start &amp; end)"><span style="font-size:12px;">📈</span> Line</button>
+        <button type="button" class="draw-btn" id="btn_tool_text" onclick="setDrawTool('text')" title="Text Annotation (Click to place note)"><span style="font-size:12px;">🔤</span> Text</button>
+        <button type="button" class="draw-btn" id="btn_tool_arrow" onclick="setDrawTool('arrow')" title="Arrow Pointer (Click tail &amp; head)"><span style="font-size:12px;">↗️</span> Arrow</button>
+        <div style="width:1px; height:18px; background:#334155; margin:0 2px;"></div>
+        <button type="button" class="draw-btn" id="btn_tool_settings" onclick="toggleChartSettings()" title="Configure Chart Displays, Markings &amp; Parameters"><span style="font-size:12px;">⚙️</span> Settings</button>
+        <div style="width:1px; height:18px; background:#334155; margin:0 2px;"></div>
+        <button type="button" class="draw-btn draw-btn-danger" onclick="clearAllDrawings()" title="Clear all drawings on chart"><span style="font-size:12px;">🗑️</span> Clear</button>
+      </div>
+
+      <!-- Floating Chart Settings Panel -->
+      <div id="chart_settings_panel" class="chart-settings-panel" style="display:none;">
+        <div class="settings-panel-header">
+          <span style="font-weight:700; color:#f8fafc; font-size:12px; display:flex; align-items:center; gap:6px;">
+            <span>⚙️</span> Chart &amp; Indicator Settings
+          </span>
+          <button type="button" class="panel-close-btn" onclick="toggleChartSettings()" title="Close Settings">&times;</button>
+        </div>
+        <div class="settings-panel-body">
+          <div class="settings-section">
+            <div class="settings-sec-title">📈 MOVING AVERAGES &amp; RIBBONS</div>
+            <div class="settings-row">
+              <label class="toggle-control" style="margin:0; font-size:11px;">
+                <input type="checkbox" id="chk_settings_ema10" checked onchange="toggleEma10()">
+                <span class="toggle-label" style="color:#38bdf8;">10 EMA (Momentum)</span>
+              </label>
+            </div>
+            <div class="settings-row">
+              <label class="toggle-control" style="margin:0; font-size:11px;">
+                <input type="checkbox" id="chk_settings_ema20" checked onchange="toggleEma20()">
+                <span class="toggle-label" style="color:#eab308;">20 EMA (Swing baseline)</span>
+              </label>
+            </div>
+            <div class="settings-row">
+              <label class="toggle-control" style="margin:0; font-size:11px;">
+                <input type="checkbox" id="chk_settings_sma50" checked onchange="toggleSma50()">
+                <span class="toggle-label" style="color:#ef4444;">50 SMA (Institutional trend)</span>
+              </label>
+            </div>
+            <div class="settings-row">
+              <label class="toggle-control" style="margin:0; font-size:11px;">
+                <input type="checkbox" id="chk_settings_sma200" checked onchange="toggleSma200()">
+                <span class="toggle-label" style="color:#64748b;">200 SMA (Long-term anchor)</span>
+              </label>
+            </div>
+            <div class="settings-row">
+              <label class="toggle-control" style="margin:0; font-size:11px;">
+                <input type="checkbox" id="chk_settings_vol_ma20" checked onchange="toggleVolMa20()">
+                <span class="toggle-label" style="color:#38bdf8;">20 Day Volume MA</span>
+              </label>
+            </div>
+            <div class="settings-row" style="margin-top:2px;">
+              <label class="toggle-control" style="margin:0; font-size:11px;">
+                <input type="checkbox" id="chk_settings_larsson" checked onchange="toggleLarsson()">
+                <span class="toggle-label" style="color:#facc15; font-weight:700;">Larsson Line Ribbon</span>
+              </label>
+            </div>
+            <div class="settings-row" style="margin-top:6px; justify-content:space-between; align-items:center; background:#111827; padding:4px 8px; border-radius:4px; border:1px solid #1f2937;">
+              <div style="display:flex; align-items:center; gap:6px;">
+                <span style="font-size:11px; color:#cbd5e1; font-weight:600;">Fastest EMA:</span>
+                <input type="number" id="cfg_larsson_fastest" value="32" min="3" max="80" style="width:42px; background:#1e293b; color:#38bdf8; border:1px solid #334155; border-radius:3px; padding:2px 4px; font-size:11px; text-align:center; font-weight:700;" onchange="onLarssonFastestChange()">
+              </div>
+              <div style="display:flex; align-items:center; gap:6px;">
+                <span id="lbl_larsson_spans" style="color:#64748b; font-size:10px; font-weight:600;">(32, 35, 50, 58)</span>
+                <span id="lbl_larsson_vals" style="font-size:11px; font-weight:700; display:inline-flex; gap:6px;">
+                  <span id="larsson_val_fast" style="color:#facc15;">—</span>
+                  <span id="larsson_val_slow" style="color:#38bdf8;">—</span>
+                </span>
+              </div>
+            </div>
+          </div>
+
+          <div class="settings-section">
+            <div class="settings-sec-title">📐 QM GEOMETRY &amp; VISUALS</div>
+            <div class="settings-row">
+              <label class="toggle-control" style="margin:0; font-size:11px;" title="Shaded Emerald Pole Box depicting impulse move">
+                <input type="checkbox" id="chk_settings_pole_box" checked onchange="togglePoleBox()">
+                <span class="toggle-label" style="color:#34d399;">QM Pole Box</span>
+              </label>
+            </div>
+            <div class="settings-row">
+              <label class="toggle-control" style="margin:0; font-size:11px;" title="Shaded Amber Base Box depicting consolidation surfing">
+                <input type="checkbox" id="chk_settings_cons_box" checked onchange="toggleConsBox()">
+                <span class="toggle-label" style="color:#fbbf24;">QM Base Box</span>
+              </label>
+            </div>
+            <div class="settings-row">
+              <label class="toggle-control" style="margin:0; font-size:11px;" title="Horizontal Trigger and Support/Resistance price lines">
+                <input type="checkbox" id="chk_settings_price_lines" checked onchange="togglePriceLines()">
+                <span class="toggle-label" style="color:#a855f7;">Breakout &amp; Stack Price Lines</span>
+              </label>
+            </div>
+            <div class="settings-row">
+              <label class="toggle-control" style="margin:0; font-size:11px;" title="Markers for Prior and Post Episodic Pivots">
+                <input type="checkbox" id="chk_settings_ep_markers" checked onchange="toggleEpMarkers()">
+                <span class="toggle-label" style="color:#06b6d4;">EP Catalyst Markers</span>
+              </label>
+            </div>
+          </div>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -1072,6 +1426,53 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   </div>
 </div>
 
+<!-- Filtered QM Setups Modal for Enlarged Chart Navigation -->
+<div class="modal-overlay" id="enlarged_stock_list_modal" onclick="closeEnlargedStockListModal(event)">
+  <div class="modal-box" style="width:1120px; max-width:96vw; height:85vh; display:flex; flex-direction:column;" onclick="event.stopPropagation()">
+    <div class="modal-header" style="padding:10px 18px; display:flex; justify-content:space-between; align-items:center; background:#161d2b; border-bottom:1px solid #232f42;">
+      <div style="display:flex; align-items:center; gap:12px; flex:1; flex-wrap:wrap;">
+        <span style="font-size:15px; font-weight:700; color:#fff; display:flex; align-items:center; gap:6px;">
+          📋 Filtered QM Setups (<span id="esl_count" style="color:#38bdf8;">0</span>)
+        </span>
+        <div style="position:relative; width:280px;">
+          <input type="text" id="esl_search" placeholder="Quick search symbol, pattern, sector, theme..." 
+                 oninput="filterEnlargedStockList(this.value)" 
+                 onkeydown="if(event.key==='Enter'){ const r=document.querySelector('#esl_table_body tr'); if(r) r.click(); }"
+                 style="width:100%; background:#0c1017; border:1px solid #334155; border-radius:4px; padding:5px 10px 5px 28px; color:#fff; font-size:12px; outline:none;">
+          <span style="position:absolute; left:8px; top:6px; font-size:12px; color:#64748b;">🔍</span>
+        </div>
+        <span style="font-size:11px; color:#94a3b8;" id="esl_filter_summary">Current Active Filters</span>
+      </div>
+      <button class="modal-close" onclick="closeEnlargedStockListModal()" style="font-size:22px; line-height:1; padding:2px 8px; cursor:pointer;">&times;</button>
+    </div>
+    <div style="background:#0f172a; padding:6px 18px; border-bottom:1px solid #1e293b; font-size:11px; color:#94a3b8; display:flex; justify-content:space-between; align-items:center;">
+      <span>Click any row to switch chart and dossier immediately. Active setup is highlighted.</span>
+      <span>Tip: Press <kbd style="background:#1e293b; padding:1px 4px; border-radius:3px; color:#cbd5e1; border:1px solid #334155;">Esc</kbd> to close · <kbd style="background:#1e293b; padding:1px 4px; border-radius:3px; color:#cbd5e1; border:1px solid #334155;">Enter</kbd> to select first · ◀ / ▶ to step</span>
+    </div>
+    <div style="flex:1; overflow-y:auto; padding:0; background:#0e121a;">
+      <table class="esl-table">
+        <thead style="position:sticky; top:0; z-index:10; background:#161e2e; border-bottom:1px solid #283548;">
+          <tr>
+            <th class="tl" onclick="sortEslBy('symbol')" style="cursor:pointer;" title="Sort by Symbol">Symbol ↕</th>
+            <th class="tl" onclick="sortEslBy('date')" style="cursor:pointer;" title="Sort by Date">Date ↕</th>
+            <th class="tl" onclick="sortEslBy('state')" style="cursor:pointer; width:90px;" title="Sort by State">State ↕</th>
+            <th onclick="sortEslBy('move_pct')" style="cursor:pointer;" title="Sort by Pole Move %">Move % ↕</th>
+            <th onclick="sortEslBy('cons_bars')" style="cursor:pointer;" title="Sort by Consolidation Bars">Cons ↕</th>
+            <th onclick="sortEslBy('pullback_pct')" style="cursor:pointer;" title="Sort by Pullback %">Pullback ↕</th>
+            <th class="tl" onclick="sortEslBy('pattern')" style="cursor:pointer;" title="Sort by Pattern Shape">Pattern ↕</th>
+            <th class="tl" title="EP Relationship">EP Catalyst Badge</th>
+            <th class="tl" onclick="sortEslBy('sector')" style="cursor:pointer;" title="Sort by Sector">Sector ↕</th>
+            <th class="tl" onclick="sortEslBy('theme')" style="cursor:pointer;" title="Sort by Theme">Theme ↕</th>
+          </tr>
+        </thead>
+        <tbody id="esl_table_body">
+          <!-- Dynamically populated -->
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
 <script>
 // State
 let allEvents = [];
@@ -1087,14 +1488,270 @@ let searchDebounceTimer = null;
 let chart = null;
 let candleSeries = null;
 let volumeSeries = null;
+let volMa20Series = null;
 let ema10Series = null;
 let ema20Series = null;
 let sma50Series = null;
 let sma200Series = null;
+let larssonFastSeries = null;
+let larssonSlowSeries = null;
 let activePriceLines = [];
 
 let showPoleBox = true;
 let showConsBox = true;
+let showPriceLines = true;
+let showEpMarkers = true;
+
+/* --- On-Chart Drawing Tools (Measure, Line, Text, Arrow) with Disk Persistence --- */
+let currentDrawTool = 'cursor';
+let drawings = [];
+let drawStart = null;
+let currentChartSymbol = null;
+
+function saveCurrentDrawings() {
+  const sym = currentChartSymbol || (currentEvent ? currentEvent.symbol : null);
+  if (!sym) return;
+  fetch('/api/annotations', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ symbol: sym, drawings: drawings })
+  }).then(r => r.json()).catch(err => {
+    console.error('Failed to save drawings to disk:', err);
+  });
+}
+
+function loadDrawingsForSymbol(sym) {
+  if (!sym) return;
+  currentChartSymbol = sym;
+  fetch(`/api/annotations?symbol=${encodeURIComponent(sym)}`)
+    .then(r => r.json())
+    .then(res => {
+      if (currentChartSymbol === sym) {
+        drawings = (res && Array.isArray(res.drawings)) ? res.drawings : [];
+        renderAllDrawings();
+      }
+    })
+    .catch(err => {
+      console.warn('Could not load drawings for ' + sym, err);
+      drawings = [];
+      renderAllDrawings();
+    });
+}
+
+function toggleDrawToolbar() {
+  const tb = document.getElementById('chart_draw_toolbar');
+  if (!tb) return;
+  const isHidden = (tb.style.display === 'none' || !tb.style.display);
+  tb.style.display = isHidden ? 'flex' : 'none';
+  const b = document.getElementById('btn_toggle_draw');
+  if (b) b.classList.toggle('active', isHidden);
+}
+
+function setDrawTool(tool) {
+  currentDrawTool = tool;
+  document.querySelectorAll('.draw-btn').forEach(b => b.classList.remove('active'));
+  const btn = document.getElementById('btn_tool_' + tool);
+  if (btn) btn.classList.add('active');
+
+  const canvas = document.getElementById('draw_canvas');
+  if (!canvas) return;
+  if (tool === 'cursor') {
+    canvas.style.pointerEvents = 'none';
+    canvas.style.cursor = 'default';
+    drawStart = null;
+    clearDrawPreview();
+  } else {
+    canvas.style.pointerEvents = 'auto';
+    canvas.style.cursor = 'crosshair';
+  }
+}
+
+function clearAllDrawings() {
+  drawings = [];
+  drawStart = null;
+  clearDrawPreview();
+  renderAllDrawings();
+  saveCurrentDrawings();
+}
+
+function clearDrawPreview() {
+  const prev = document.getElementById('draw_preview');
+  if (prev) prev.innerHTML = '';
+}
+
+function getCanvasCoords(e) {
+  const canvas = document.getElementById('draw_canvas');
+  if (!canvas) return { x: 0, y: 0, price: null, time: null, w: 1, h: 1 };
+  const rect = canvas.getBoundingClientRect();
+  const x = e.clientX - rect.left;
+  const y = e.clientY - rect.top;
+  const price = candleSeries ? candleSeries.coordinateToPrice(y) : null;
+  let time = chart ? chart.timeScale().coordinateToTime(x) : null;
+  if (time) {
+    if (typeof time === 'object' && time.year) {
+      const mm = String(time.month).padStart(2, '0');
+      const dd = String(time.day).padStart(2, '0');
+      time = `${time.year}-${mm}-${dd}`;
+    } else if (typeof time === 'number') {
+      const dt = new Date(time * 1000);
+      if (!isNaN(dt.getTime())) {
+        time = dt.toISOString().split('T')[0];
+      }
+    }
+  }
+  return { x, y, price, time, w: rect.width || 1, h: rect.height || 1 };
+}
+
+function coordForTime(t, fallbackX) {
+  if (!chart || !t) return fallbackX;
+  try {
+    const cx = chart.timeScale().timeToCoordinate(t);
+    return cx != null ? cx : fallbackX;
+  } catch(e) {
+    return fallbackX;
+  }
+}
+
+function coordForPrice(p, fallbackY) {
+  if (!candleSeries || p == null) return fallbackY;
+  try {
+    const cy = candleSeries.priceToCoordinate(p);
+    return cy != null ? cy : fallbackY;
+  } catch(e) {
+    return fallbackY;
+  }
+}
+
+function onCanvasMouseDown(e) {
+  if (currentDrawTool === 'cursor') return;
+  const pt = getCanvasCoords(e);
+
+  if (currentDrawTool === 'text') {
+    const note = prompt('Enter chart note / annotation:');
+    if (note && note.trim()) {
+      drawings.push({
+        type: 'text',
+        time: pt.time,
+        price: pt.price,
+        x_rel: pt.w > 0 ? pt.x / pt.w : 0.5,
+        y_rel: pt.h > 0 ? pt.y / pt.h : 0.5,
+        text: note.trim()
+      });
+      renderAllDrawings();
+      saveCurrentDrawings();
+    }
+    setDrawTool('cursor');
+    return;
+  }
+
+  if (!drawStart) {
+    drawStart = pt;
+  } else {
+    commitDrawing(drawStart, pt, currentDrawTool);
+    drawStart = null;
+    clearDrawPreview();
+    setDrawTool('cursor');
+  }
+}
+
+function onCanvasMouseMove(e) {
+  if (currentDrawTool === 'cursor' || !drawStart) return;
+  const pt = getCanvasCoords(e);
+  renderPreviewDrawing(drawStart, pt, currentDrawTool);
+}
+
+function commitDrawing(p1, p2, tool) {
+  const w = p1.w || 1000;
+  const h = p1.h || 600;
+  drawings.push({
+    type: tool,
+    t1: p1.time,
+    p1: p1.price,
+    t2: p2.time,
+    p2: p2.price,
+    x1_rel: p1.x / w,
+    y1_rel: p1.y / h,
+    x2_rel: p2.x / w,
+    y2_rel: p2.y / h
+  });
+  renderAllDrawings();
+  saveCurrentDrawings();
+}
+
+function renderPreviewDrawing(p1, p2, tool) {
+  const prevG = document.getElementById('draw_preview');
+  if (!prevG) return;
+  prevG.innerHTML = buildDrawingSvg(tool, p1.x, p1.y, p2.x, p2.y, p1.price, p2.price, true);
+}
+
+function buildDrawingSvg(tool, x1, y1, x2, y2, price1, price2, isPreview) {
+  if (tool === 'line') {
+    return `<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="#38bdf8" stroke-width="2" stroke-dasharray="${isPreview?'4 4':'none'}"/>
+            <circle cx="${x1}" cy="${y1}" r="3.5" fill="#38bdf8"/>
+            <circle cx="${x2}" cy="${y2}" r="3.5" fill="#38bdf8"/>`;
+  }
+  if (tool === 'arrow') {
+    return `<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="#38bdf8" stroke-width="2.5" marker-end="url(#arrowhead)"/>
+            <circle cx="${x1}" cy="${y1}" r="3" fill="#38bdf8"/>`;
+  }
+  if (tool === 'measure') {
+    const rx = Math.min(x1, x2);
+    const ry = Math.min(y1, y2);
+    const rw = Math.abs(x2 - x1);
+    const rh = Math.abs(y2 - y1);
+    const deltaP = (price1 != null && price2 != null) ? (price2 - price1) : 0;
+    const pct = (price1 != null && price1 > 0 && price2 != null) ? ((price2 - price1) / price1 * 100) : 0;
+    const isUp = deltaP >= 0;
+    const boxColor = isUp ? 'rgba(16, 185, 129, 0.2)' : 'rgba(239, 68, 68, 0.2)';
+    const strokeColor = isUp ? '#10b981' : '#ef4444';
+    const tagBg = isUp ? '#065f46' : '#991b1b';
+    const tagX = rx + rw / 2;
+    const tagY = ry + rh / 2;
+    const sign = isUp ? '+' : '';
+    const label = `${sign}${pct.toFixed(2)}% (${sign}$${deltaP.toFixed(2)})`;
+
+    return `<rect x="${rx}" y="${ry}" width="${rw}" height="${rh}" fill="${boxColor}" stroke="${strokeColor}" stroke-dasharray="3 3" stroke-width="1.5"/>
+            <line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="${strokeColor}" stroke-width="1.5"/>
+            <circle cx="${x1}" cy="${y1}" r="3.5" fill="${strokeColor}"/>
+            <circle cx="${x2}" cy="${y2}" r="3.5" fill="${strokeColor}"/>
+            <g transform="translate(${tagX}, ${tagY})">
+              <rect x="-75" y="-13" width="150" height="24" rx="4" fill="${tagBg}" stroke="${strokeColor}" stroke-width="1"/>
+              <text x="0" y="3" text-anchor="middle" fill="#ffffff" font-size="11" font-weight="700" font-family="sans-serif">${label}</text>
+            </g>`;
+  }
+  return '';
+}
+
+function renderAllDrawings() {
+  const container = document.getElementById('draw_elements');
+  const canvas = document.getElementById('draw_canvas');
+  if (!container || !canvas) return;
+  const rect = canvas.getBoundingClientRect();
+  const w = rect.width, h = rect.height;
+  if (w <= 0 || h <= 0) return;
+
+  let html = '';
+  drawings.forEach(d => {
+    if (d.type === 'text') {
+      const x = coordForTime(d.time, d.x_rel * w);
+      const y = coordForPrice(d.price, d.y_rel * h);
+      const textLen = (d.text || '').length;
+      const boxW = Math.max(70, textLen * 7 + 16);
+      html += `<g transform="translate(${x}, ${y})">
+                 <rect x="0" y="-20" width="${boxW}" height="24" rx="4" fill="#0f172a" stroke="#38bdf8" stroke-width="1.5"/>
+                 <text x="8" y="-4" fill="#f8fafc" font-size="11" font-weight="600" font-family="sans-serif">${d.text}</text>
+                 <circle cx="0" cy="0" r="3" fill="#38bdf8"/>
+               </g>`;
+    } else {
+      const x1 = coordForTime(d.t1, d.x1_rel * w);
+      const y1 = coordForPrice(d.p1, d.y1_rel * h);
+      const x2 = coordForTime(d.t2, d.x2_rel * w);
+      const y2 = coordForPrice(d.p2, d.y2_rel * h);
+      html += buildDrawingSvg(d.type, x1, y1, x2, y2, d.p1, d.p2, false);
+    }
+  });
+  container.innerHTML = html;
+}
 
 // Init Chart
 function initChart() {
@@ -1138,8 +1795,34 @@ function initChart() {
     lastValueVisible: false,
   });
 
+  volMa20Series = chart.addLineSeries({
+    color: '#38bdf8',
+    lineWidth: 1,
+    title: 'Vol MA20',
+    priceScaleId: 'volume',
+    priceLineVisible: false,
+    lastValueVisible: false,
+  });
+
   chart.priceScale('volume').applyOptions({
     scaleMargins: { top: 0.85, bottom: 0.0 },
+  });
+
+  larssonFastSeries = chart.addLineSeries({
+    lineWidth: 1,
+    color: 'rgba(250, 204, 21, 0.001)',
+    title: 'Larsson Fast',
+    priceLineVisible: false,
+    lastValueVisible: true,
+    crosshairMarkerVisible: false,
+  });
+  larssonSlowSeries = chart.addLineSeries({
+    lineWidth: 1,
+    color: 'rgba(56, 189, 248, 0.001)',
+    title: 'Larsson Slow',
+    priceLineVisible: false,
+    lastValueVisible: true,
+    crosshairMarkerVisible: false,
   });
 
   candleSeries = chart.addCandlestickSeries({
@@ -1180,16 +1863,45 @@ function initChart() {
       ${e20 ? `<span style="color:#eab308;">E20: ${e20.toFixed(2)}</span>` : ''}
       ${s50 ? `<span style="color:#ef4444;">S50: ${s50.toFixed(2)}</span>` : ''}
     `;
+
+    if (window._lastLarssonData) {
+      const lItem = window._lastLarssonData.find(x => x.time === param.time);
+      if (lItem) updateLarssonLegendValues(lItem);
+    }
   });
 
-  // Time scale scroll/zoom listener to redraw canvas shaded boxes
-  chart.timeScale().subscribeVisibleLogicalRangeChange(drawCanvasOverlays);
-  chart.timeScale().subscribeVisibleTimeRangeChange(drawCanvasOverlays);
+  // Time scale scroll/zoom listener to redraw canvas shaded boxes, drawings, and larsson ribbon
+  chart.timeScale().subscribeVisibleLogicalRangeChange(() => {
+    drawCanvasOverlays();
+    renderAllDrawings();
+    scheduleLarssonRender();
+  });
+  chart.timeScale().subscribeVisibleTimeRangeChange(() => {
+    scheduleLarssonRender();
+  });
+
+  const containerRel = document.querySelector('.chart-container-rel');
+  if (containerRel) {
+    containerRel.addEventListener('wheel', () => scheduleLarssonRender(), { passive: true });
+    containerRel.addEventListener('touchmove', () => scheduleLarssonRender(), { passive: true });
+    containerRel.addEventListener('mousemove', (e) => {
+      if (e.buttons > 0) scheduleLarssonRender();
+    });
+    containerRel.addEventListener('mouseup', () => scheduleLarssonRender());
+  }
+
+  const drawCanvas = document.getElementById('draw_canvas');
+  if (drawCanvas) {
+    drawCanvas.addEventListener('mousedown', onCanvasMouseDown);
+    drawCanvas.addEventListener('mousemove', onCanvasMouseMove);
+  }
 
   window.addEventListener('resize', () => {
     if (chart && container) {
       chart.applyOptions({ width: container.clientWidth, height: container.clientHeight });
       drawCanvasOverlays();
+      renderAllDrawings();
+      scheduleLarssonRender();
     }
   });
 }
@@ -1296,6 +2008,11 @@ function fetchEvents() {
         data.emerging_themes || []
       );
       renderTable();
+      updateEnlargedStockCount();
+      const eslModal = document.getElementById('enlarged_stock_list_modal');
+      if (eslModal && eslModal.classList.contains('active')) {
+        renderEnlargedStockList();
+      }
       if (allEvents.length > 0) {
         selectEvent(allEvents[0]);
       } else {
@@ -1441,11 +2158,16 @@ function selectEvent(ev) {
   const activeRow = document.getElementById(`row_${ev.symbol}_${ev.date}`);
   if (activeRow) activeRow.classList.add('selected');
 
+  updateEnlargedStockCount();
   loadChart(ev.symbol, ev.date);
 }
 
 function loadChart(sym, dateStr) {
-  fetch(`/api/chart?symbol=${encodeURIComponent(sym)}&date=${encodeURIComponent(dateStr)}`)
+  currentChartSymbol = sym;
+  loadDrawingsForSymbol(sym);
+
+  const lFastest = document.getElementById('cfg_larsson_fastest') ? document.getElementById('cfg_larsson_fastest').value : '32';
+  fetch(`/api/chart?symbol=${encodeURIComponent(sym)}&date=${encodeURIComponent(dateStr)}&larsson_fastest=${encodeURIComponent(lFastest)}`)
     .then(r => r.json())
     .then(data => {
       currentChartData = data;
@@ -1457,33 +2179,14 @@ function loadChart(sym, dateStr) {
     });
 }
 
-function renderChart(data) {
-  if (!chart) initChart();
-
-  // Clear previous price lines
+function applySetupPriceLines(setup) {
   activePriceLines.forEach(pl => {
     try { candleSeries.removePriceLine(pl); } catch (e) {}
   });
   activePriceLines = [];
 
-  // Set Data
-  candleSeries.setData(data.bars || []);
-  volumeSeries.setData(data.volume || []);
-  ema10Series.setData(data.ema10 || []);
-  ema20Series.setData(data.ema20 || []);
-  sma50Series.setData(data.sma50 || []);
-  sma200Series.setData(data.sma200 || []);
+  if (!showPriceLines || !setup) return;
 
-  const setup = data.setup;
-
-  // Header Title
-  document.getElementById('chart_sym').textContent = setup.symbol;
-  document.getElementById('chart_date').textContent = setup.date;
-  const isBk = (setup.state === 'breakout');
-  document.getElementById('chart_state_pill').innerHTML = isBk ? '<span class="pill-breakout">BREAKOUT</span>' : '<span class="pill-building">BUILDING</span>';
-  document.getElementById('chart_ep_badge').innerHTML = setup.ep_badge ? `<span class="badge-ep-ignited">${setup.ep_badge}</span>` : '';
-
-  // Resistance Stack Price Lines
   if (setup.trigger && setup.trigger > 0) {
     activePriceLines.push(candleSeries.createPriceLine({
       price: setup.trigger, color: '#10b981', lineWidth: 2, lineStyle: 0, axisLabelVisible: true, title: `Trigger $${setup.trigger}`
@@ -1501,8 +2204,16 @@ function renderChart(data) {
       }));
     }
   });
+}
 
-  // Candlestick Markers: Prior EP, Post EP, and QM Event
+function applyCandleMarkers(data) {
+  if (!candleSeries || !data) return;
+  if (!showEpMarkers) {
+    candleSeries.setMarkers([]);
+    return;
+  }
+  const setup = data.setup || {};
+  const isBk = (setup.state === 'breakout');
   const markers = [];
   (data.all_eps || []).forEach(ep => {
     const isPrior = (ep.date === setup.prior_ep_date);
@@ -1535,17 +2246,62 @@ function renderChart(data) {
     }
   });
 
-  // Setup Date Marker
-  markers.push({
-    time: setup.date,
-    position: isBk ? 'aboveBar' : 'belowBar',
-    color: isBk ? '#10b981' : '#f59e0b',
-    shape: 'circle',
-    text: isBk ? '🚀 QM BREAKOUT' : '⏳ QM COIL'
-  });
+  if (setup.date) {
+    markers.push({
+      time: setup.date,
+      position: isBk ? 'aboveBar' : 'belowBar',
+      color: isBk ? '#10b981' : '#f59e0b',
+      shape: 'circle',
+      text: isBk ? '🚀 QM BREAKOUT' : '⏳ QM COIL'
+    });
+  }
 
   markers.sort((a, b) => a.time.localeCompare(b.time));
   candleSeries.setMarkers(markers);
+}
+
+function renderChart(data) {
+  if (!chart) initChart();
+
+  // Clear previous price lines
+  activePriceLines.forEach(pl => {
+    try { candleSeries.removePriceLine(pl); } catch (e) {}
+  });
+  activePriceLines = [];
+
+  // Set Data
+  candleSeries.setData(data.bars || []);
+  volumeSeries.setData(data.volume || []);
+  if (volMa20Series) volMa20Series.setData(data.vol_ma20 || []);
+  ema10Series.setData(data.ema10 || []);
+  ema20Series.setData(data.ema20 || []);
+  sma50Series.setData(data.sma50 || []);
+  sma200Series.setData(data.sma200 || []);
+
+  window._lastLarssonData = data.larsson || [];
+  updateNativeLarssonSeries(window._lastLarssonData);
+  scheduleLarssonRender();
+  updateLarssonLegendValues();
+
+  if (data.larsson_spans) {
+    const spEl = document.getElementById('lbl_larsson_spans');
+    if (spEl) spEl.textContent = `(${data.larsson_spans.join(', ')})`;
+  }
+
+  const setup = data.setup;
+
+  // Header Title
+  document.getElementById('chart_sym').textContent = setup.symbol;
+  document.getElementById('chart_date').textContent = setup.date;
+  const isBk = (setup.state === 'breakout');
+  document.getElementById('chart_state_pill').innerHTML = isBk ? '<span class="pill-breakout">BREAKOUT</span>' : '<span class="pill-building">BUILDING</span>';
+  document.getElementById('chart_ep_badge').innerHTML = setup.ep_badge ? `<span class="badge-ep-ignited">${setup.ep_badge}</span>` : '';
+
+  // Resistance Stack Price Lines
+  applySetupPriceLines(setup);
+
+  // Candlestick Markers
+  applyCandleMarkers(data);
 
   // Set visible range around consolidation & pole and auto-scale price axis to new ticker
   resetChartScale();
@@ -1784,6 +2540,176 @@ function selectStockFromModal(sym) {
   fetchEvents();
 }
 
+// Enlarged Chart Stock Chooser Modal & Step Navigation
+let eslFilterText = '';
+
+function updateEnlargedStockCount() {
+  const lbl = document.getElementById('lbl_enlarged_stock_count');
+  if (!lbl) return;
+  const total = allEvents ? allEvents.length : 0;
+  if (!total) {
+    lbl.textContent = '0';
+    return;
+  }
+  let idx = -1;
+  if (currentEvent) {
+    idx = allEvents.findIndex(e => e.symbol === currentEvent.symbol && e.date === currentEvent.date);
+  }
+  if (idx !== -1) {
+    lbl.textContent = `${idx + 1}/${total}`;
+  } else {
+    lbl.textContent = `${total}`;
+  }
+}
+
+function openEnlargedStockListModal() {
+  const modal = document.getElementById('enlarged_stock_list_modal');
+  if (!modal) return;
+  modal.classList.add('active');
+  const searchInput = document.getElementById('esl_search');
+  if (searchInput) searchInput.value = '';
+  eslFilterText = '';
+  renderEnlargedStockList('');
+  setTimeout(() => {
+    if (searchInput) searchInput.focus();
+    const selRow = document.querySelector('#esl_table_body tr.selected');
+    if (selRow) selRow.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  }, 60);
+}
+
+function closeEnlargedStockListModal(e) {
+  if (e && e.target && e.target.id !== 'enlarged_stock_list_modal' && !e.target.classList.contains('modal-close')) return;
+  const modal = document.getElementById('enlarged_stock_list_modal');
+  if (modal) modal.classList.remove('active');
+}
+
+function filterEnlargedStockList(val) {
+  eslFilterText = (val || '').trim().toLowerCase();
+  renderEnlargedStockList(eslFilterText);
+}
+
+function renderEnlargedStockList(query) {
+  const tbody = document.getElementById('esl_table_body');
+  if (!tbody) return;
+  const countEl = document.getElementById('esl_count');
+  const totalCount = allEvents ? allEvents.length : 0;
+  updateEnlargedStockCount();
+
+  const q = (query != null ? query : eslFilterText || '').toLowerCase().trim();
+  let list = allEvents || [];
+  if (q) {
+    list = list.filter(e => 
+      (e.symbol && e.symbol.toLowerCase().includes(q)) ||
+      (e.date && e.date.includes(q)) ||
+      (e.state && e.state.toLowerCase().includes(q)) ||
+      (e.pattern && e.pattern.toLowerCase().includes(q)) ||
+      (e.sector && e.sector.toLowerCase().includes(q)) ||
+      (e.theme && e.theme.toLowerCase().includes(q))
+    );
+  }
+
+  if (countEl) {
+    countEl.textContent = q ? `${list.length} / ${totalCount}` : totalCount.toLocaleString();
+  }
+
+  const sumEl = document.getElementById('esl_filter_summary');
+  if (sumEl) {
+    sumEl.textContent = `State: ${activeStateFilter.toUpperCase()} · EP: ${activeEpFilter.toUpperCase()} · Macro: ${activeMacroFilter}`;
+  }
+
+  if (!list.length) {
+    tbody.innerHTML = '<tr><td colspan="10" style="text-align:center; padding:30px; color:var(--muted);">No matching QM setups found.</td></tr>';
+    return;
+  }
+
+  const rows = list.map(ev => {
+    const isSel = (currentEvent && ev.symbol === currentEvent.symbol && ev.date === currentEvent.date);
+    const isBk = (ev.state === 'breakout');
+    const statePill = isBk ? '<span class="pill-breakout">BREAKOUT</span>' : '<span class="pill-building">BUILDING</span>';
+
+    // EP badge pill
+    let epBadgeHtml = '<span class="badge-ep-tech">⚪ Pure Technical</span>';
+    if (ev.has_prior_ep && ev.has_post_ep) {
+      epBadgeHtml = `<span class="badge-ep-both">⚡🚀 Ignited & Boosted</span>`;
+    } else if (ev.has_prior_ep) {
+      epBadgeHtml = `<span class="badge-ep-ignited">⚡ Prior EP (${ev.prior_ep_days_ago}d ago, +${ev.prior_ep_gap_pct}%)</span>`;
+    } else if (ev.has_post_ep) {
+      epBadgeHtml = `<span class="badge-ep-boosted">🚀 Post EP (${ev.post_ep_days_later}d later, +${ev.post_ep_gap_pct}%)</span>`;
+    }
+
+    // Macro flow badge
+    let macroBadge = '';
+    if (ev.is_emerging_theme) {
+      macroBadge = ' <span class="badge" style="background:#78350f; color:#fde68a; font-size:9.5px; margin-left:4px;" title="Emerging Theme">🌟 Emerging</span>';
+    } else if (ev.is_leading_theme) {
+      macroBadge = ' <span class="badge" style="background:#4c1d95; color:#ddd6fe; font-size:9.5px; margin-left:4px;" title="Leading Theme">🚀 Leading</span>';
+    } else if (ev.is_leading_sector) {
+      macroBadge = ' <span class="badge" style="background:#1e3a8a; color:#bfdbfe; font-size:9.5px; margin-left:4px;" title="Leading Sector">🏭 Leading</span>';
+    }
+
+    return `<tr class="${isSel ? 'selected' : ''}" onclick="onEslRowClick('${ev.symbol}','${ev.date}')">
+      <td class="tl"><strong style="color:#38bdf8;">${ev.symbol}</strong>${macroBadge}</td>
+      <td class="tl" style="font-family:monospace; color:#94a3b8;">${ev.date}</td>
+      <td class="tl">${statePill}</td>
+      <td style="color:#34d399; font-weight:600;">+${(ev.move_pct || 0).toFixed(1)}%</td>
+      <td>${ev.cons_bars}d</td>
+      <td style="color:${(ev.pullback_pct || 0) > 25 ? '#f87171' : '#cbd5e1'}">-${(ev.pullback_pct || 0).toFixed(1)}%</td>
+      <td class="tl" style="font-size:11px; color:#cbd5e1;">${ev.pattern || '·'}</td>
+      <td class="tl">${epBadgeHtml}</td>
+      <td class="tl" style="max-width:120px; overflow:hidden; text-overflow:ellipsis; color:#38bdf8;">${ev.sector || '·'}</td>
+      <td class="tl" style="max-width:120px; overflow:hidden; text-overflow:ellipsis; color:#c084fc;">${ev.theme || '·'}</td>
+    </tr>`;
+  }).join('');
+
+  tbody.innerHTML = rows;
+}
+
+function onEslRowClick(sym, dt) {
+  const ev = allEvents.find(e => e.symbol === sym && e.date === dt);
+  if (ev) {
+    selectEvent(ev);
+    const row = document.getElementById(`row_${sym}_${dt}`);
+    if (row) row.scrollIntoView({ block: 'nearest' });
+  }
+  closeEnlargedStockListModal();
+}
+
+function sortEslBy(col) {
+  sortTable(col);
+  setTimeout(() => {
+    renderEnlargedStockList();
+  }, 100);
+}
+
+function stepFilteredStock(delta) {
+  if (!allEvents || !allEvents.length) return;
+  let idx = -1;
+  if (currentEvent) {
+    idx = allEvents.findIndex(e => e.symbol === currentEvent.symbol && e.date === currentEvent.date);
+  }
+  if (idx === -1) {
+    idx = (delta > 0) ? 0 : allEvents.length - 1;
+  } else {
+    idx = (idx + delta + allEvents.length) % allEvents.length;
+  }
+  const nextEv = allEvents[idx];
+  if (nextEv) {
+    selectEvent(nextEv);
+    const row = document.getElementById(`row_${nextEv.symbol}_${nextEv.date}`);
+    if (row) row.scrollIntoView({ block: 'nearest' });
+    updateEnlargedStockCount();
+
+    const modal = document.getElementById('enlarged_stock_list_modal');
+    if (modal && modal.classList.contains('active')) {
+      renderEnlargedStockList();
+      setTimeout(() => {
+        const selRow = document.querySelector('#esl_table_body tr.selected');
+        if (selRow) selRow.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+      }, 40);
+    }
+  }
+}
+
 function clearDossier() {
   document.getElementById('dos_sym_date').textContent = '--';
   document.getElementById('dos_sector').textContent = '--';
@@ -1904,42 +2830,279 @@ function sortTable(col) {
 }
 
 // Indicator Toggles
+// Chart Settings & Indicator Toggles
+function toggleChartSettings() {
+  const p = document.getElementById('chart_settings_panel');
+  if (!p) return;
+  const isHidden = (p.style.display === 'none' || !p.style.display);
+  p.style.display = isHidden ? 'flex' : 'none';
+  const b = document.getElementById('btn_chart_settings');
+  if (b) b.classList.toggle('active', isHidden);
+  const bTool = document.getElementById('btn_tool_settings');
+  if (bTool) bTool.classList.toggle('active', isHidden);
+}
+
 function toggleEma10() {
-  const on = document.getElementById('chk_ema10').checked;
-  ema10Series.applyOptions({ visible: on });
+  const el = document.getElementById('chk_settings_ema10') || document.getElementById('chk_ema10');
+  const on = el ? el.checked : true;
+  if (ema10Series) ema10Series.applyOptions({ visible: on });
 }
 function toggleEma20() {
-  const on = document.getElementById('chk_ema20').checked;
-  ema20Series.applyOptions({ visible: on });
+  const el = document.getElementById('chk_settings_ema20') || document.getElementById('chk_ema20');
+  const on = el ? el.checked : true;
+  if (ema20Series) ema20Series.applyOptions({ visible: on });
 }
 function toggleSma50() {
-  const on = document.getElementById('chk_sma50').checked;
-  sma50Series.applyOptions({ visible: on });
+  const el = document.getElementById('chk_settings_sma50') || document.getElementById('chk_sma50');
+  const on = el ? el.checked : true;
+  if (sma50Series) sma50Series.applyOptions({ visible: on });
 }
 function toggleSma200() {
-  const on = document.getElementById('chk_sma200').checked;
-  sma200Series.applyOptions({ visible: on });
+  const el = document.getElementById('chk_settings_sma200') || document.getElementById('chk_sma200');
+  const on = el ? el.checked : true;
+  if (sma200Series) sma200Series.applyOptions({ visible: on });
+}
+function toggleVolMa20() {
+  const el = document.getElementById('chk_settings_vol_ma20');
+  const on = el ? el.checked : true;
+  if (volMa20Series) volMa20Series.applyOptions({ visible: on });
 }
 function togglePoleBox() {
-  showPoleBox = document.getElementById('chk_pole_box').checked;
+  const el = document.getElementById('chk_settings_pole_box') || document.getElementById('chk_pole_box');
+  showPoleBox = el ? el.checked : true;
   drawCanvasOverlays();
 }
 function toggleConsBox() {
-  showConsBox = document.getElementById('chk_cons_box').checked;
+  const el = document.getElementById('chk_settings_cons_box') || document.getElementById('chk_cons_box');
+  showConsBox = el ? el.checked : true;
   drawCanvasOverlays();
 }
+function togglePriceLines() {
+  const el = document.getElementById('chk_settings_price_lines');
+  showPriceLines = el ? el.checked : true;
+  if (currentChartData && currentChartData.setup) {
+    applySetupPriceLines(currentChartData.setup);
+  }
+}
+function toggleEpMarkers() {
+  const el = document.getElementById('chk_settings_ep_markers');
+  showEpMarkers = el ? el.checked : true;
+  if (currentChartData) {
+    applyCandleMarkers(currentChartData);
+  }
+}
 
-function toggleFullscreen() {
+// Larsson Ribbon Renderer
+let _larssonRaf = null;
+function scheduleLarssonRender() {
+  if (_larssonRaf) cancelAnimationFrame(_larssonRaf);
+  _larssonRaf = requestAnimationFrame(() => {
+    _larssonRaf = null;
+    renderLarssonRibbon();
+  });
+}
+
+function updateNativeLarssonSeries(larssonData) {
+  if (!larssonFastSeries || !larssonSlowSeries) return;
+  const isEnabled = document.getElementById('chk_settings_larsson') ? document.getElementById('chk_settings_larsson').checked : true;
+  if (!isEnabled || !larssonData || !larssonData.length) {
+    larssonFastSeries.setData([]);
+    larssonSlowSeries.setData([]);
+    return;
+  }
+  const fastData = [];
+  const slowData = [];
+  for (let i = 0; i < larssonData.length; i++) {
+    const item = larssonData[i];
+    if (item.fast != null) {
+      fastData.push({ time: item.time, value: item.fast });
+    }
+    if (item.slow != null) {
+      slowData.push({ time: item.time, value: item.slow });
+    }
+  }
+  larssonFastSeries.setData(fastData);
+  larssonSlowSeries.setData(slowData);
+}
+
+function renderLarssonRibbon(larssonData) {
+  if (larssonData) {
+    window._lastLarssonData = larssonData;
+  } else {
+    larssonData = window._lastLarssonData;
+  }
+  const group = document.getElementById('larsson_ribbon_group');
+  if (!group) return;
+  const isEnabled = document.getElementById('chk_settings_larsson') ? document.getElementById('chk_settings_larsson').checked : true;
+  if (!isEnabled || !larssonData || !larssonData.length || !chart || !candleSeries) {
+    group.innerHTML = '';
+    return;
+  }
+
+  const container = document.getElementById('chart_tv');
+  const svg = document.getElementById('larsson_ribbon_svg');
+  if (svg && container) {
+    svg.setAttribute('width', container.clientWidth);
+    svg.setAttribute('height', container.clientHeight);
+    svg.style.width = container.clientWidth + 'px';
+    svg.style.height = container.clientHeight + 'px';
+  }
+
+  const logicalRange = chart.timeScale().getVisibleLogicalRange();
+  const fromIdx = logicalRange ? Math.max(0, Math.floor(logicalRange.from) - 8) : 0;
+  const toIdx = logicalRange ? Math.min(larssonData.length - 1, Math.ceil(logicalRange.to) + 8) : larssonData.length - 1;
+
+  let segments = [];
+  let currentSeg = null;
+
+  for (let i = fromIdx; i <= toIdx; i++) {
+    const item = larssonData[i];
+    if (!item || item.fast == null || item.slow == null) {
+      if (currentSeg && currentSeg.pts.length >= 2) segments.push(currentSeg);
+      currentSeg = null;
+      continue;
+    }
+    const x = chart.timeScale().timeToCoordinate(item.time);
+    const yFast = candleSeries.priceToCoordinate(item.fast);
+    const ySlow = candleSeries.priceToCoordinate(item.slow);
+    if (x == null || yFast == null || ySlow == null) continue;
+
+    const pt = { x, yFast, ySlow, state: item.state };
+
+    if (!currentSeg) {
+      currentSeg = { state: item.state, pts: [pt] };
+    } else if (currentSeg.state === item.state) {
+      currentSeg.pts.push(pt);
+    } else {
+      currentSeg.pts.push(pt);
+      if (currentSeg.pts.length >= 2) segments.push(currentSeg);
+      const prevPt = currentSeg.pts[currentSeg.pts.length - 2];
+      currentSeg = { state: item.state, pts: [prevPt, pt] };
+    }
+  }
+  if (currentSeg && currentSeg.pts.length >= 2) {
+    segments.push(currentSeg);
+  }
+
+  const styleConfig = {
+    yellow: { fill: 'rgba(250, 204, 21, 0.35)', strokeFast: '#facc15', strokeSlow: '#ca8a04', strokeWidth: '2.0' },
+    blue:   { fill: 'rgba(56, 189, 248, 0.30)', strokeFast: '#38bdf8', strokeSlow: '#0284c7', strokeWidth: '2.0' },
+    gray:   { fill: 'rgba(148, 163, 184, 0.20)', strokeFast: '#94a3b8', strokeSlow: '#64748b', strokeWidth: '1.5' }
+  };
+
+  let svgHtml = '';
+  segments.forEach(seg => {
+    const cfg = styleConfig[seg.state] || styleConfig.gray;
+    const pts = seg.pts;
+    if (pts.length < 2) return;
+
+    let pathD = `M ${pts[0].x.toFixed(1)} ${pts[0].yFast.toFixed(1)}`;
+    for (let j = 1; j < pts.length; j++) {
+      pathD += ` L ${pts[j].x.toFixed(1)} ${pts[j].yFast.toFixed(1)}`;
+    }
+    pathD += ` L ${pts[pts.length - 1].x.toFixed(1)} ${pts[pts.length - 1].ySlow.toFixed(1)}`;
+    for (let j = pts.length - 2; j >= 0; j--) {
+      pathD += ` L ${pts[j].x.toFixed(1)} ${pts[j].ySlow.toFixed(1)}`;
+    }
+    pathD += ' Z';
+
+    let fastLineD = `M ${pts[0].x.toFixed(1)} ${pts[0].yFast.toFixed(1)}`;
+    let slowLineD = `M ${pts[0].x.toFixed(1)} ${pts[0].ySlow.toFixed(1)}`;
+    for (let j = 1; j < pts.length; j++) {
+      fastLineD += ` L ${pts[j].x.toFixed(1)} ${pts[j].yFast.toFixed(1)}`;
+      slowLineD += ` L ${pts[j].x.toFixed(1)} ${pts[j].ySlow.toFixed(1)}`;
+    }
+
+    svgHtml += `<path d="${pathD}" fill="${cfg.fill}" />`;
+    svgHtml += `<path d="${fastLineD}" fill="none" stroke="${cfg.strokeFast}" stroke-width="${cfg.strokeWidth}" stroke-linejoin="round" stroke-linecap="round" />`;
+    svgHtml += `<path d="${slowLineD}" fill="none" stroke="${cfg.strokeSlow}" stroke-width="${cfg.strokeWidth}" stroke-linejoin="round" stroke-linecap="round" />`;
+  });
+
+  group.innerHTML = svgHtml;
+}
+
+function updateLarssonLegendValues(item) {
+  const elFast = document.getElementById('larsson_val_fast');
+  const elSlow = document.getElementById('larsson_val_slow');
+  if (!elFast || !elSlow) return;
+  if (!item && window._lastLarssonData && window._lastLarssonData.length) {
+    for (let i = window._lastLarssonData.length - 1; i >= 0; i--) {
+      if (window._lastLarssonData[i].fast != null && window._lastLarssonData[i].slow != null) {
+        item = window._lastLarssonData[i];
+        break;
+      }
+    }
+  }
+  if (item && item.fast != null && item.slow != null) {
+    elFast.textContent = item.fast.toFixed(2);
+    elSlow.textContent = item.slow.toFixed(2);
+    if (item.state === 'yellow') {
+      elFast.style.color = '#facc15';
+      elSlow.style.color = '#facc15';
+    } else if (item.state === 'blue') {
+      elFast.style.color = '#38bdf8';
+      elSlow.style.color = '#38bdf8';
+    } else {
+      elFast.style.color = '#94a3b8';
+      elSlow.style.color = '#94a3b8';
+    }
+  }
+}
+
+function onLarssonFastestChange() {
+  const el = document.getElementById('cfg_larsson_fastest');
+  let val = parseInt(el.value, 10);
+  if (isNaN(val) || val < 2) val = 32;
+  if (val > 100) val = 100;
+  el.value = val;
+  if (currentEvent) {
+    loadChart(currentEvent.symbol, currentEvent.date);
+  }
+}
+
+function toggleLarsson() {
+  const el = document.getElementById('chk_settings_larsson');
+  const isEnabled = el ? el.checked : true;
+  updateNativeLarssonSeries(window._lastLarssonData);
+  scheduleLarssonRender();
+}
+
+function toggleChartFullscreen() {
   const ws = document.getElementById('main_workspace');
-  ws.classList.toggle('fullscreen-chart-mode');
-  setTimeout(() => {
+  const btn = document.getElementById('btn_chart_fullscreen');
+  if (!ws) return;
+  const isFull = ws.classList.toggle('fullscreen-chart-mode');
+  if (btn) {
+    btn.innerHTML = isFull ? '🗗 Minimize' : '⛶ Enlarge';
+  }
+  const drawToolbar = document.getElementById('chart_draw_toolbar');
+  if (drawToolbar) {
+    drawToolbar.style.display = isFull ? 'flex' : 'none';
+  }
+  updateEnlargedStockCount();
+  if (!isFull) {
+    const p = document.getElementById('chart_settings_panel');
+    if (p) p.style.display = 'none';
+    const b = document.getElementById('btn_chart_settings');
+    if (b) b.classList.remove('active');
+    const bTool = document.getElementById('btn_tool_settings');
+    if (bTool) bTool.classList.remove('active');
+  }
+  const updateLayout = () => {
     const container = document.getElementById('chart_tv');
     if (chart && container) {
       chart.applyOptions({ width: container.clientWidth, height: container.clientHeight });
-      drawCanvasOverlays();
     }
-  }, 100);
+    requestAnimationFrame(() => {
+      drawCanvasOverlays();
+      renderAllDrawings();
+      scheduleLarssonRender();
+    });
+  };
+  setTimeout(updateLayout, 50);
+  setTimeout(updateLayout, 200);
 }
+const toggleFullscreen = toggleChartFullscreen;
 
 function reloadDataset() {
   fetch('/api/reload_dataset')
@@ -1952,22 +3115,57 @@ function reloadDataset() {
 
 // Keyboard Navigation
 window.addEventListener('keydown', e => {
+  if (e.key === 'Escape') {
+    const eslModal = document.getElementById('enlarged_stock_list_modal');
+    if (eslModal && eslModal.classList.contains('active')) {
+      closeEnlargedStockListModal();
+      return;
+    }
+    const p = document.getElementById('chart_settings_panel');
+    if (p && p.style.display !== 'none') {
+      p.style.display = 'none';
+      const b = document.getElementById('btn_chart_settings');
+      if (b) b.classList.remove('active');
+      const bTool = document.getElementById('btn_tool_settings');
+      if (bTool) bTool.classList.remove('active');
+      return;
+    }
+    if (currentDrawTool !== 'cursor') {
+      setDrawTool('cursor');
+      return;
+    }
+    const ws = document.getElementById('main_workspace');
+    if (ws && ws.classList.contains('fullscreen-chart-mode')) {
+      toggleChartFullscreen();
+      return;
+    }
+  }
+
+  // Ctrl/Cmd + K opens stock chooser modal
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
+    e.preventDefault();
+    openEnlargedStockListModal();
+    return;
+  }
+
   if (document.activeElement.tagName === 'INPUT' || document.activeElement.tagName === 'SELECT') return;
   if (!allEvents || allEvents.length === 0 || !currentEvent) return;
 
-  const curIdx = allEvents.findIndex(x => x.symbol === currentEvent.symbol && x.date === currentEvent.date);
-  if (curIdx === -1) return;
+  const ws = document.getElementById('main_workspace');
+  const isEnlarged = ws && ws.classList.contains('fullscreen-chart-mode');
 
-  if (e.key === 'ArrowDown' && curIdx < allEvents.length - 1) {
+  if (e.key === 'ArrowRight' || (isEnlarged && e.key === 'ArrowDown')) {
     e.preventDefault();
-    selectEvent(allEvents[curIdx + 1]);
-    const row = document.getElementById(`row_${allEvents[curIdx + 1].symbol}_${allEvents[curIdx + 1].date}`);
-    if (row) row.scrollIntoView({ block: 'nearest' });
-  } else if (e.key === 'ArrowUp' && curIdx > 0) {
+    stepFilteredStock(1);
+  } else if (e.key === 'ArrowLeft' || (isEnlarged && e.key === 'ArrowUp')) {
     e.preventDefault();
-    selectEvent(allEvents[curIdx - 1]);
-    const row = document.getElementById(`row_${allEvents[curIdx - 1].symbol}_${allEvents[curIdx - 1].date}`);
-    if (row) row.scrollIntoView({ block: 'nearest' });
+    stepFilteredStock(-1);
+  } else if (!isEnlarged && e.key === 'ArrowDown') {
+    e.preventDefault();
+    stepFilteredStock(1);
+  } else if (!isEnlarged && e.key === 'ArrowUp') {
+    e.preventDefault();
+    stepFilteredStock(-1);
   }
 });
 

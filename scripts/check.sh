@@ -10,7 +10,7 @@ echo "▸ py_compile (EP core modules)"
 "$PY" - <<'PYEOF'
 import py_compile, sys
 CORE_MODULES = [
-    "serve_ep.py", "serve_ep_tracker.py", "serve_qm.py", "mine_qm_setups.py",
+    "serve_ep.py", "serve_ep_tracker.py", "serve_qm.py", "serve_rs.py", "mine_qm_setups.py",
     "ep_ml_engine.py", "scanner_core.py", "indicators.py", "datastore.py",
     "labels.py", "thematic_engine.py", "generate_handbook_pdf.py"
 ]

@@ -41,6 +41,7 @@ import thematic_engine
 import universe
 from ep_ml_engine import engine
 import serve_ep
+import trading_calendar
 
 DATA_PATH = ROOT / "data" / "simulations" / "ep_combined_study_scored.parquet"
 
@@ -121,7 +122,9 @@ def scan_for_new_eps(since_date: str) -> list[tuple[str, str, str]]:
             fwd = d.iloc[j:]
             held_d1_low = float(fwd["low"].min()) >= (float(row["low"]) * 0.999)
 
-            if (gap >= 5.0 or vol_shares >= 9_000_000 or chg >= 8.0) and (rvol >= 2.4 or round(rvol, 1) >= 2.5) and dvol_m >= 15.0 and held_d1_low:
+            is_mech_vol = trading_calendar.is_mechanical_volume_date(dt_str)
+            valid_catalyst = gap >= 5.0 if is_mech_vol else (gap >= 5.0 or vol_shares >= 9_000_000 or chg >= 8.0)
+            if valid_catalyst and (rvol >= 2.4 or round(rvol, 1) >= 2.5) and dvol_m >= 15.0 and held_d1_low:
                 fresh_eps.append((sym, dt_str, "dre"))
                 seen_keys.add(key)
 
@@ -430,7 +433,14 @@ def build_ep_row(sym: str, dt_str: str, subtype: str, thm_engine) -> dict | None
         "t1_delayed_climax_pyramid_r": round(t1_delayed_climax_pyramid_r, 3),
         "adr_pct": round(adr_pct_val, 2),
         "prev_day_gap_pct": round(prev_day_gap_pct, 2),
-        "prev_day_gap_up": prev_day_gap_up
+        "prev_day_gap_up": prev_day_gap_up,
+        "is_opex": trading_calendar.is_monthly_opex(dt_str),
+        "is_quad_witching": trading_calendar.is_quad_witching(dt_str),
+        "is_russell_recon": trading_calendar.is_russell_reconstitution(dt_str),
+        "is_month_end": trading_calendar.is_month_end(dt_str),
+        "is_quarter_end": trading_calendar.is_quarter_end(dt_str),
+        "is_mechanical_volume_date": trading_calendar.is_mechanical_volume_date(dt_str),
+        "calendar_anomaly": trading_calendar.get_calendar_anomaly_type(dt_str)
     }
 
 

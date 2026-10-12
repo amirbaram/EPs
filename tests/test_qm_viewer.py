@@ -296,8 +296,89 @@ class TestQMViewer(unittest.TestCase):
         self.assertIn(b"onSectorChange()", res_idx.data)
         self.assertIn(b"onThemeChange()", res_idx.data)
 
+    def test_chart_settings_larsson_and_draw_tools(self):
+        """Verifies chart settings panel, Larsson line computation, drawing tools, and enlarge button in serve_qm."""
+        client = serve_qm.app.test_client()
+
+        # 1. Verify /api/chart returns larsson data, spans, and vol_ma20
+        res = client.get("/api/chart?symbol=NVDA&date=2024-05-23&larsson_fastest=32")
+        self.assertEqual(res.status_code, 200)
+        d = res.get_json()
+        self.assertIn("larsson", d)
+        self.assertIn("larsson_spans", d)
+        self.assertEqual(d["larsson_spans"], [32, 35, 50, 58])
+        self.assertIn("vol_ma20", d)
+        self.assertGreater(len(d["larsson"]), 0)
+        l_first = d["larsson"][-1]
+        self.assertIn("fast", l_first)
+        self.assertIn("slow", l_first)
+        self.assertIn("state", l_first)
+        self.assertIn(l_first["state"], ["yellow", "blue", "gray"])
+
+        # 2. Verify /api/annotations GET and POST
+        test_drawings = [
+            {"type": "line", "t1": "2024-05-20", "p1": 900.0, "t2": "2024-05-23", "p2": 1050.0}
+        ]
+        res_post = client.post("/api/annotations", json={"symbol": "TEST_QM", "drawings": test_drawings})
+        self.assertEqual(res_post.status_code, 200)
+        self.assertTrue(res_post.get_json().get("ok"))
+
+        res_get = client.get("/api/annotations?symbol=TEST_QM")
+        self.assertEqual(res_get.status_code, 200)
+        d_anno = res_get.get_json()
+        self.assertEqual(d_anno.get("symbol"), "TEST_QM")
+        self.assertEqual(len(d_anno.get("drawings", [])), 1)
+        self.assertEqual(d_anno["drawings"][0]["type"], "line")
+
+        # 3. Verify UI Elements in index
+        res_idx = client.get("/")
+        self.assertEqual(res_idx.status_code, 200)
+        html = res_idx.data.decode("utf-8")
+        self.assertIn("btn_chart_settings", html)
+        self.assertIn("btn_toggle_draw", html)
+        self.assertIn("btn_chart_fullscreen", html)
+        self.assertIn("chart_settings_panel", html)
+        self.assertIn("chart_draw_toolbar", html)
+        self.assertIn("larsson_ribbon_svg", html)
+        self.assertIn("draw_canvas", html)
+        self.assertIn("cfg_larsson_fastest", html)
+        self.assertIn("toggleChartSettings()", html)
+        self.assertIn("toggleDrawToolbar()", html)
+        self.assertIn("toggleChartFullscreen()", html)
+
+    def test_enlarged_chart_stock_list_and_navigation(self):
+        """Verifies enlarged chart stock list chooser button, modal, and next/prev buttons."""
+        client = serve_qm.app.test_client()
+        res_idx = client.get("/")
+        self.assertEqual(res_idx.status_code, 200)
+        html = res_idx.data.decode("utf-8")
+
+        # 1. Enlarged controls & navigation buttons in chart header
+        self.assertIn("chart-enlarged-only-controls", html)
+        self.assertIn("btn_enlarged_stock_list", html)
+        self.assertIn("btn_chart_prev_ticker", html)
+        self.assertIn("btn_chart_next_ticker", html)
+        self.assertIn("lbl_enlarged_stock_count", html)
+
+        # 2. Stock chooser modal elements
+        self.assertIn("enlarged_stock_list_modal", html)
+        self.assertIn("esl_search", html)
+        self.assertIn("esl_table_body", html)
+        self.assertIn("esl_count", html)
+        self.assertIn("esl-table", html)
+
+        # 3. JavaScript helper functions
+        self.assertIn("openEnlargedStockListModal()", html)
+        self.assertIn("closeEnlargedStockListModal", html)
+        self.assertIn("renderEnlargedStockList", html)
+        self.assertIn("stepFilteredStock(-1)", html)
+        self.assertIn("stepFilteredStock(1)", html)
+        self.assertIn("onEslRowClick", html)
+        self.assertIn("updateEnlargedStockCount()", html)
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
 

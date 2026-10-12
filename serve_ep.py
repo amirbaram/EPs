@@ -63,6 +63,9 @@ def get_df():
                 DF["adr_pct"] = 5.0
             if "prev_day_gap_pct" in DF.columns:
                 DF["prev_day_gap_up"] = DF["prev_day_gap_pct"] > (0.33 * DF["adr_pct"])
+            if "is_mechanical_volume_date" not in DF.columns:
+                import trading_calendar
+                DF = trading_calendar.annotate_calendar_events(DF, date_col="date")
             print(f"Loaded {len(DF)} EP events.")
         else:
             print(f"Error: {DATA_PATH} not found!")
@@ -664,6 +667,18 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       <option value="">All</option>
       <option value="no_gap">🛡️ Clean (No Gap &gt; 0.33×ADR)</option>
       <option value="gap_up">⚠️ Prior Gap Up (&gt; 0.33×ADR)</option>
+    </select>
+  </div>
+
+  <div class="filter-group">
+    <label title="Filter out mechanical volume spikes (Quad Witching, Monthly OpEx, Russell Reconstitution, Month/Quarter-End)">Calendar</label>
+    <select id="f_calendar">
+      <option value="">All Dates</option>
+      <option value="clean">🛡️ Clean (Exclude Special Volume Dates)</option>
+      <option value="opex">⚠️ Monthly OpEx</option>
+      <option value="quad">⚠️ Quad Witching</option>
+      <option value="russell">⚠️ Russell Reconstitution</option>
+      <option value="month_end">⚠️ Month / Quarter-End</option>
     </select>
   </div>
 
@@ -2469,6 +2484,7 @@ function resetBoosters() {
     if (el) el.classList.remove('active');
   }
   if (document.getElementById('f_prev_gap')) document.getElementById('f_prev_gap').value = '';
+  if (document.getElementById('f_calendar')) document.getElementById('f_calendar').value = '';
   fetchEvents();
 }
 
@@ -2488,6 +2504,7 @@ function setPreset(p) {
   document.getElementById('f_year').value = '';
   document.getElementById('f_search').value = '';
   if (document.getElementById('f_prev_gap')) document.getElementById('f_prev_gap').value = '';
+  if (document.getElementById('f_calendar')) document.getElementById('f_calendar').value = '';
   if (document.getElementById('f_recent_days')) {
     document.getElementById('f_recent_days').value = '';
     const cEl = document.getElementById('f_recent_days_custom');
@@ -3068,6 +3085,7 @@ function fetchEvents() {
     })(),
     v2: document.getElementById('f_v2') ? document.getElementById('f_v2').value : '',
     prev_gap: document.getElementById('f_prev_gap') ? document.getElementById('f_prev_gap').value : '',
+    calendar: document.getElementById('f_calendar') ? document.getElementById('f_calendar').value : '',
     search: document.getElementById('f_search').value.trim().toUpperCase(),
     cond_veto_headwind: activeBoosters.veto_headwind ? '1' : '0',
     cond_win_sectors: activeBoosters.win_sectors ? '1' : '0',
@@ -3194,8 +3212,12 @@ function renderTable() {
       ? `<br><span style="color:#f59e0b; font-size:9.5px; font-weight:600;" title="Prior day (D-1) gapped up by ${e.prev_day_gap_pct}% (> 0.33×ADR)">⚠️ P-Gap +${Number(e.prev_day_gap_pct || 0).toFixed(0)}%</span>`
       : `<br><span style="color:#10b981; font-size:9.5px;" title="Clean pivot: no prior day gap-up > 0.33×ADR">✓ Clean</span>`;
 
+    const calBadge = e.calendar_anomaly
+      ? `<br><span style="color:#c084fc; font-size:9px; font-weight:600;" title="Special Volume Date: ${e.calendar_anomaly}">📅 ${e.calendar_anomaly}</span>`
+      : '';
+
     return `<tr class="${isSel ? 'selected' : ''}" onclick="onRowClick('${e.symbol}','${e.date}')">
-      <td class="tl">${e.date}</td>
+      <td class="tl">${e.date}${calBadge}</td>
       <td class="tl" style="font-weight:700; color:#fff;">${e.symbol}</td>
       <td class="tl" style="max-width:130px; overflow:hidden; text-overflow:ellipsis;"><span style="color:#38bdf8; cursor:pointer; text-decoration:underline dotted;" title="Click to view ${e.sector} Stock Leaderboard" onclick="event.stopPropagation(); openGroupStocksModal('${e.sector}', 'sector')">${e.sector || '·'}</span></td>
       <td class="tl" style="max-width:130px; overflow:hidden; text-overflow:ellipsis;"><span style="color:#c084fc; cursor:pointer; text-decoration:underline dotted;" title="Click to view ${e.theme} Stock Leaderboard" onclick="event.stopPropagation(); openGroupStocksModal('${e.theme}', 'theme')">${e.theme || '·'}</span></td>
@@ -3312,12 +3334,16 @@ function renderEnlargedStockList(query) {
       ? `<br><span style="color:#f59e0b; font-size:9px; font-weight:600;" title="Prior day (D-1) gapped up by ${e.prev_day_gap_pct}% (> 0.33×ADR)">⚠️ P-Gap +${Number(e.prev_day_gap_pct || 0).toFixed(0)}%</span>`
       : `<br><span style="color:#10b981; font-size:9px;" title="Clean pivot: no prior day gap-up > 0.33×ADR">✓ Clean</span>`;
 
+    const calBadge = e.calendar_anomaly
+      ? `<br><span style="color:#c084fc; font-size:9px; font-weight:600;" title="Special Volume Date: ${e.calendar_anomaly}">📅 ${e.calendar_anomaly}</span>`
+      : '';
+
     const subBadge = (e.subtype === 'dre')
       ? '<span style="background:rgba(244,63,94,0.2); color:#fb7185; padding:1px 4px; border-radius:3px; font-size:9px; font-weight:700;">DRE</span>'
       : '<span style="background:rgba(56,189,248,0.2); color:#38bdf8; padding:1px 4px; border-radius:3px; font-size:9px; font-weight:700;">EP</span>';
 
     return `<tr class="${isSel ? 'selected' : ''}" onclick="onEslRowClick('${e.symbol}','${e.date}')">
-      <td class="tl">${e.date}</td>
+      <td class="tl">${e.date}${calBadge}</td>
       <td class="tl" style="font-weight:700; color:#fff; font-size:12px;">${e.symbol}</td>
       <td class="tl">${subBadge}</td>
       <td class="tl" style="max-width:120px; overflow:hidden; text-overflow:ellipsis; color:#38bdf8;">${e.sector || '·'}</td>
@@ -3387,11 +3413,12 @@ function loadChart(ev) {
   const lFastest = document.getElementById('cfg_larsson_fastest') ? document.getElementById('cfg_larsson_fastest').value : '32';
   const v2Val = document.getElementById('f_v2') ? document.getElementById('f_v2').value : '';
   const prevGapVal = document.getElementById('f_prev_gap') ? document.getElementById('f_prev_gap').value : '';
+  const calendarVal = document.getElementById('f_calendar') ? document.getElementById('f_calendar').value : '';
   const recentDaysEl = document.getElementById('f_recent_days');
   const recentDaysVal = recentDaysEl ? recentDaysEl.value : '';
   const recentDaysParam = (recentDaysVal === 'custom' && document.getElementById('f_recent_days_custom')) ? document.getElementById('f_recent_days_custom').value : recentDaysVal;
   const subtypeVal = document.getElementById('f_subtype') ? document.getElementById('f_subtype').value : '';
-  const chartUrl = `/api/chart?symbol=${ev.symbol}&date=${ev.date}&t1_mode=${stratConfig.t1_mode}&use_trade1=${stratConfig.use_trade1?1:0}&use_pyramid=${stratConfig.use_pyramid?1:0}&use_ml_climax=${stratConfig.use_ml_climax?1:0}&use_ml_stop=${stratConfig.use_ml_stop?1:0}&use_multileg=${stratConfig.use_multileg?1:0}&use_multileg_ml=${stratConfig.use_multileg_ml?1:0}&climax_partial_pct=${stratConfig.climax_partial_pct}&climax_r_hurdle=${stratConfig.climax_r_hurdle}&larsson_fastest=${lFastest}&v2=${v2Val}&prev_gap=${prevGapVal}&recent_days=${encodeURIComponent(recentDaysParam)}&subtype=${encodeURIComponent(subtypeVal)}`;
+  const chartUrl = `/api/chart?symbol=${ev.symbol}&date=${ev.date}&t1_mode=${stratConfig.t1_mode}&use_trade1=${stratConfig.use_trade1?1:0}&use_pyramid=${stratConfig.use_pyramid?1:0}&use_ml_climax=${stratConfig.use_ml_climax?1:0}&use_ml_stop=${stratConfig.use_ml_stop?1:0}&use_multileg=${stratConfig.use_multileg?1:0}&use_multileg_ml=${stratConfig.use_multileg_ml?1:0}&climax_partial_pct=${stratConfig.climax_partial_pct}&climax_r_hurdle=${stratConfig.climax_r_hurdle}&larsson_fastest=${lFastest}&v2=${v2Val}&prev_gap=${prevGapVal}&calendar=${encodeURIComponent(calendarVal)}&recent_days=${encodeURIComponent(recentDaysParam)}&subtype=${encodeURIComponent(subtypeVal)}`;
 
   fetch(chartUrl).then(r => r.json()).then(data => {
     if (!data || !data.bars || !data.bars.length) return;
@@ -3411,7 +3438,8 @@ function loadChart(ev) {
 
     // Definitive server metrics update for chart header (cures any 0.0% chip click issue)
     if (data.gap_pct != null || data.rvol != null) {
-      document.getElementById('chart_sym').textContent = `${data.symbol} — ${data.date} (${(data.subtype || 'EP').toUpperCase()})`;
+      const calPill = data.calendar_anomaly ? ` <span style="background:rgba(192,132,252,0.2); color:#c084fc; border:1px solid rgba(192,132,252,0.5); padding:1px 6px; border-radius:4px; font-size:10px; font-weight:700; margin-left:4px;" title="Special Calendar Volume Date: ${data.calendar_anomaly}">📅 ${data.calendar_anomaly}</span>` : '';
+      document.getElementById('chart_sym').innerHTML = `${data.symbol} — ${data.date} (${(data.subtype || 'EP').toUpperCase()})${calPill}`;
       const mfeVal = data.forward_mfe_20d != null ? data.forward_mfe_20d : (data.dossier && data.dossier.ai_scores && data.dossier.ai_scores.forward_mfe_20d != null ? data.dossier.ai_scores.forward_mfe_20d : null);
       const mfeSub = mfeVal != null ? ` | 🎯 20D MFE: +${Number(mfeVal).toFixed(1)}%` : '';
       document.getElementById('chart_sub').textContent =
@@ -4158,7 +4186,7 @@ function renderChartMarkersAndLines(data) {
 }
 
 // Attach filter listeners
-['f_outcome', 'f_milestone', 'f_sector', 'f_theme', 'f_retrace', 'f_cpos', 'f_subtype', 'f_year', 'f_v2', 'f_prev_gap', 'f_recent_days'].forEach(id => {
+['f_outcome', 'f_milestone', 'f_sector', 'f_theme', 'f_retrace', 'f_cpos', 'f_subtype', 'f_year', 'f_v2', 'f_prev_gap', 'f_calendar', 'f_recent_days'].forEach(id => {
   const el = document.getElementById(id);
   if (el) el.addEventListener('change', (e) => {
     if (id === 'f_recent_days') {
@@ -4399,6 +4427,23 @@ def api_events():
             q = q[q["prev_day_gap_pct"] > 0.33 * q["adr_pct"]]
         elif "prev_day_gap_pct" in q.columns:
             q = q[q["prev_day_gap_pct"] > 1.5]
+
+    cal_filter = request.args.get("calendar", "")
+    if cal_filter == "clean":
+        if "is_mechanical_volume_date" in q.columns:
+            q = q[(~q["is_mechanical_volume_date"]) | (q["gap_pct"] >= 8.0)]
+    elif cal_filter == "opex":
+        if "is_opex" in q.columns:
+            q = q[q["is_opex"]]
+    elif cal_filter == "quad":
+        if "is_quad_witching" in q.columns:
+            q = q[q["is_quad_witching"]]
+    elif cal_filter == "russell":
+        if "is_russell_recon" in q.columns:
+            q = q[q["is_russell_recon"]]
+    elif cal_filter == "month_end":
+        if "is_month_end" in q.columns and "is_quarter_end" in q.columns:
+            q = q[q["is_month_end"] | q["is_quarter_end"]]
 
     recent_days = request.args.get("recent_days")
     if recent_days:
@@ -5986,6 +6031,9 @@ def api_chart():
                 reasons.append(f"Prior Day Gap Up (+{pg_pct:.1f}% > 0.33×ADR)")
             if ml is not None and ml < 0.20:
                 reasons.append(f"Low V2 Conviction ({ml*100:.0f}%)")
+            if bool(h_row.get("is_mechanical_volume_date", False)) and g < 8.0:
+                cal_anom = h_row.get("calendar_anomaly") or "Mechanical Volume Anomaly"
+                reasons.append(f"Volume Anomaly Date ({cal_anom})")
             if st not in ("classic", "dre", "ep9m", "bigmove"):
                 reasons.append(f"Subtype: {st}")
             return reasons
@@ -6035,6 +6083,23 @@ def api_chart():
         if subtype_filt and subtype_filt != "all":
             t_matches = t_matches[t_matches["subtype"] == subtype_filt]
 
+        cal_filter = request.args.get("calendar", "")
+        if cal_filter == "clean":
+            if "is_mechanical_volume_date" in t_matches.columns:
+                t_matches = t_matches[(~t_matches["is_mechanical_volume_date"]) | (t_matches["gap_pct"] >= 8.0)]
+        elif cal_filter == "opex":
+            if "is_opex" in t_matches.columns:
+                t_matches = t_matches[t_matches["is_opex"]]
+        elif cal_filter == "quad":
+            if "is_quad_witching" in t_matches.columns:
+                t_matches = t_matches[t_matches["is_quad_witching"]]
+        elif cal_filter == "russell":
+            if "is_russell_recon" in t_matches.columns:
+                t_matches = t_matches[t_matches["is_russell_recon"]]
+        elif cal_filter == "month_end":
+            if "is_month_end" in t_matches.columns and "is_quarter_end" in t_matches.columns:
+                t_matches = t_matches[t_matches["is_month_end"] | t_matches["is_quarter_end"]]
+
         for _, h_row in t_matches.iterrows():
             disquals = _calc_disqualifications(h_row)
             ticker_history.append({
@@ -6051,6 +6116,8 @@ def api_chart():
                 "prev_day_gap_pct": round(float(h_row.get("prev_day_gap_pct", 0.0)), 1) if pd.notna(h_row.get("prev_day_gap_pct")) else 0.0,
                 "prev_day_gap_up": bool(h_row.get("prev_day_gap_up", False)),
                 "ml_50": round(float(h_row.get("ml_50", 0.0)), 3) if pd.notna(h_row.get("ml_50")) else None,
+                "is_mechanical_volume_date": bool(h_row.get("is_mechanical_volume_date", False)),
+                "calendar_anomaly": str(h_row.get("calendar_anomaly", "")) if pd.notna(h_row.get("calendar_anomaly")) else None,
                 "is_qualified": bool(len(disquals) == 0),
                 "matches_filters": True,
                 "disqualifications": disquals,
@@ -6079,6 +6146,8 @@ def api_chart():
                 "prev_day_gap_pct": round(float(h_row.get("prev_day_gap_pct", 0.0)), 1) if pd.notna(h_row.get("prev_day_gap_pct")) else 0.0,
                 "prev_day_gap_up": bool(h_row.get("prev_day_gap_up", False)),
                 "ml_50": round(float(h_row.get("ml_50", 0.0)), 3) if pd.notna(h_row.get("ml_50")) else None,
+                "is_mechanical_volume_date": bool(h_row.get("is_mechanical_volume_date", False)),
+                "calendar_anomaly": str(h_row.get("calendar_anomaly", "")) if pd.notna(h_row.get("calendar_anomaly")) else None,
                 "is_qualified": bool(len(disquals) == 0 and matches_filt),
                 "matches_filters": bool(matches_filt),
                 "disqualifications": disquals,
@@ -6135,6 +6204,8 @@ def api_chart():
         "ret_20d": ret_20d_val,
         "ret_60d": ret_60d_val,
         "max_gain": max_gain_val,
+        "is_mechanical_volume_date": bool(ev_row_dict.get("is_mechanical_volume_date", False)) if ev_row_dict else False,
+        "calendar_anomaly": str(ev_row_dict.get("calendar_anomaly", "")) if ev_row_dict and pd.notna(ev_row_dict.get("calendar_anomaly")) else None,
         "forward_mfe_20d": dossier.get("ai_scores", {}).get("forward_mfe_20d"),
         "forward_mae_20d": dossier.get("ai_scores", {}).get("forward_mae_20d"),
         "prob_mfe_first": dossier.get("ai_scores", {}).get("prob_mfe_first"),
