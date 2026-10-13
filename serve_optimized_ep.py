@@ -479,8 +479,8 @@ def get_active_watchlist(force_reload: bool = False) -> List[Dict[str, Any]]:
         fwd = bars.iloc[ep_idx + 1:]
         curr_close = float(bars["close"].iloc[-1])
         trigger_px = round(d1_high + 0.05, 2)
-        stop_px = round(max(d1_low, trigger_px * 0.927), 2)
-        risk_pts = max(0.01, trigger_px - stop_px)
+        shelf_low = d1_low
+        stop_px = d1_low
 
         broke_out = False
         breakout_date = None
@@ -490,21 +490,29 @@ def get_active_watchlist(force_reload: bool = False) -> List[Dict[str, Any]]:
         for b_i in range(len(fwd)):
             bar = fwd.iloc[b_i]
             b_dt = fwd.index[b_i].strftime("%Y-%m-%d")
+            b_low = float(bar["low"])
+            b_high = float(bar["high"])
             if not broke_out:
-                if float(bar["low"]) < d1_low:
+                if b_low < d1_low:
                     stopped_out = True
                     break
-                if float(bar["high"]) >= trigger_px:
+                if b_low < shelf_low:
+                    shelf_low = b_low
+                if b_high >= trigger_px:
                     broke_out = True
                     breakout_date = b_dt
                     breakout_idx = b_i
+                    # Anchor stop to shelf_low (max with institutional 15% risk boundary)
+                    stop_px = round(max(shelf_low, trigger_px * 0.85), 2)
             else:
-                if float(bar["low"]) <= stop_px:
+                if b_low <= stop_px:
                     stopped_out = True
                     break
 
         if stopped_out and not broke_out:
             continue
+
+        risk_pts = max(0.01, trigger_px - stop_px)
 
         # V2 Rolling Conviction & Win Probability
         eval_fwd = breakout_idx if (broke_out and breakout_idx is not None) else min(len(fwd), 2)
@@ -2491,20 +2499,14 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     }
 
     function sortWatchlistByEV() {
-      currentSortBy = 'expected_value_r';
-      currentSortDir = 'desc';
-      const b = document.getElementById('btn_wl_sort_ev');
-      if (b) {
-        b.classList.add('active');
-        b.style.background = 'rgba(192, 132, 252, 0.35)';
-        b.style.borderColor = '#c084fc';
-        b.style.color = '#fff';
-      }
-      sortWatchlistTable('expected_value_r');
+      sortWatchlistTable('expected_value_r', 'desc');
     }
 
-    function sortWatchlistTable(col) {
-      if (currentSortBy === col) {
+    function sortWatchlistTable(col, forceDir = null) {
+      if (forceDir) {
+        currentSortBy = col;
+        currentSortDir = forceDir;
+      } else if (currentSortBy === col) {
         currentSortDir = (currentSortDir === 'desc') ? 'asc' : 'desc';
       } else {
         currentSortBy = col;
@@ -2513,7 +2515,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
       const btnEV = document.getElementById('btn_wl_sort_ev');
       if (btnEV) {
-        if (currentSortBy === 'expected_value_r') {
+        if (currentSortBy === 'expected_value_r' && currentSortDir === 'desc') {
           btnEV.classList.add('active');
           btnEV.style.background = 'rgba(192, 132, 252, 0.35)';
           btnEV.style.borderColor = '#c084fc';
@@ -2683,6 +2685,13 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         document.getElementById('kpi_val_6').textContent = avgRS.toFixed(1);
         document.getElementById('kpi_lbl_7').textContent = 'STAGE 2 RATIO';
         document.getElementById('kpi_val_7').textContent = `${stage2Pct.toFixed(0)}%`;
+
+        const sortLbl = document.getElementById('tbl_sort_lbl');
+        if (sortLbl) {
+          const dirArrow = currentSortDir === 'desc' ? '▼' : '▲';
+          const colLabel = (currentSortBy === 'expected_value_r') ? 'HIGHEST EXPECTED VALUE (EV)' : currentSortBy.toUpperCase();
+          sortLbl.textContent = `SORT: ${colLabel} ${dirArrow}`;
+        }
 
         document.getElementById('tbl_count_lbl').textContent = `WATCHLIST SETUPS (${items.length})`;
         renderWatchlistTable();

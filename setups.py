@@ -183,7 +183,7 @@ def _is_ep_event(r, base_dvol: float | None = None) -> str | None:
         if is_mech_vol:
             return None
         if r["chg_pct"] >= config.EP9M_MIN_CHG and float(r["volume"]) >= config.EP_MIN_SHARES \
-                and r["rvol"] >= vol_mult:
+                and r["rvol"] >= config.EP_VOL_MULT:
             return "ep9m"
         if r["chg_pct"] >= config.EP_BIGMOVE_CHG and r["rvol"] >= rvol_req:
             return "bigmove"
