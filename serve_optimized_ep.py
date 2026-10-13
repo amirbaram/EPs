@@ -1447,18 +1447,22 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
     /* Center Pane: Chart */
     .pane-chart { flex: 1; border-right: 1px solid var(--border); display: flex; flex-direction: column; background: #090c13; min-width: 0; overflow: hidden; position: relative; }
-    .chart-top-bar { padding: 6px 12px; background: #0c101a; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; flex-shrink: 0; gap: 8px; min-height: 42px; }
+    .chart-top-bar { padding: 5px 12px; background: #0c101a; border-bottom: 1px solid var(--border); display: flex; flex-direction: column; gap: 4px; flex-shrink: 0; min-height: 56px; }
+    .chart-header-row { display: flex; justify-content: space-between; align-items: center; gap: 8px; width: 100%; min-width: 0; }
+    .chart-sub-row { display: flex; justify-content: space-between; align-items: center; gap: 8px; width: 100%; min-width: 0; border-top: 1px solid rgba(255, 255, 255, 0.04); padding-top: 3px; }
     .chart-meta-group { display: flex; align-items: center; gap: 8px; min-width: 0; flex-shrink: 1; }
     .chart-ticker { font-size: 16px; font-weight: 800; color: #fff; letter-spacing: 0.5px; flex-shrink: 0; }
-    .chart-sub { font-size: 11px; color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 250px; }
+    .chart-sub { font-size: 11px; color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 280px; }
     .chart-nav-group { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
-    .btn-nav { background: #131929; border: 1px solid #27344d; color: #cbd5e1; font-size: 11px; font-weight: 700; padding: 3px 9px; border-radius: 4px; cursor: pointer; display: inline-flex; align-items: center; gap: 4px; transition: all 0.15s ease; }
+    .btn-nav { background: #131929; border: 1px solid #27344d; color: #cbd5e1; font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 4px; cursor: pointer; display: inline-flex; align-items: center; gap: 3px; transition: all 0.15s ease; }
     .btn-nav:hover:not(:disabled) { background: #1e293b; border-color: var(--accent); color: #fff; }
     .btn-nav:disabled { opacity: 0.35; cursor: not-allowed; }
-    .nav-stock-select { max-width: 190px; font-size: 11px; font-weight: 600; padding: 3px 8px; background: #131929; border: 1px solid #27344d; color: #fff; border-radius: 4px; outline: none; text-overflow: ellipsis; }
-    .nav-counter { font-size: 10.5px; font-weight: 700; color: var(--accent); background: rgba(56, 189, 248, 0.1); border: 1px solid rgba(56, 189, 248, 0.25); padding: 2px 7px; border-radius: 4px; white-space: nowrap; }
+    .nav-stock-select { max-width: 220px; font-size: 11px; font-weight: 600; padding: 2px 7px; background: #131929; border: 1px solid #27344d; color: #fff; border-radius: 4px; outline: none; text-overflow: ellipsis; }
+    .nav-counter { font-size: 10.5px; font-weight: 700; color: var(--accent); background: rgba(56, 189, 248, 0.1); border: 1px solid rgba(56, 189, 248, 0.25); padding: 2px 6px; border-radius: 4px; white-space: nowrap; }
     .fs-hint { font-size: 10px; color: #64748b; margin-left: 6px; white-space: nowrap; }
     .chart-controls-group { display: flex; align-items: center; gap: 8px; font-size: 11px; position: relative; flex-shrink: 0; }
+    .btn-fullscreen-active { background: rgba(56, 189, 248, 0.15) !important; border-color: var(--accent) !important; color: var(--accent) !important; font-weight: 700 !important; }
+    .btn-fullscreen-active:hover { background: rgba(56, 189, 248, 0.3) !important; }
     .chart-legends-bar { font-size: 10.5px; display: flex; gap: 8px; align-items: center; margin-left: 4px; white-space: nowrap; }
     .chart-container { flex: 1; min-height: 0; width: 100%; height: 100%; position: relative; overflow: hidden; }
 
@@ -1540,17 +1544,24 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       background: #090c13 !important;
     }
     .pane-chart.fullscreen .chart-top-bar {
-      padding: 10px 24px;
-      background: #0c101a;
-      border-bottom: 1px solid #1e293b;
-      box-shadow: 0 4px 20px rgba(0, 0, 0, 0.6);
+      display: flex !important;
+      flex-direction: row !important;
+      justify-content: space-between !important;
+      align-items: center !important;
+      padding: 10px 24px !important;
+      background: #0c101a !important;
+      border-bottom: 1px solid #1e293b !important;
+      box-shadow: 0 4px 20px rgba(0, 0, 0, 0.6) !important;
+      min-height: 52px !important;
     }
-    .pane-chart.fullscreen .chart-ticker { font-size: 22px; }
-    .pane-chart.fullscreen .chart-sub { max-width: 500px; font-size: 12px; }
-    .pane-chart.fullscreen .nav-stock-select { max-width: 320px; font-size: 12px; padding: 4px 10px; }
-    .pane-chart.fullscreen .btn-nav { font-size: 12px; padding: 5px 14px; }
-    .pane-chart.fullscreen .btn-toggle { font-size: 12px; padding: 5px 12px; }
-    .pane-chart.fullscreen .chart-legends-bar { font-size: 11.5px; gap: 12px; }
+    .pane-chart.fullscreen .chart-header-row { width: auto !important; gap: 16px !important; }
+    .pane-chart.fullscreen .chart-sub-row { width: auto !important; gap: 16px !important; border-top: none !important; padding-top: 0 !important; }
+    .pane-chart.fullscreen .chart-ticker { font-size: 22px !important; }
+    .pane-chart.fullscreen .chart-sub { max-width: 500px !important; font-size: 12px !important; }
+    .pane-chart.fullscreen .nav-stock-select { max-width: 340px !important; font-size: 12px !important; padding: 4px 10px !important; }
+    .pane-chart.fullscreen .btn-nav { font-size: 12px !important; padding: 4px 12px !important; }
+    .pane-chart.fullscreen .btn-toggle { font-size: 12px !important; padding: 4px 12px !important; }
+    .pane-chart.fullscreen .chart-legends-bar { font-size: 11.5px !important; gap: 12px !important; }
     .pane-chart.fullscreen .fs-hint { display: inline-block !important; }
 
     /* Popover Settings Panels */
@@ -1855,51 +1866,53 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <!-- Center Pane: TradingView Chart -->
     <div class="pane-chart" id="pane_chart">
       <div class="chart-top-bar" id="chart_top_bar">
-        <!-- Left: Ticker & Context Badges -->
-        <div class="chart-meta-group">
-          <span class="chart-ticker" id="c_ticker">-</span>
-          <span id="c_badge_status" class="badge-status status-active" style="display:none;">Active</span>
-          <span id="c_badge_arch" class="badge-arch" style="display:none; font-size:9.5px; padding:2px 5px;">-</span>
-          <span class="chart-sub" id="c_meta" title="">-</span>
-        </div>
-
-        <!-- Center: Interactive Stock Navigation Controls -->
-        <div class="chart-nav-group">
-          <button class="btn-nav" id="btn_nav_prev" onclick="selectPreviousTrade()" title="Previous Stock (← arrow key)">◀ Prev</button>
-          <select id="sel_nav_stock" class="ctl-select nav-stock-select" onchange="onNavStockSelect(this.value)" title="Select Stock from Current List"></select>
-          <button class="btn-nav" id="btn_nav_next" onclick="selectNextTrade()" title="Next Stock (→ arrow key)">Next ▶</button>
-          <span class="nav-counter" id="lbl_nav_counter" title="Position in current filtered list">1 / 54</span>
-          <span id="fs_keyboard_hint" class="fs-hint" style="display:none;">(← / → browse · Esc exit)</span>
-        </div>
-
-        <!-- Right: History, Indicators, Fullscreen & Legends -->
-        <div class="chart-controls-group">
-          <!-- History Depth Selection -->
-          <div class="ctl-group" style="gap:4px;">
-            <span class="ctl-label" style="font-size:10px;">HISTORY:</span>
-            <select id="sel_chart_history" class="ctl-select" onchange="onChartHistoryChange()" style="font-size:10px; padding:2px 6px;">
-              <option value="setup" selected>Setup Focus (-40D/+60D)</option>
-              <option value="6m">6 Months</option>
-              <option value="1y">1 Year</option>
-              <option value="2y">2 Years</option>
-              <option value="full">Full History</option>
-            </select>
+        <!-- Top Row: Ticker Info (Left) & Controls/Fullscreen (Right) -->
+        <div class="chart-header-row">
+          <div class="chart-meta-group">
+            <span class="chart-ticker" id="c_ticker">-</span>
+            <span id="c_badge_status" class="badge-status status-active" style="display:none;">Active</span>
+            <span id="c_badge_arch" class="badge-arch" style="display:none; font-size:9.5px; padding:2px 5px;">-</span>
+            <span class="chart-sub" id="c_meta" title="">-</span>
           </div>
-          <button class="btn-toggle" id="btn_chart_settings" onclick="toggleChartSettings()" title="Configure Moving Averages, Larsson Ribbon &amp; Indicators" style="font-size:10.5px; padding:2px 7px;">⚙️ Indicators</button>
-          <button class="btn-toggle" id="btn_chart_fullscreen" onclick="toggleChartFullscreen()" title="Toggle Fullscreen Chart" style="font-size:10.5px; padding:2px 7px;">⛶ Fullscreen</button>
+          <div class="chart-controls-group">
+            <div class="ctl-group" style="gap:4px;">
+              <span class="ctl-label" style="font-size:10px;">HISTORY:</span>
+              <select id="sel_chart_history" class="ctl-select" onchange="onChartHistoryChange()" style="font-size:10px; padding:2px 6px;">
+                <option value="setup" selected>Setup Focus (-40D/+60D)</option>
+                <option value="6m">6 Months</option>
+                <option value="1y">1 Year</option>
+                <option value="2y">2 Years</option>
+                <option value="full">Full History</option>
+              </select>
+            </div>
+            <button class="btn-toggle" id="btn_chart_settings" onclick="toggleChartSettings()" title="Configure Moving Averages, Larsson Ribbon &amp; Indicators" style="font-size:10.5px; padding:2px 7px;">⚙️ Indicators</button>
+            <button class="btn-toggle btn-fullscreen-active" id="btn_chart_fullscreen" onclick="toggleChartFullscreen()" title="Toggle Fullscreen Chart" style="font-size:10.5px; padding:2px 8px;">⛶ Fullscreen</button>
+          </div>
+        </div>
+
+        <!-- Sub Row: Navigation Controls (Left) & Price Line Legends (Right) -->
+        <div class="chart-sub-row">
+          <div class="chart-nav-group">
+            <button class="btn-nav" id="btn_nav_prev" onclick="selectPreviousTrade()" title="Previous Stock (← arrow key)">◀ Prev</button>
+            <select id="sel_nav_stock" class="ctl-select nav-stock-select" onchange="onNavStockSelect(this.value)" title="Select Stock from Current List"></select>
+            <button class="btn-nav" id="btn_nav_next" onclick="selectNextTrade()" title="Next Stock (→ arrow key)">Next ▶</button>
+            <span class="nav-counter" id="lbl_nav_counter" title="Position in current filtered list">1 / 54</span>
+            <span id="fs_keyboard_hint" class="fs-hint" style="display:none;">(← / → browse · Esc exit)</span>
+          </div>
           <div class="chart-legends-bar">
             <span id="c_trigger_legend" style="color:#22c55e;">── Breakout</span>
             <span id="c_stop_legend" style="color:#ef4444;">── Stop</span>
             <span id="c_ma_legend" style="color:#0284c7;">── Trail MA</span>
             <span id="c_climax_legend" style="color:#c084fc; display:none;">── 50% Climax</span>
           </div>
+        </div>
 
-          <!-- Chart Settings Popover -->
-          <div id="chart_settings_panel" class="settings-popover" style="display:none; top:36px; right:0;">
-            <div class="popover-header">
-              <span>⚙️ Chart Indicators &amp; Ribbons</span>
-              <button class="popover-close" onclick="toggleChartSettings()">&times;</button>
-            </div>
+        <!-- Chart Settings Popover -->
+        <div id="chart_settings_panel" class="settings-popover" style="display:none; top:36px; right:12px;">
+          <div class="popover-header">
+            <span>⚙️ Chart Indicators &amp; Ribbons</span>
+            <button class="popover-close" onclick="toggleChartSettings()">&times;</button>
+          </div>
             <div>
               <div class="popover-sec-title">📈 MOVING AVERAGES</div>
               <div class="popover-row"><label><input type="checkbox" id="chk_ema8" onchange="toggleIndicatorSeries()"> <span style="color:#ec4899;">8 EMA (Fast Momentum)</span></label></div>
