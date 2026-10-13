@@ -54,6 +54,53 @@ MONITOR_SETTINGS_FILE = ROOT / "data" / "cache" / "monitor_settings.json"
 _EXTREME_PEAK_MODEL = None
 
 
+def compute_watchlist_ev(it: Dict[str, Any]) -> float:
+    """Computes institutional Expected Value (EV in R-multiples) for active watchlist setups.
+    
+    Active Longs:
+      EV = (Unrealized R * Position Sizing Multiplier)
+         + Remaining Climax Runway Headroom (Low ML Exhaustion * Sizing Multiplier * 4.0)
+         + Institutional Quality Bonus (RS score / 100 + Stage 2 bonus + V2 Conviction bonus).
+    
+    Coiling Setups:
+      EV = (P_win * Target R * Position Sizing Multiplier) - ((1 - P_win) * 0.50 R loss).
+      Where:
+        Target R is inversely proportional to stop risk % (massive asymmetry for tight invalidations).
+        P_win reflects Stage 2, RS leadership, pre-pivot base tightness, V2 conviction, and proximity to trigger.
+        0.50 R accounts for Delayed Breakout 0-risk order cancellations when price drops before breakout.
+    """
+    status = it.get("status")
+    sug_mult = safe_float(it.get("suggested_size_mult", 1.0), 1.0)
+    rs = safe_float(it.get("rs_score", 50.0), 50.0)
+    stage2 = bool(it.get("stage2", False))
+    v2_50 = safe_float(it.get("v2_conviction_50", 0.0), 0.0)
+    
+    if status == "Active Long":
+        unr_r = safe_float(it.get("unrealized_r", 0.0), 0.0)
+        exh_prob = safe_float(it.get("current_high_exhaustion_prob", 0.1), 0.1)
+        climax_th = safe_float(it.get("climax_threshold", 0.55), 0.55)
+        headroom = max(0.0, climax_th - exh_prob)
+        
+        curr_ev = unr_r * sug_mult
+        runway_ev = headroom * 4.0 * sug_mult
+        quality_bonus = (rs / 100.0) + (0.50 if stage2 else 0.0) + (v2_50 * 2.0)
+        return round(curr_ev + runway_ev + quality_bonus, 2)
+    else:
+        dist = safe_float(it.get("dist_to_trigger", 0.0), 0.0)
+        stop_risk_pct = max(0.4, safe_float(it.get("dynamic_stop_loss_pct", 5.0), 5.0))
+        tight = safe_float(it.get("pre_consol_tightness_20d", 20.0), 20.0)
+        
+        target_r = min(12.0, max(2.0, 8.0 / stop_risk_pct))
+        p_win = 0.38 + (0.07 if stage2 else 0.0) + ((rs / 100.0) * 0.08) + (v2_50 * 0.20)
+        if tight <= 15.0:
+            p_win += 0.05
+        if dist > 5.0:
+            p_win = max(0.15, p_win - (dist - 5.0) * 0.02)
+            
+        ev = (p_win * target_r * sug_mult) - ((1.0 - p_win) * 0.50)
+        return round(ev, 2)
+
+
 def apply_intraday_cache_to_watchlist(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Overlays real-time intraday price, high, exhaustion, and alert states from monitor cache."""
     if not INTRADAY_CACHE_PATH.exists():
@@ -100,6 +147,7 @@ def apply_intraday_cache_to_watchlist(items: List[Dict[str, Any]]) -> List[Dict[
                     it["recommended_ma_price"] = p["recommended_ma_price"]
                 if "recommended_ma_buffer_pct" in p:
                     it["recommended_ma_buffer_pct"] = p["recommended_ma_buffer_pct"]
+                it["expected_value_r"] = compute_watchlist_ev(it)
     except Exception:
         pass
     return items
@@ -516,7 +564,7 @@ def get_active_watchlist(force_reload: bool = False) -> List[Dict[str, Any]]:
             else:
                 climax_action = f"🟢 HOLD RUNNER (Current High Exhaustion: {exh_pct}% < {climax_th_pct:.0f}% Trigger Threshold)"
 
-            items.append({
+            it_dict = {
                 "symbol": sym,
                 "ep_date": ep_dt,
                 "status": "Active Long",
@@ -573,11 +621,13 @@ def get_active_watchlist(force_reload: bool = False) -> List[Dict[str, Any]]:
                 "qqq_ret_20d_entry": qqq_ret20,
                 "qqq_bull_stack": qqq_bull,
                 "qqq_spy_ratio_bull": tech_lead,
-            })
+            }
+            it_dict["expected_value_r"] = compute_watchlist_ev(it_dict)
+            items.append(it_dict)
         elif not broke_out and not stopped_out and len(fwd) <= 20:
             dist_to_trigger = round(((trigger_px / curr_close) - 1.0) * 100.0, 1)
             climax_action = "⏳ Pending Breakout Trigger (Monitors at Breakout High)"
-            items.append({
+            it_dict = {
                 "symbol": sym,
                 "ep_date": ep_dt,
                 "status": "Coiling Setup",
@@ -634,7 +684,9 @@ def get_active_watchlist(force_reload: bool = False) -> List[Dict[str, Any]]:
                 "qqq_ret_20d_entry": qqq_ret20,
                 "qqq_bull_stack": qqq_bull,
                 "qqq_spy_ratio_bull": tech_lead,
-            })
+            }
+            it_dict["expected_value_r"] = compute_watchlist_ev(it_dict)
+            items.append(it_dict)
 
     _WATCHLIST = items
     return apply_intraday_cache_to_watchlist([dict(x) for x in _WATCHLIST])
@@ -1111,12 +1163,14 @@ def api_watchlist():
         filtered.append(it)
 
     asc = (sort_dir.lower() == "asc")
-    if sort_by in ["unrealized_r", "unrealized_pct", "dist_to_trigger", "rs_score", "gap_pct", "rvol", "trigger_price", "current_price"]:
+    if sort_by in ["expected_value_r", "ev", "ev_r"]:
+        filtered.sort(key=lambda x: safe_float(x.get("expected_value_r", 0.0)), reverse=not asc)
+    elif sort_by in ["unrealized_r", "unrealized_pct", "dist_to_trigger", "rs_score", "gap_pct", "rvol", "trigger_price", "current_price"]:
         filtered.sort(key=lambda x: safe_float(x.get(sort_by, 0.0)), reverse=not asc)
-    elif sort_by in ["ep_date", "trigger_date", "symbol", "status"]:
+    elif sort_by in ["ep_date", "trigger_date", "symbol", "status", "archetype"]:
         filtered.sort(key=lambda x: str(x.get(sort_by, "")), reverse=not asc)
     else:
-        filtered.sort(key=lambda x: safe_float(x.get("unrealized_r", 0.0)), reverse=True)
+        filtered.sort(key=lambda x: safe_float(x.get("expected_value_r", x.get("unrealized_r", 0.0))), reverse=True)
 
     n_active = sum(1 for x in items if x["status"] == "Active Long")
     n_coiling = sum(1 for x in items if x["status"] == "Coiling Setup")
@@ -1799,6 +1853,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         </select>
       </div>
 
+      <button class="btn-toggle" id="btn_wl_sort_ev" onclick="sortWatchlistByEV()" title="Sort active watchlist by Highest Expected Value (Asymmetry, Conviction &amp; Setup Quality)" style="font-weight:700; border-color:rgba(192, 132, 252, 0.4); color:#e9d5ff; background:rgba(192, 132, 252, 0.12); padding:3px 10px; font-size:11px;">💎 Highest EV</button>
+
       <div style="display:flex; align-items:center; gap:8px; margin-left:auto; position:relative;">
         <button class="btn-toggle" id="btn_monitor_settings" onclick="toggleMonitorSettings()" title="Configure intraday monitor polling interval & rate limit safety">⚙️ Detector Settings</button>
         <div id="monitor_pill" class="monitor-indicator">
@@ -1954,6 +2010,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           <div style="font-weight:700; color:var(--accent); margin-bottom:2px;" id="d_size_title">1.00x Base Allocation</div>
           <div id="d_size_desc" style="color:#94a3b8;">Standard institutional EP allocation: 1.0 R risk budget.</div>
         </div>
+        <div class="d-row"><span class="d-lbl" id="d_lbl_ev">Expected Value (EV):</span><span class="d-val hl" id="d_ev" style="color:#c084fc; font-weight:700;">-</span></div>
         <div class="d-row"><span class="d-lbl" id="d_lbl_exit">Current / Exit Price:</span><span class="d-val" id="d_exit">-</span></div>
         <div class="d-row"><span class="d-lbl" id="d_lbl_exit_reason">Unrealized / Exit Result:</span><span class="d-val" id="d_exit_reason" style="color:var(--amber);">-</span></div>
         <div class="d-row"><span class="d-lbl" id="d_lbl_hold">Holding Period:</span><span class="d-val" id="d_hold">-</span></div>
@@ -2322,8 +2379,15 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       } else {
         document.getElementById('filters_closed').style.display = 'none';
         document.getElementById('filters_watchlist').style.display = 'flex';
-        currentSortBy = 'unrealized_r';
+        currentSortBy = 'expected_value_r';
         currentSortDir = 'desc';
+        const btnEV = document.getElementById('btn_wl_sort_ev');
+        if (btnEV) {
+          btnEV.classList.add('active');
+          btnEV.style.background = 'rgba(192, 132, 252, 0.35)';
+          btnEV.style.borderColor = '#c084fc';
+          btnEV.style.color = '#fff';
+        }
         updateTableHeader();
         loadWatchlistData();
       }
@@ -2348,11 +2412,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         thead.innerHTML = `
           <tr>
             <th class="tl" onclick="sortWatchlistTable('symbol')" title="Sort by Symbol">TICKER</th>
+            <th class="tl" onclick="sortWatchlistTable('archetype')" title="Sort by Archetype">ARCHETYPE</th>
             <th class="tl" onclick="sortWatchlistTable('status')" title="Sort by Status">STATUS</th>
             <th onclick="sortWatchlistTable('trigger_price')" title="Sort by Trigger Price">TRIGGER</th>
             <th onclick="sortWatchlistTable('current_price')" title="Sort by Current Price">CURRENT</th>
-            <th onclick="sortWatchlistTable('stop_price')" title="Sort by Stop Price">STOP</th>
             <th onclick="sortWatchlistTable('unrealized_r')" title="Sort by Gain / Proximity">GAIN / DIST</th>
+            <th onclick="sortWatchlistTable('expected_value_r')" style="color:#c084fc; font-weight:700;" title="Sort by Highest Expected Value (EV in R)">EV (R) ⬍</th>
             <th onclick="sortWatchlistTable('rs_score')" title="Sort by RS Score">RS</th>
             <th onclick="sortWatchlistTable('ep_date')" style="color:var(--accent);" title="Sort by EP Date">EP DATE ⬍</th>
           </tr>
@@ -2407,6 +2472,19 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       }
     }
 
+    function sortWatchlistByEV() {
+      currentSortBy = 'expected_value_r';
+      currentSortDir = 'desc';
+      const b = document.getElementById('btn_wl_sort_ev');
+      if (b) {
+        b.classList.add('active');
+        b.style.background = 'rgba(192, 132, 252, 0.35)';
+        b.style.borderColor = '#c084fc';
+        b.style.color = '#fff';
+      }
+      sortWatchlistTable('expected_value_r');
+    }
+
     function sortWatchlistTable(col) {
       if (currentSortBy === col) {
         currentSortDir = (currentSortDir === 'desc') ? 'asc' : 'desc';
@@ -2415,10 +2493,26 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         currentSortDir = (col === 'ep_date' || col === 'symbol' || col === 'status') ? 'asc' : 'desc';
       }
 
+      const btnEV = document.getElementById('btn_wl_sort_ev');
+      if (btnEV) {
+        if (currentSortBy === 'expected_value_r') {
+          btnEV.classList.add('active');
+          btnEV.style.background = 'rgba(192, 132, 252, 0.35)';
+          btnEV.style.borderColor = '#c084fc';
+          btnEV.style.color = '#fff';
+        } else {
+          btnEV.classList.remove('active');
+          btnEV.style.background = 'rgba(192, 132, 252, 0.12)';
+          btnEV.style.borderColor = 'rgba(192, 132, 252, 0.4)';
+          btnEV.style.color = '#e9d5ff';
+        }
+      }
+
       const sortLbl = document.getElementById('tbl_sort_lbl');
       if (sortLbl) {
         const dirArrow = currentSortDir === 'desc' ? '▼' : '▲';
-        sortLbl.textContent = `SORT: ${col.toUpperCase()} ${dirArrow}`;
+        const colLabel = (col === 'expected_value_r') ? 'HIGHEST EXPECTED VALUE (EV)' : col.toUpperCase();
+        sortLbl.textContent = `SORT: ${colLabel} ${dirArrow}`;
       }
 
       currentWatchlist.sort((a, b) => {
@@ -2654,7 +2748,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         }
 
         const rsColor = it.rs_score >= 90 ? '#38bdf8' : (it.rs_score >= 80 ? '#22c55e' : '#94a3b8');
-        const archBadge = `<span class="badge-arch" style="font-size:9.5px; font-weight:600;">${it.archetype ? it.archetype.replace(/^[^\\s]+\\s*/, '') : 'Core'}</span>`;
+        const archBadge = `<span class="badge-arch" style="font-size:9.5px; font-weight:600;">${it.archetype ? it.archetype.replace(/^[^\s]+\s*/, '') : 'Core'}</span>`;
+
+        const evVal = it.expected_value_r !== undefined ? it.expected_value_r : 0.0;
+        const evColor = evVal >= 5.0 ? '#c084fc' : (evVal >= 2.0 ? '#38bdf8' : (evVal >= 0 ? '#22c55e' : '#ef4444'));
+        const evStr = (evVal >= 0 ? '+' : '') + evVal.toFixed(2) + ' R';
 
         row.innerHTML = `
           <td class="tl"><strong style="color:#fff;">${it.symbol}</strong></td>
@@ -2663,6 +2761,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           <td>$${it.trigger_price.toFixed(2)}</td>
           <td style="color:#fff; font-weight:600;">$${it.current_price.toFixed(2)}</td>
           <td>${gainCol}</td>
+          <td><span style="color:${evColor}; font-weight:700;">${evStr}</span></td>
           <td><span style="color:${rsColor}; font-weight:600;">${it.rs_score}</span></td>
           <td style="color:var(--accent); font-size:10px; font-weight:600;">${it.ep_date}</td>
         `;
@@ -2696,7 +2795,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           const isAct = (t.status === 'Active Long');
           const perf = isAct ? `+${t.unrealized_r.toFixed(2)}R` : `${t.dist_to_trigger.toFixed(1)}% dist`;
           const statusShort = isAct ? 'Active' : 'Coiling';
-          opt.textContent = `${i + 1}. ${t.symbol} · ${statusShort} (${perf}) · RS:${t.rs_score}`;
+          const evStr = t.expected_value_r !== undefined ? ` · EV:+${Number(t.expected_value_r).toFixed(1)}R` : '';
+          opt.textContent = `${i + 1}. ${t.symbol} · ${statusShort} (${perf})${evStr} · RS:${t.rs_score}`;
         } else {
           const rSign = t.r_multiple >= 0 ? '+' : '';
           const archClean = t.archetype ? t.archetype.replace(/^[^\s]+\s*/, '') : 'EP';
@@ -2829,6 +2929,14 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       document.getElementById('d_size_mult').textContent = sugLabel;
       document.getElementById('d_size_title').textContent = sugLabel;
       document.getElementById('d_size_desc').textContent = sugDesc;
+
+      // Update Expected Value (EV) in Dossier
+      const evVal = tr.expected_value_r !== undefined ? tr.expected_value_r : (tr.r_multiple || 0.0);
+      const evElem = document.getElementById('d_ev');
+      if (evElem) {
+        evElem.textContent = (evVal >= 0 ? '+' : '') + Number(evVal).toFixed(2) + ' R';
+        evElem.style.color = evVal >= 5.0 ? '#c084fc' : (evVal >= 2.0 ? '#38bdf8' : (evVal >= 0 ? '#22c55e' : '#ef4444'));
+      }
 
       if (isWl) {
         if (isActiveLong) {
