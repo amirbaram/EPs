@@ -158,9 +158,9 @@ DHVC_REQUIRE_UPTREND = False # the gap+base is the ignition; prior uptrend optio
 # flag that surfs the rising 10/20-EMA, then a range-expansion breakout. RS leadership (top
 # 1-2% over 1/3/6mo) is the rs_rank column + a dashboard filter, not gated in the detector.
 QMB_MOVE_LOOKBACK = 63       # the move's high must be within ~this many bars (3 months)
-QMB_MIN_MOVE = 30.0          # the move (recent low -> high) gained at least this %
-QMB_MOVE_MAX_BARS = 35       # the move happened over at most this many bars (days-to-weeks)
-QMB_CONS_MIN = 8             # consolidation length >= this (bars, ~1.5 weeks)
+QMB_MIN_MOVE = 15.0          # the move (recent low -> high) gained at least this % (>=15% captures institutional large caps like GOOG/MSFT/AAPL, while UI/strategy filters can isolate >=30%)
+QMB_MOVE_MAX_BARS = 63       # the move happened over at most this many bars (up to 3 months)
+QMB_CONS_MIN = 3             # consolidation length >= this (bars, 3-7 bars quick flags and 8-45 bars standard bases)
 QMB_CONS_MAX = 45            # consolidation length <= this (bars, ~2 months)
 QMB_MAX_PULLBACK = 50.0      # max pullback in the consolidation from the move high, % (less is better;
                              # volatile momentum names can flush deep then re-tighten, e.g. FCEL ~46%)

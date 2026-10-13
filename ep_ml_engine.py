@@ -46,6 +46,9 @@ class EPMLEngine:
         next_bar_path = base / "ep_next_bar_excursion_model.pkl"
         self.next_bar_model = joblib.load(next_bar_path) if next_bar_path.exists() else None
 
+        extreme_peak_path = base / "ep_extreme_peak_classifier.pkl"
+        self.extreme_peak_classifier = joblib.load(extreme_peak_path) if extreme_peak_path.exists() else None
+
         self._cont_scaler_mean = None
         self._cont_scaler_scale = None
         self._cont_booster = None
@@ -540,6 +543,23 @@ class EPMLEngine:
                 cols = list(features.keys())
             df_exh = pd.DataFrame([features]).reindex(columns=cols, fill_value=0.0)
             return float(self.exhaustion_classifier.predict_proba(df_exh)[0][1])
+        except Exception:
+            return 0.0
+
+    def predict_extreme_peak(self, features: dict) -> float:
+        """Predicts the probability that an active trade's daily high is a terminal extreme peak before exit."""
+        if not hasattr(self, 'extreme_peak_classifier') or not self.extreme_peak_classifier:
+            return 0.0
+        try:
+            model_payload = self.extreme_peak_classifier
+            cal_lgb = model_payload.get("cal_lgb")
+            cal_xgb = model_payload.get("cal_xgb")
+            feature_cols = model_payload.get("feature_cols", [])
+            
+            df_row = pd.DataFrame([features]).reindex(columns=feature_cols, fill_value=0.0)
+            p_lgb = float(cal_lgb.predict_proba(df_row)[0][1]) if cal_lgb is not None else 0.0
+            p_xgb = float(cal_xgb.predict_proba(df_row)[0][1]) if cal_xgb is not None else 0.0
+            return float(0.55 * p_lgb + 0.45 * p_xgb)
         except Exception:
             return 0.0
 

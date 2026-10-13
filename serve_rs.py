@@ -277,6 +277,19 @@ def api_recompute_rs():
     })
 
 
+@app.route("/api/reload_dataset", methods=["GET", "POST"])
+def api_reload_dataset():
+    global DF
+    DF = None
+    df = get_df()
+    return jsonify({
+        "status": "ok",
+        "stocks_count": len(df),
+        "max_date": str(df["last_date"].max()) if not df.empty else ""
+    })
+
+
+
 @app.route("/api/dates")
 def api_dates():
     dates = build_rs_history.list_available_dates()
@@ -831,10 +844,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   }
 
   /* 3-Pane Workspace */
-  .workspace { display: flex; flex: 1; overflow: hidden; position: relative; }
+  .workspace { display: flex; flex: 1; min-height: 0; overflow: hidden; position: relative; }
 
   /* Left Pane: Table */
-  .table-pane { flex: 1.15; min-width: 460px; overflow: auto; border-right: 1px solid var(--border); }
+  .table-pane { flex: 1.15; min-width: 460px; min-height: 0; overflow: auto; border-right: 1px solid var(--border); }
   table { width: 100%; border-collapse: collapse; font-size: 12px; }
   th {
     background: #11151f; color: var(--muted); font-weight: 600; text-align: right;
@@ -935,8 +948,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   }
   .draw-btn-danger:hover { background: #991b1b; border-color: #ef4444; color: #fff; }
 
-  .chart-container-rel { flex: 1; position: relative; width: 100%; height: 100%; overflow: hidden; }
-  #chart_tv { width: 100%; height: 100%; }
+  .chart-container-rel { flex: 1; min-height: 0; position: relative; width: 100%; overflow: hidden; }
+  #chart_tv { width: 100%; height: 100%; min-height: 0; }
   #draw_canvas {
     position: absolute; top: 0; left: 0; width: 100%; height: 100%;
     pointer-events: none; z-index: 6;

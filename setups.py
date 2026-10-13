@@ -864,9 +864,18 @@ def detect_qm_breakout(d: pd.DataFrame) -> dict | None:
     pullback = (1 - cons_low / hi_p) * 100
     if pullback > config.QMB_MAX_PULLBACK:
         return None
-    # 3. breakout-level STACK (shared with HTF): the trigger is the top of the stack (nearest resistance).
-    # `building` while coiling under it; `breakout` the day a level is popped on volume expansion.
+    # 3. shakeout-aware surf of the rising 10/20-EMA over the consolidation (pole high -> latest bar)
     closeA = d["close"].to_numpy(float)
+    cons_sl = slice(hi_pos + 1, n)
+    ride = _qm_ride(
+        closeA[cons_sl], d["low"].to_numpy(float)[cons_sl],
+        d["ema10"].to_numpy(float)[cons_sl], d["ema20"].to_numpy(float)[cons_sl],
+        d["sma50"].to_numpy(float)[cons_sl])
+    if ride is None:
+        return None
+
+    # 4. breakout-level STACK (shared with HTF): the trigger is the top of the stack (nearest resistance).
+    # `building` while coiling under it; `breakout` the day a level is popped on volume expansion.
     volA, proj_frac = _project_last_volume(d)                           # project TODAY's partial bar (if live)
     win = config.QMB_CONTRACT_WIN
     vbase = volA[max(0, n - 1 - win):n - 1].mean()                      # recent contraction's avg volume
@@ -880,14 +889,6 @@ def detect_qm_breakout(d: pd.DataFrame) -> dict | None:
     provisional = bool(st["broke_today"] and proj_frac is not None)     # today's break used projected volume
     rend = n - 1
     lo_start = hi_pos + 1 + int(np.argmin(d["low"].to_numpy(float)[hi_pos + 1:n]))   # consolidation low
-    # 4. shakeout-aware surf of the rising 10/20-EMA over the consolidation (pole high -> latest bar)
-    cons_sl = slice(hi_pos + 1, n)
-    ride = _qm_ride(
-        closeA[cons_sl], d["low"].to_numpy(float)[cons_sl],
-        d["ema10"].to_numpy(float)[cons_sl], d["ema20"].to_numpy(float)[cons_sl],
-        d["sma50"].to_numpy(float)[cons_sl])
-    if ride is None:
-        return None
     # 5. higher lows within the rising-support window (from the consolidation low)
     if not _qm_higher_lows(d, lo_start, rend):
         return None

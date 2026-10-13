@@ -32,11 +32,14 @@ app = Flask(__name__)
 
 DATA_PATH = Path("data/simulations/qm_historical_setups.parquet")
 EP_STUDY_PATH = Path("data/simulations/ep_combined_study_scored.parquet")
+STRATEGY_TRADES_PATH = Path("data/simulations/qm_strategy_trades.parquet")
 ANNOTATIONS_DIR = Path("data/annotations")
 ANNOTATIONS_DIR.mkdir(parents=True, exist_ok=True)
 
 DF: Optional[pd.DataFrame] = None
 EP_DF: Optional[pd.DataFrame] = None
+STRATEGY_DF: Optional[pd.DataFrame] = None
+STRATEGY_LOOKUP: Optional[Dict[Tuple[str, str], Dict[str, Any]]] = None
 
 
 def _enrich_with_rs_technicals(df: pd.DataFrame) -> pd.DataFrame:
@@ -92,17 +95,37 @@ def get_ep_df() -> pd.DataFrame:
     return EP_DF
 
 
+def get_strategy_df() -> pd.DataFrame:
+    global STRATEGY_DF, STRATEGY_LOOKUP
+    if STRATEGY_DF is None:
+        if STRATEGY_TRADES_PATH.exists():
+            print(f"Loading QM strategy trades dataset from {STRATEGY_TRADES_PATH}...")
+            STRATEGY_DF = pd.read_parquet(STRATEGY_TRADES_PATH)
+            recs = STRATEGY_DF.to_dict(orient="records")
+            STRATEGY_LOOKUP = {(str(r["symbol"]), str(r["date"])): r for r in recs}
+            print(f"Loaded {len(STRATEGY_DF)} QM breakout strategy trades into lookup.")
+        else:
+            print(f"Warning: {STRATEGY_TRADES_PATH} not found.")
+            STRATEGY_DF = pd.DataFrame()
+            STRATEGY_LOOKUP = {}
+    return STRATEGY_DF
+
+
 @app.route("/api/reload_dataset", methods=["GET", "POST"])
 def api_reload_dataset():
-    global DF, EP_DF
+    global DF, EP_DF, STRATEGY_DF, STRATEGY_LOOKUP
     DF = None
     EP_DF = None
+    STRATEGY_DF = None
+    STRATEGY_LOOKUP = None
     df = get_df()
+    _ = get_strategy_df()
     return jsonify({
         "status": "ok",
         "rows": len(df),
         "breakouts": int((df["state"] == "breakout").sum()) if not df.empty else 0,
         "building": int((df["state"] == "building").sum()) if not df.empty else 0,
+        "strategy_trades": len(STRATEGY_LOOKUP) if STRATEGY_LOOKUP else 0,
     })
 
 
@@ -150,10 +173,128 @@ def api_events():
 
     q = df.copy()
 
-    # 1. State Filter
-    state_f = request.args.get("state", "all")
-    if state_f in ["breakout", "building"]:
-        q = q[q["state"] == state_f]
+    # Strategy Mode Override
+    strategy_mode = request.args.get("strategy_mode", "0") in ["1", "true", "True"]
+    strategy_kpis = None
+
+    if strategy_mode:
+        strat_df = get_strategy_df()
+        if not strat_df.empty:
+            sq = strat_df.copy()
+
+            # 1. Macro Universe Filter
+            strat_macro = request.args.get("strat_macro", "leading").strip()
+            if strat_macro == "leading":
+                sq = sq[sq["is_leading_macro"] == True]
+            elif strat_macro == "leading_sectors":
+                sq = sq[sq["is_leading_sector"] == True]
+            elif strat_macro == "leading_themes":
+                sq = sq[sq["is_leading_theme"] == True]
+
+            # 2. Market Trend (SPY) Filter
+            strat_spy = request.args.get("strat_spy", "spy200").strip()
+            if strat_spy == "spy200":
+                sq = sq[sq["spy_above_200sma"] == True]
+            elif strat_spy == "spy50":
+                sq = sq[sq["spy_above_50sma"] == True]
+
+            # 3. RS & Posture Filter
+            strat_rs = request.args.get("strat_rs", "rs90_lead").strip()
+            if strat_rs == "rs90_lead":
+                sq = sq[sq["rs_leader"] == True]
+            elif strat_rs == "rs95":
+                sq = sq[(sq["rs_score"] >= 95) & ((sq["stage2"] == True) | (sq["dist_52w_high"] >= -15.0))]
+            elif strat_rs == "rs80":
+                sq = sq[(sq["rs_score"] >= 80) & ((sq["stage2"] == True) | (sq["dist_52w_high"] >= -15.0))]
+
+            # 4. Fresh EP Recency Filter
+            strat_fresh_ep = request.args.get("strat_fresh_ep", "all").strip()
+            if strat_fresh_ep == "15d":
+                sq = sq[sq["has_prior_ep"] & (sq["prior_ep_days_ago"] <= 15)]
+            elif strat_fresh_ep == "30d":
+                sq = sq[sq["has_prior_ep"] & (sq["prior_ep_days_ago"] <= 30)]
+            elif strat_fresh_ep == "has_ep":
+                sq = sq[sq["has_prior_ep"] == True]
+
+            # 5. Breakout RVOL Filter
+            strat_rvol = request.args.get("strat_rvol", "all").strip()
+            if strat_rvol == "1.5x":
+                sq = sq[sq["breakout_rvol"] >= 1.5]
+            elif strat_rvol == "2.0x":
+                sq = sq[sq["breakout_rvol"] >= 2.0]
+            elif strat_rvol == "2.5x":
+                sq = sq[sq["breakout_rvol"] >= 2.5]
+
+            # 6. QQQ Regime Filter
+            strat_qqq = request.args.get("strat_qqq", "all").strip()
+            if strat_qqq == "pullback":
+                sq = sq[sq["qqq_pullback"] == True]
+            elif strat_qqq == "bull_stack":
+                sq = sq[sq["qqq_bull_stack"] == True]
+
+            # 7. Tech Leadership Filter
+            strat_tech_lead = request.args.get("strat_tech_lead", "all").strip()
+            if strat_tech_lead == "bull_stack":
+                sq = sq[sq["qqq_spy_ratio_bull"] == True]
+
+            # 8. Sizing and Stoploss Models for Stats
+            strat_stop = request.args.get("strat_stop", "06x").strip()
+            strat_sizing = request.args.get("strat_sizing", "dynamic").strip()
+
+            r_key = "r_06x" if strat_stop == "06x" else "r_10x"
+            sized_r_key = "sized_r_06x" if strat_stop == "06x" else "sized_r_10x"
+            win_key = "is_win_06x" if strat_stop == "06x" else "is_win_10x"
+            bars_key = "bars_06x" if strat_stop == "06x" else "bars_10x"
+
+            eff_r = sq[sized_r_key] if strat_sizing == "dynamic" else sq[r_key]
+            n_trades = len(sq)
+            wins = int(sq[win_key].sum()) if n_trades > 0 else 0
+            losses = n_trades - wins
+            win_rate = (wins / n_trades * 100.0) if n_trades > 0 else 0.0
+
+            gross_win = float(eff_r[eff_r > 0].sum()) if n_trades > 0 else 0.0
+            gross_loss = float(abs(eff_r[eff_r <= 0].sum())) if n_trades > 0 else 0.0
+            pf = round(gross_win / gross_loss, 2) if gross_loss > 0 else (99.0 if gross_win > 0 else 0.0)
+            exp_r = round(float(eff_r.mean()), 3) if n_trades > 0 else 0.0
+            tot_r = round(float(sq[r_key].sum()), 1) if n_trades > 0 else 0.0
+            sized_tot_r = round(float(sq[sized_r_key].sum()), 1) if n_trades > 0 else 0.0
+
+            avg_win = round(float(eff_r[eff_r > 0].mean()), 2) if wins > 0 else 0.0
+            avg_loss = round(float(eff_r[eff_r <= 0].mean()), 2) if losses > 0 else 0.0
+            wl_ratio = round(avg_win / abs(avg_loss), 2) if avg_loss != 0 else 0.0
+            max_win = round(float(eff_r.max()), 1) if n_trades > 0 else 0.0
+            max_loss = round(float(eff_r.min()), 1) if n_trades > 0 else 0.0
+            avg_bars = round(float(sq[bars_key].mean()), 1) if n_trades > 0 else 0.0
+
+            strategy_kpis = {
+                "total_trades": n_trades,
+                "win_rate": round(win_rate, 1),
+                "profit_factor": pf,
+                "expectancy_r": exp_r,
+                "total_r": tot_r,
+                "sized_total_r": sized_tot_r,
+                "avg_win_r": avg_win,
+                "avg_loss_r": avg_loss,
+                "win_loss_ratio": wl_ratio,
+                "max_win_r": max_win,
+                "max_loss_r": max_loss,
+                "avg_bars": avg_bars,
+                "strat_stop": strat_stop,
+                "strat_sizing": strat_sizing,
+                "strat_macro": strat_macro,
+                "strat_spy": strat_spy,
+                "strat_rs": strat_rs,
+            }
+
+            # Filter events to only the qualifying breakout trades
+            valid_keys = set(zip(sq["symbol"].astype(str), sq["date"].astype(str)))
+            q = q[(q["state"] == "breakout") & q.apply(lambda r: (str(r["symbol"]), str(r["date"])) in valid_keys, axis=1)]
+
+    # 1. State Filter (when not in strategy mode)
+    if not strategy_mode:
+        state_f = request.args.get("state", "all")
+        if state_f in ["breakout", "building"]:
+            q = q[q["state"] == state_f]
 
     # 2. EP Catalyst Link Filter
     ep_link_f = request.args.get("ep_link", "all")
@@ -186,7 +327,9 @@ def api_events():
 
     # 5. Consolidation Bars Filter
     cons_f = request.args.get("cons_bars", "all")
-    if cons_f == "8-15":
+    if cons_f == "3-7":
+        q = q[(q["cons_bars"] >= 3) & (q["cons_bars"] <= 7)]
+    elif cons_f == "8-15":
         q = q[(q["cons_bars"] >= 8) & (q["cons_bars"] <= 15)]
     elif cons_f == "16-25":
         q = q[(q["cons_bars"] >= 16) & (q["cons_bars"] <= 25)]
@@ -236,7 +379,11 @@ def api_events():
     # Relative Strength (RS) Score & Posture Filter
     # Default: RS >= 90 for stage 2 bullish (stage2 == True) or within 15% 52w high (dist_52w_high >= -15.0)
     rs_f = request.args.get("rs_filter", "rs90_stage2_or_15").strip()
-    if rs_f in ["rs90_stage2_or_15", "default"]:
+    if search_q and rs_f in ["rs90_stage2_or_15", "default"]:
+        # When specifically searching for a ticker symbol, show full historical setups for that stock
+        # rather than restricting to only moments the ticker had RS >= 90
+        pass
+    elif rs_f in ["rs90_stage2_or_15", "default"]:
         q = q[(q["rs_score"] >= 90) & ((q["stage2"] == True) | (q["dist_52w_high"] >= -15.0))]
     elif rs_f == "rs95_stage2_or_15":
         q = q[(q["rs_score"] >= 95) & ((q["stage2"] == True) | (q["dist_52w_high"] >= -15.0))]
@@ -373,6 +520,8 @@ def api_events():
     return jsonify({
         "events": events_list,
         "kpis": kpis,
+        "strategy_kpis": strategy_kpis,
+        "strategy_mode": strategy_mode,
         "sectors": all_sectors,
         "themes": all_themes,
         "patterns": all_patterns,
@@ -651,6 +800,55 @@ def api_chart():
         "ep_badge": str(setup_row.get("ep_badge", "Pure Technical QM")) if setup_row else "Pure Technical QM",
     }
 
+    # Enrich with Strategy Trade Execution & Conviction Sizing if breakout
+    _ = get_strategy_df()
+    if STRATEGY_LOOKUP:
+        tr = STRATEGY_LOOKUP.get((str(sym), str(date_str)))
+        if tr:
+            setup_payload["trade_info"] = {
+                "entry_price": round(float(tr["entry_price"]), 2),
+                "pivot_low_price": round(float(tr["pivot_low_price"]), 2),
+                "pivot_low_date": str(tr["pivot_low_date"]),
+                "full_pivot_dist": round(float(tr["full_pivot_dist"]), 2),
+                "stop_loss_06x": round(float(tr["stop_loss_06x"]), 2),
+                "risk_pct_06x": round(float(tr["risk_pct_06x"]), 1),
+                "exit_date_06x": str(tr["exit_date_06x"]),
+                "exit_price_06x": round(float(tr["exit_price_06x"]), 2),
+                "exit_reason_06x": str(tr["exit_reason_06x"]),
+                "bars_06x": int(tr["bars_06x"]),
+                "r_06x": round(float(tr["r_06x"]), 2),
+                "sized_r_06x": round(float(tr["sized_r_06x"]), 2),
+                "gain_pct_06x": round(float(tr["gain_pct_06x"]), 1),
+                "mfe_r_06x": round(float(tr["mfe_r_06x"]), 2),
+                "mae_r_06x": round(float(tr["mae_r_06x"]), 2),
+                "is_win_06x": bool(tr["is_win_06x"]),
+                "stop_loss_10x": round(float(tr["stop_loss_10x"]), 2),
+                "risk_pct_10x": round(float(tr["risk_pct_10x"]), 1),
+                "exit_date_10x": str(tr["exit_date_10x"]),
+                "exit_price_10x": round(float(tr["exit_price_10x"]), 2),
+                "exit_reason_10x": str(tr["exit_reason_10x"]),
+                "bars_10x": int(tr["bars_10x"]),
+                "r_10x": round(float(tr["r_10x"]), 2),
+                "sized_r_10x": round(float(tr["sized_r_10x"]), 2),
+                "gain_pct_10x": round(float(tr["gain_pct_10x"]), 1),
+                "mfe_r_10x": round(float(tr["mfe_r_10x"]), 2),
+                "mae_r_10x": round(float(tr["mae_r_10x"]), 2),
+                "is_win_10x": bool(tr["is_win_10x"]),
+                "pos_size_mult": round(float(tr["pos_size_mult"]), 2),
+                "s_ep": round(float(tr["s_ep"]), 2),
+                "s_pole": round(float(tr["s_pole"]), 2),
+                "s_rvol": round(float(tr["s_rvol"]), 2),
+                "s_pb": round(float(tr["s_pb"]), 2),
+                "spy_above_200sma": bool(tr["spy_above_200sma"]),
+                "spy_above_50sma": bool(tr["spy_above_50sma"]),
+                "qqq_bull_stack": bool(tr["qqq_bull_stack"]),
+                "qqq_pullback": bool(tr["qqq_pullback"]),
+                "qqq_spy_ratio_bull": bool(tr["qqq_spy_ratio_bull"]),
+                "is_leading_macro": bool(tr["is_leading_macro"]),
+                "is_leading_sector": bool(tr["is_leading_sector"]),
+                "is_leading_theme": bool(tr["is_leading_theme"]),
+            }
+
     return jsonify({
         "symbol": sym,
         "date": date_str,
@@ -742,10 +940,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   }
 
   /* 3-Pane Workspace */
-  .workspace { display: flex; flex: 1; overflow: hidden; position: relative; }
+  .workspace { display: flex; flex: 1; min-height: 0; overflow: hidden; position: relative; }
   
   /* Left Pane: Table */
-  .table-pane { flex: 1.1; min-width: 440px; overflow: auto; border-right: 1px solid var(--border); }
+  .table-pane { flex: 1.1; min-width: 440px; min-height: 0; overflow: auto; border-right: 1px solid var(--border); }
   table { width: 100%; border-collapse: collapse; font-size: 12px; }
   th {
     background: #11151f; color: var(--muted); font-weight: 600; text-align: right;
@@ -889,8 +1087,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   }
   .draw-btn-danger:hover { background: #991b1b; border-color: #ef4444; color: #fff; }
 
-  .chart-container-rel { flex: 1; position: relative; width: 100%; height: 100%; overflow: hidden; }
-  #chart_tv { width: 100%; height: 100%; }
+  .chart-container-rel { flex: 1; min-height: 0; position: relative; width: 100%; overflow: hidden; }
+  #chart_tv { width: 100%; height: 100%; min-height: 0; }
   #chart_canvas_overlay {
     position: absolute; top: 0; left: 0; width: 100%; height: 100%;
     pointer-events: none; z-index: 6;
@@ -905,7 +1103,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
   /* Right Pane: Dossier */
   .dossier-pane {
-    flex: 0 0 380px; width: 380px; max-width: 420px; overflow-y: auto;
+    flex: 0 0 380px; width: 380px; max-width: 420px; min-height: 0; overflow-y: auto;
     background: var(--surface); padding: 14px; display: flex; flex-direction: column; gap: 12px;
   }
 
@@ -994,6 +1192,50 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .modal-close:hover { color: #fff; }
   .modal-body {
     padding: 16px 20px; overflow-y: auto; line-height: 1.6; font-size: 12px; color: #cbd5e1;
+  }
+
+  /* Strategy Mode Toolbar Buttons */
+  .btn-strategy {
+    background: #0f172a; color: #94a3b8; border: 1px solid #334155;
+    padding: 4px 10px; border-radius: 6px; font-size: 11.5px; font-weight: 700;
+    cursor: pointer; display: inline-flex; align-items: center; gap: 5px; transition: all 0.2s ease;
+  }
+  .btn-strategy:hover { background: #1e293b; color: #e2e8f0; border-color: #64748b; }
+  .btn-strategy.active {
+    background: linear-gradient(135deg, #0369a1 0%, #0284c7 100%);
+    color: #fff; border-color: #38bdf8;
+    box-shadow: 0 0 12px rgba(56, 189, 248, 0.4);
+  }
+  .btn-strategy-settings {
+    background: #0f172a; color: #cbd5e1; border: 1px solid #334155;
+    padding: 4px 8px; border-radius: 6px; font-size: 12.5px; cursor: pointer;
+    transition: all 0.2s ease;
+  }
+  .btn-strategy-settings:hover { background: #1e293b; color: #38bdf8; border-color: #0284c7; }
+
+  /* Strategy KPI Ribbon */
+  .strategy-kpi-bar {
+    display: flex; gap: 8px; padding: 7px 16px; background: linear-gradient(90deg, #07101e 0%, #0b172a 100%);
+    border-bottom: 2px solid #0284c7; flex-shrink: 0; overflow-x: auto;
+  }
+  .strat-kpi-card {
+    background: rgba(15, 23, 42, 0.85); border: 1px solid #1e3a5f; border-radius: 6px;
+    padding: 5px 10px; flex: 1; min-width: 105px;
+  }
+  .strat-kpi-label { font-size: 9.5px; color: #93c5fd; text-transform: uppercase; font-weight: 700; letter-spacing: 0.5px; margin-bottom: 2px; }
+  .strat-kpi-val { font-size: 14.5px; font-weight: 800; color: #fff; }
+  .strat-kpi-sub { font-size: 9.5px; color: #64748b; margin-top: 1px; }
+
+  /* Strategy Settings Modal Elements */
+  .settings-group {
+    background: #111827; border: 1px solid #1f2937; border-radius: 6px; padding: 10px 12px;
+  }
+  .settings-group-title {
+    font-size: 11.5px; font-weight: 700; color: #38bdf8; margin-bottom: 4px; display: flex; align-items: center; justify-content: space-between;
+  }
+  .settings-group-desc { font-size: 10.5px; color: var(--muted); margin-bottom: 6px; line-height: 1.35; }
+  .cfg-select {
+    width: 100%; padding: 5px 8px; background: #0b0f19; border: 1px solid #374151; color: #f3f4f6; border-radius: 4px; font-size: 11.5px; outline: none;
   }
 </style>
 </head>
@@ -1106,8 +1348,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   <div class="filter-group">
     <label>Min Move:</label>
     <select id="sel_move" onchange="fetchEvents()">
-      <option value="">All Moves</option>
-      <option value="30">≥ +30%</option>
+      <option value="">All Moves (≥ +15%)</option>
+      <option value="15">≥ +15% (Large Cap Momentum)</option>
+      <option value="20">≥ +20%</option>
+      <option value="30">≥ +30% (Standard QM)</option>
       <option value="40">≥ +40%</option>
       <option value="50">≥ +50%</option>
       <option value="75">≥ +75%</option>
@@ -1118,7 +1362,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   <div class="filter-group">
     <label>Cons Bars:</label>
     <select id="sel_cons" onchange="fetchEvents()">
-      <option value="all">All Lengths</option>
+      <option value="all">All Lengths (3–45 bars)</option>
+      <option value="3-7">⚡ 3 – 7 bars (Quick Flags / High Velocity)</option>
       <option value="8-15">8 – 15 bars (Tight)</option>
       <option value="16-25">16 – 25 bars (Medium)</option>
       <option value="26-45">26 – 45 bars (Extended)</option>
@@ -1157,7 +1402,60 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <input type="text" id="inp_search" placeholder="Search symbol..." style="width:120px;" oninput="onSearchInput()">
   </div>
 
-  <button class="btn-filter-chip" onclick="resetFilters()" style="margin-left:auto;">Reset Filters</button>
+  <div class="filter-group" style="margin-left:auto; display:flex; align-items:center; gap:5px;">
+    <button class="btn-strategy" id="btn_strategy_toggle" onclick="toggleStrategyMode()" title="Filter to setups passing QM strategy rules and show aggregate trade stats">
+      <span>🎯</span> <span id="strategy_mode_lbl">Strategy Mode: OFF</span>
+    </button>
+    <button class="btn-strategy-settings" id="btn_strategy_settings" onclick="openStrategySettingsModal()" title="Configure QM Strategy Filtering &amp; Sizing Rules">
+      ⚙️
+    </button>
+  </div>
+
+  <button class="btn-filter-chip" onclick="resetFilters()">Reset Filters</button>
+</div>
+
+<!-- Strategy Performance KPI Banner (Visible when Strategy Mode is Active) -->
+<div class="strategy-kpi-bar" id="strategy_kpi_bar" style="display:none;">
+  <div class="strat-kpi-card" style="border-color:#0284c7;">
+    <div class="strat-kpi-label">TOTAL TRADES</div>
+    <div class="strat-kpi-val" id="skpi_trades" style="color:#38bdf8;">--</div>
+    <div class="strat-kpi-sub" id="skpi_sub_trades">Filtered breakouts</div>
+  </div>
+  <div class="strat-kpi-card" style="border-color:#059669;">
+    <div class="strat-kpi-label">WIN RATE</div>
+    <div class="strat-kpi-val" id="skpi_winrate" style="color:#34d399;">--%</div>
+    <div class="strat-kpi-sub" id="skpi_sub_winrate">Trailing 10 EMA</div>
+  </div>
+  <div class="strat-kpi-card" style="border-color:#0284c7;">
+    <div class="strat-kpi-label">PROFIT FACTOR</div>
+    <div class="strat-kpi-val" id="skpi_pf" style="color:#38bdf8;">--</div>
+    <div class="strat-kpi-sub">Gross Win / Gross Loss</div>
+  </div>
+  <div class="strat-kpi-card" style="border-color:#d97706;">
+    <div class="strat-kpi-label">EXPECTANCY (R)</div>
+    <div class="strat-kpi-val" id="skpi_expectancy" style="color:#fbbf24;">-- R</div>
+    <div class="strat-kpi-sub" id="skpi_sub_expectancy">Per Trade Mean</div>
+  </div>
+  <div class="strat-kpi-card" style="border-color:#059669;">
+    <div class="strat-kpi-label">TOTAL RETURN</div>
+    <div class="strat-kpi-val" id="skpi_total_r" style="color:#34d399;">-- R</div>
+    <div class="strat-kpi-sub" id="skpi_sub_total_r">Unsized Realized</div>
+  </div>
+  <div class="strat-kpi-card" style="border-color:#7c3aed;">
+    <div class="strat-kpi-label">SIZED RETURN</div>
+    <div class="strat-kpi-val" id="skpi_sized_r" style="color:#c084fc;">-- R</div>
+    <div class="strat-kpi-sub" id="skpi_sub_sized_r">Dynamic Multiplier</div>
+  </div>
+  <div class="strat-kpi-card" style="border-color:#0284c7;">
+    <div class="strat-kpi-label">WIN / LOSS RATIO</div>
+    <div class="strat-kpi-val" id="skpi_win_loss" style="color:#38bdf8;">-- : 1</div>
+    <div class="strat-kpi-sub" id="skpi_sub_win_loss">Avg Win vs Avg Loss</div>
+  </div>
+  <div class="strat-kpi-card" style="border-color:#0284c7;">
+    <div class="strat-kpi-label">MAX WIN / MAX LOSS</div>
+    <div class="strat-kpi-val" id="skpi_max_win" style="font-size:13px; color:#e2e8f0;">-- R / -- R</div>
+    <div class="strat-kpi-sub" id="skpi_sub_max_win">Holding: -- bars</div>
+  </div>
 </div>
 
 <!-- 3-Pane Workspace -->
@@ -1355,6 +1653,100 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       <div class="dossier-row">
         <span class="dossier-label">Themes:</span>
         <span class="dossier-val" id="dos_themes" style="font-size:11px; max-width:220px; text-align:right; cursor:pointer; text-decoration:underline dotted; color:#c084fc;" title="Click to view Theme Stock Leaderboard" onclick="openGroupStocksModal(this.textContent, 'theme')">--</span>
+      </div>
+    </div>
+
+    <!-- QM Breakout Strategy Trade Execution & Conviction Sizing Card -->
+    <div class="dossier-card" id="card_strategy_trade" style="border-color:#0284c7; background:linear-gradient(180deg, #0d1527 0%, #0b111e 100%); display:none;">
+      <div class="dossier-title">
+        <span style="color:#38bdf8; font-weight:700;">🎯 QM STRATEGY TRADE EXECUTION</span>
+        <span id="dos_strat_result_badge" class="pctile-badge pctile-high">--</span>
+      </div>
+
+      <!-- Execution Grid -->
+      <div style="background:#070d18; border:1px solid #1e293b; border-radius:6px; padding:8px 10px; display:flex; flex-direction:column; gap:4px;">
+        <div style="display:flex; justify-content:space-between; align-items:center;">
+          <span style="color:var(--muted); font-size:11px;">Breakout Entry:</span>
+          <span style="font-weight:700; color:#fff;" id="dos_strat_entry">--</span>
+        </div>
+        <div style="display:flex; justify-content:space-between; align-items:center;">
+          <span style="color:var(--muted); font-size:11px;">Stop Loss Level:</span>
+          <span style="font-weight:700; color:#f87171;" id="dos_strat_stop">--</span>
+        </div>
+        <div style="display:flex; justify-content:space-between; align-items:center;">
+          <span style="color:var(--muted); font-size:11px;">10 EMA Trailing Exit:</span>
+          <span style="font-weight:700; color:#38bdf8;" id="dos_strat_exit">--</span>
+        </div>
+        <div style="display:flex; justify-content:space-between; align-items:center;">
+          <span style="color:var(--muted); font-size:11px;">Exit Reason:</span>
+          <span style="font-size:11px; color:#cbd5e1;" id="dos_strat_exit_reason">--</span>
+        </div>
+      </div>
+
+      <!-- Return & Excursion Performance -->
+      <div style="display:grid; grid-template-columns:1fr 1fr; gap:6px;">
+        <div style="background:#0d1829; border:1px solid #1e3a5f; border-radius:6px; padding:6px 8px; text-align:center;">
+          <div style="font-size:9.5px; color:#93c5fd; text-transform:uppercase; font-weight:700;">Realized Return (1.0x)</div>
+          <div style="font-size:15px; font-weight:800;" id="dos_strat_r">-- R</div>
+          <div style="font-size:10px; color:var(--muted);" id="dos_strat_gain_pct">--% gain</div>
+        </div>
+        <div style="background:#1b142f; border:1px solid #4c1d95; border-radius:6px; padding:6px 8px; text-align:center;">
+          <div style="font-size:9.5px; color:#c084fc; text-transform:uppercase; font-weight:700;">Sized Return (Dynamic)</div>
+          <div style="font-size:15px; font-weight:800; color:#c084fc;" id="dos_strat_sized_r">-- R</div>
+          <div style="font-size:10px; color:#ddd6fe;" id="dos_strat_size_mult">Conviction: --x</div>
+        </div>
+      </div>
+
+      <div style="display:flex; justify-content:space-between; font-size:10.5px; color:var(--muted); padding:2px 2px;">
+        <span>Peak MFE: <strong style="color:#34d399;" id="dos_strat_mfe">-- R</strong></span>
+        <span>Max Drawdown MAE: <strong style="color:#f87171;" id="dos_strat_mae">-- R</strong></span>
+        <span>Holding: <strong style="color:#e2e8f0;" id="dos_strat_bars">-- bars</strong></span>
+      </div>
+
+      <!-- Multi-Factor Conviction Sizing Breakdown -->
+      <div style="background:#080e1b; border:1px solid #1e293b; border-radius:6px; padding:8px 10px;">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
+          <span style="font-size:10.5px; font-weight:700; color:#c084fc;">⚡ CONVICTION SIZING FACTORS</span>
+          <span style="font-size:10.5px; font-weight:700; color:#fff;" id="dos_strat_total_mult_badge">1.00x Base</span>
+        </div>
+        <div style="display:grid; grid-template-columns:1fr 1fr; gap:4px; font-size:10px;">
+          <div style="background:#111928; padding:4px 6px; border-radius:4px; display:flex; justify-content:space-between;">
+            <span style="color:var(--muted);">Fresh EP:</span>
+            <strong id="dos_strat_s_ep" style="color:#38bdf8;">1.00x</strong>
+          </div>
+          <div style="background:#111928; padding:4px 6px; border-radius:4px; display:flex; justify-content:space-between;">
+            <span style="color:var(--muted);">Pole Move:</span>
+            <strong id="dos_strat_s_pole" style="color:#34d399;">1.00x</strong>
+          </div>
+          <div style="background:#111928; padding:4px 6px; border-radius:4px; display:flex; justify-content:space-between;">
+            <span style="color:var(--muted);">Breakout RVOL:</span>
+            <strong id="dos_strat_s_rvol" style="color:#f59e0b;">1.00x</strong>
+          </div>
+          <div style="background:#111928; padding:4px 6px; border-radius:4px; display:flex; justify-content:space-between;">
+            <span style="color:var(--muted);">Pullback Tight:</span>
+            <strong id="dos_strat_s_pb" style="color:#a855f7;">1.00x</strong>
+          </div>
+        </div>
+      </div>
+
+      <!-- Market Regime & Alignment Checklist -->
+      <div style="font-size:11px; color:#cbd5e1; display:flex; flex-direction:column; gap:3px; background:#070d18; border:1px solid #1e293b; border-radius:6px; padding:6px 8px;">
+        <div style="display:flex; justify-content:space-between;">
+          <span style="color:var(--muted); font-size:10.5px;">Market Trend (SPY):</span>
+          <span id="dos_strat_spy_status">--</span>
+        </div>
+        <div style="display:flex; justify-content:space-between;">
+          <span style="color:var(--muted); font-size:10.5px;">QQQ 10/20 EMA Regime:</span>
+          <span id="dos_strat_qqq_status">--</span>
+        </div>
+        <div style="display:flex; justify-content:space-between;">
+          <span style="color:var(--muted); font-size:10.5px;">Tech Leadership (QQQ/SPY):</span>
+          <span id="dos_strat_tech_status">--</span>
+        </div>
+        <div style="display:flex; justify-content:space-between;">
+          <span style="color:var(--muted); font-size:10.5px;">Macro Universe:</span>
+          <span id="dos_strat_macro_status">--</span>
+        </div>
       </div>
     </div>
 
@@ -1586,6 +1978,142 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   </div>
 </div>
 
+<!-- Strategy Settings Modal -->
+<div class="modal-overlay" id="strategy_settings_modal" onclick="closeStrategySettingsModal(event)">
+  <div class="modal-box" style="width:680px; max-width:92vw; max-height:88vh; display:flex; flex-direction:column;" onclick="event.stopPropagation()">
+    <div class="modal-header" style="background:#0f172a; border-bottom:1px solid #1e293b; padding:12px 18px;">
+      <div class="modal-title" style="color:#38bdf8; font-size:14px; display:flex; align-items:center; gap:8px;">
+        <span>🎯 Institutional QM Strategy Filtering &amp; Sizing Rules</span>
+      </div>
+      <button class="modal-close" onclick="closeStrategySettingsModal()">&times;</button>
+    </div>
+    <div class="modal-body" style="background:#090d16; padding:16px 20px; display:flex; flex-direction:column; gap:12px; overflow-y:auto;">
+      <!-- Macro / Universe -->
+      <div class="settings-group">
+        <div class="settings-group-title">
+          <span>🏭 Macro Universe Sponsorship</span>
+        </div>
+        <div class="settings-group-desc">Filter breakout candidates by institutional sector and theme momentum leadership (Score ≥ 65).</div>
+        <select id="cfg_strat_macro" class="cfg-select">
+          <option value="leading" selected>Leading Sectors &amp; Leading Themes (Score ≥ 65) — Recommended (+471.0 R)</option>
+          <option value="leading_sectors">Leading Sectors Only</option>
+          <option value="leading_themes">Leading Themes Only</option>
+          <option value="all">Unrestricted Universe (All Sectors &amp; Themes)</option>
+        </select>
+      </div>
+
+      <!-- Market Health (SPY) -->
+      <div class="settings-group">
+        <div class="settings-group-title">
+          <span>📈 Market Regime Filter (SPY)</span>
+        </div>
+        <div class="settings-group-desc">Bypasses long trades in macro bear markets to avoid low-liquidity whipsaws.</div>
+        <select id="cfg_strat_spy" class="cfg-select">
+          <option value="spy200" selected>SPY ≥ 200 SMA (Bull Market Baseline) — Recommended</option>
+          <option value="spy50">SPY ≥ 50 SMA (Strict Momentum Alignment)</option>
+          <option value="all">All Market Regimes (No SPY Filter)</option>
+        </select>
+      </div>
+
+      <!-- Stop Loss Mechanics -->
+      <div class="settings-group">
+        <div class="settings-group-title">
+          <span>🛑 Stop Loss Mechanics</span>
+        </div>
+        <div class="settings-group-desc">0.6x stoploss cuts initial risk distance by 40% and boosts Expectancy +142% (+0.180 R vs +0.057 R).</div>
+        <select id="cfg_strat_stop" class="cfg-select">
+          <option value="06x" selected>0.6x Distance to Previous TrendLab Pivot Low — Optimized (+0.180 R, PF 1.30)</option>
+          <option value="10x">1.0x Full Distance to Previous Pivot Low — Classical (+0.057 R, PF 1.09)</option>
+        </select>
+      </div>
+
+      <!-- Position Sizing Model -->
+      <div class="settings-group">
+        <div class="settings-group-title">
+          <span>⚖️ Position Sizing Multiplier (S)</span>
+        </div>
+        <div class="settings-group-desc">Dynamic multi-factor conviction sizing overweights Fresh EPs, Monster Poles, RVOL, and Tight Pullbacks.</div>
+        <select id="cfg_strat_sizing" class="cfg-select">
+          <option value="dynamic" selected>Dynamic Multi-Factor Sizing (0.50x – 2.50x) — (+471.0 R Total Alpha)</option>
+          <option value="equal">Equal Weighting (1.0x Fixed Unit Risk) — (+361.5 R)</option>
+        </select>
+      </div>
+
+      <!-- Relative Strength Posture -->
+      <div class="settings-group">
+        <div class="settings-group-title">
+          <span>⚡ Relative Strength (RS) &amp; Posture</span>
+        </div>
+        <div class="settings-group-desc">Institutional leadership posture from daily cross-sectional RS history database.</div>
+        <select id="cfg_strat_rs" class="cfg-select">
+          <option value="rs90_lead" selected>RS ≥ 90 + (Stage 2 Bullish Stack OR ≤15% 52W High) — Default</option>
+          <option value="rs95">RS ≥ 95 Elite Leaders (Stage 2 / ≤15% 52W High) — Peak Win/Loss (2.65:1)</option>
+          <option value="rs80">RS ≥ 80 (Stage 2 / ≤15% 52W High)</option>
+          <option value="all">All RS Scores &amp; Postures</option>
+        </select>
+      </div>
+
+      <!-- Fresh EP Alignment -->
+      <div class="settings-group">
+        <div class="settings-group-title">
+          <span>🚀 Fresh EP Recency Alignment</span>
+        </div>
+        <div class="settings-group-desc">Episodic Pivot catalyst ignition preceding QM momentum pole.</div>
+        <select id="cfg_strat_fresh_ep" class="cfg-select">
+          <option value="all" selected>All Breakouts (Sizing automatically scales 0.85x – 1.30x)</option>
+          <option value="15d">Fresh EP within ≤ 15 Days (+30% Sizing Bonus)</option>
+          <option value="30d">Fresh EP within ≤ 30 Days (+15% Sizing Bonus)</option>
+          <option value="has_ep">Any Prior EP Catalyst Link</option>
+        </select>
+      </div>
+
+      <!-- Breakout RVOL Filter -->
+      <div class="settings-group">
+        <div class="settings-group-title">
+          <span>📊 Breakout RVOL Expansion</span>
+        </div>
+        <div class="settings-group-desc">Volume explosion on breakout confirmation day relative to 20-day SMA.</div>
+        <select id="cfg_strat_rvol" class="cfg-select">
+          <option value="all" selected>All Volume Levels (Sizing automatically scales 0.90x – 1.20x)</option>
+          <option value="1.5x">RVOL ≥ 1.5x Base Volume</option>
+          <option value="2.0x">RVOL ≥ 2.0x Base Volume</option>
+          <option value="2.5x">RVOL ≥ 2.5x Institutional Explosion (+20% Sizing Bonus)</option>
+        </select>
+      </div>
+
+      <!-- Nasdaq 100 (QQQ) Trend & Divergence -->
+      <div class="settings-group">
+        <div class="settings-group-title">
+          <span>🌐 Nasdaq 100 (QQQ) Market Regime</span>
+        </div>
+        <div class="settings-group-desc">Setups during QQQ pullbacks show superior +0.238 R expectancy due to market divergence.</div>
+        <select id="cfg_strat_qqq" class="cfg-select">
+          <option value="all" selected>All QQQ Market Regimes — Default</option>
+          <option value="pullback">Pullback Divergence (QQQ &lt; 10 or 20 EMA) — Highest Edge (+0.238 R, PF 1.48)</option>
+          <option value="bull_stack">Extended Bull Stack (QQQ &gt; 10 EMA &gt; 20 EMA)</option>
+        </select>
+      </div>
+
+      <!-- Tech Leadership (QQQ/SPY Ratio) -->
+      <div class="settings-group">
+        <div class="settings-group-title">
+          <span>💻 Tech Leadership (QQQ/SPY Ratio)</span>
+        </div>
+        <div class="settings-group-desc">Relative strength of tech equities against broad S&amp;P 500 index.</div>
+        <select id="cfg_strat_tech_lead" class="cfg-select">
+          <option value="all" selected>All Tech Leadership Regimes — Default</option>
+          <option value="bull_stack">(QQQ/SPY) &gt; 10 EMA &gt; 20 EMA (Tech Dominance, +0.201 R)</option>
+        </select>
+      </div>
+
+      <div style="display:flex; justify-content:space-between; margin-top:8px; padding-top:10px; border-top:1px solid #1f2937;">
+        <button class="btn-filter-chip" onclick="resetStrategySettings()">Reset to Defaults</button>
+        <button class="reload-btn" onclick="applyStrategySettings()">✓ Apply Settings &amp; Filter</button>
+      </div>
+    </div>
+  </div>
+</div>
+
 <script>
 // State
 let allEvents = [];
@@ -1596,6 +2124,135 @@ let activeStateFilter = 'all';
 let activeEpFilter = 'all';
 let activeMacroFilter = 'all';
 let searchDebounceTimer = null;
+
+// Strategy Mode & Settings State
+let strategyMode = false;
+let strategySettings = {
+  macro: 'leading',
+  spy: 'spy200',
+  stop: '06x',
+  sizing: 'dynamic',
+  rs: 'rs90_lead',
+  fresh_ep: 'all',
+  rvol: 'all',
+  qqq: 'all',
+  tech_lead: 'all'
+};
+
+function toggleStrategyMode() {
+  strategyMode = !strategyMode;
+  const btn = document.getElementById('btn_strategy_toggle');
+  const lbl = document.getElementById('strategy_mode_lbl');
+  const stratKpis = document.getElementById('strategy_kpi_bar');
+  const normKpis = document.getElementById('kpi_row');
+
+  if (strategyMode) {
+    if (btn) btn.classList.add('active');
+    if (lbl) lbl.textContent = '🎯 Strategy Mode: ACTIVE';
+    if (stratKpis) stratKpis.style.display = 'flex';
+    if (normKpis) normKpis.style.display = 'none';
+  } else {
+    if (btn) btn.classList.remove('active');
+    if (lbl) lbl.textContent = 'Strategy Mode: OFF';
+    if (stratKpis) stratKpis.style.display = 'none';
+    if (normKpis) normKpis.style.display = 'flex';
+  }
+  fetchEvents();
+}
+
+function openStrategySettingsModal() {
+  const selMacro = document.getElementById('cfg_strat_macro');
+  const selSpy = document.getElementById('cfg_strat_spy');
+  const selStop = document.getElementById('cfg_strat_stop');
+  const selSizing = document.getElementById('cfg_strat_sizing');
+  const selRs = document.getElementById('cfg_strat_rs');
+  const selFresh = document.getElementById('cfg_strat_fresh_ep');
+  const selRvol = document.getElementById('cfg_strat_rvol');
+  const selQqq = document.getElementById('cfg_strat_qqq');
+  const selTech = document.getElementById('cfg_strat_tech_lead');
+
+  if (selMacro) selMacro.value = strategySettings.macro;
+  if (selSpy) selSpy.value = strategySettings.spy;
+  if (selStop) selStop.value = strategySettings.stop;
+  if (selSizing) selSizing.value = strategySettings.sizing;
+  if (selRs) selRs.value = strategySettings.rs;
+  if (selFresh) selFresh.value = strategySettings.fresh_ep;
+  if (selRvol) selRvol.value = strategySettings.rvol;
+  if (selQqq) selQqq.value = strategySettings.qqq;
+  if (selTech) selTech.value = strategySettings.tech_lead;
+
+  const m = document.getElementById('strategy_settings_modal');
+  if (m) m.classList.add('active');
+}
+
+function closeStrategySettingsModal(e) {
+  if (e && e.target && e.target.id !== 'strategy_settings_modal' && !e.target.classList.contains('modal-close')) return;
+  const m = document.getElementById('strategy_settings_modal');
+  if (m) m.classList.remove('active');
+}
+
+function applyStrategySettings() {
+  strategySettings.macro = document.getElementById('cfg_strat_macro').value;
+  strategySettings.spy = document.getElementById('cfg_strat_spy').value;
+  strategySettings.stop = document.getElementById('cfg_strat_stop').value;
+  strategySettings.sizing = document.getElementById('cfg_strat_sizing').value;
+  strategySettings.rs = document.getElementById('cfg_strat_rs').value;
+  strategySettings.fresh_ep = document.getElementById('cfg_strat_fresh_ep').value;
+  strategySettings.rvol = document.getElementById('cfg_strat_rvol').value;
+  strategySettings.qqq = document.getElementById('cfg_strat_qqq').value;
+  strategySettings.tech_lead = document.getElementById('cfg_strat_tech_lead').value;
+
+  closeStrategySettingsModal();
+
+  if (!strategyMode) {
+    toggleStrategyMode();
+  } else {
+    fetchEvents();
+  }
+}
+
+function resetStrategySettings() {
+  strategySettings = {
+    macro: 'leading',
+    spy: 'spy200',
+    stop: '06x',
+    sizing: 'dynamic',
+    rs: 'rs90_lead',
+    fresh_ep: 'all',
+    rvol: 'all',
+    qqq: 'all',
+    tech_lead: 'all'
+  };
+  openStrategySettingsModal();
+}
+
+function updateStrategyKPIs(k) {
+  if (!k) return;
+  const trEl = document.getElementById('skpi_trades');
+  if (trEl) trEl.textContent = (k.total_trades || 0).toLocaleString();
+  const wrEl = document.getElementById('skpi_winrate');
+  if (wrEl) wrEl.textContent = (k.win_rate != null ? k.win_rate.toFixed(1) : '0.0') + '%';
+  const subWrEl = document.getElementById('skpi_sub_winrate');
+  if (subWrEl) subWrEl.textContent = (k.strat_stop === '06x' ? '0.6x Stop' : '1.0x Stop') + ' • 10 EMA Exit';
+  const pfEl = document.getElementById('skpi_pf');
+  if (pfEl) pfEl.textContent = k.profit_factor != null ? k.profit_factor.toFixed(2) : '--';
+  const expEl = document.getElementById('skpi_expectancy');
+  if (expEl) expEl.textContent = (k.expectancy_r > 0 ? '+' : '') + (k.expectancy_r != null ? k.expectancy_r.toFixed(3) : '0.0') + ' R';
+  const totREl = document.getElementById('skpi_total_r');
+  if (totREl) totREl.textContent = (k.total_r > 0 ? '+' : '') + (k.total_r != null ? k.total_r.toFixed(1) : '0.0') + ' R';
+  const sizedREl = document.getElementById('skpi_sized_r');
+  if (sizedREl) sizedREl.textContent = (k.sized_total_r > 0 ? '+' : '') + (k.sized_total_r != null ? k.sized_total_r.toFixed(1) : '0.0') + ' R';
+  const subSizedEl = document.getElementById('skpi_sub_sized_r');
+  if (subSizedEl) subSizedEl.textContent = (k.strat_sizing === 'dynamic' ? 'Dynamic Multiplier' : '1.0x Equal Weight');
+  const wlEl = document.getElementById('skpi_win_loss');
+  if (wlEl) wlEl.textContent = (k.win_loss_ratio != null ? k.win_loss_ratio.toFixed(2) : '--') + ' : 1';
+  const subWlEl = document.getElementById('skpi_sub_win_loss');
+  if (subWlEl) subWlEl.textContent = `Avg +${k.avg_win_r || 0}R vs ${k.avg_loss_r || 0}R`;
+  const maxWEl = document.getElementById('skpi_max_win');
+  if (maxWEl) maxWEl.textContent = `+${k.max_win_r || 0} R / ${k.max_loss_r || 0} R`;
+  const subMaxWEl = document.getElementById('skpi_sub_max_win');
+  if (subMaxWEl) subMaxWEl.textContent = `Avg Hold: ${k.avg_bars || 0} bars`;
+}
 
 // Chart state
 let chart = null;
@@ -1898,6 +2555,8 @@ function initChart() {
       borderColor: '#232936',
       timeVisible: true,
       secondsVisible: false,
+      visible: true,
+      borderVisible: true,
     },
   });
 
@@ -2017,6 +2676,24 @@ function initChart() {
       scheduleLarssonRender();
     }
   });
+
+  const roTarget = document.querySelector('.chart-container-rel') || container;
+  if (window.ResizeObserver && roTarget) {
+    const ro = new ResizeObserver(entries => {
+      for (const entry of entries) {
+        const cr = entry.contentRect;
+        if (cr.width > 0 && cr.height > 0 && chart) {
+          chart.applyOptions({ width: Math.round(cr.width), height: Math.round(cr.height) });
+          requestAnimationFrame(() => {
+            drawCanvasOverlays();
+            renderAllDrawings();
+            scheduleLarssonRender();
+          });
+        }
+      }
+    });
+    ro.observe(roTarget);
+  }
 }
 
 function drawCanvasOverlays() {
@@ -2110,11 +2787,27 @@ function fetchEvents() {
   p.set('sort', currentSort.col);
   p.set('asc', currentSort.asc ? '1' : '0');
 
+  if (strategyMode) {
+    p.set('strategy_mode', '1');
+    p.set('strat_macro', strategySettings.macro);
+    p.set('strat_spy', strategySettings.spy);
+    p.set('strat_stop', strategySettings.stop);
+    p.set('strat_sizing', strategySettings.sizing);
+    p.set('strat_rs', strategySettings.rs);
+    p.set('strat_fresh_ep', strategySettings.fresh_ep);
+    p.set('strat_rvol', strategySettings.rvol);
+    p.set('strat_qqq', strategySettings.qqq);
+    p.set('strat_tech_lead', strategySettings.tech_lead);
+  }
+
   fetch('/api/events?' + p.toString())
     .then(r => r.json())
     .then(data => {
       allEvents = data.events || [];
       updateKPIs(data.kpis || {});
+      if (data.strategy_kpis) {
+        updateStrategyKPIs(data.strategy_kpis);
+      }
       populateDropdowns(
         data.sectors || [],
         data.themes || [],
@@ -2339,6 +3032,23 @@ function applySetupPriceLines(setup) {
       }));
     }
   });
+
+  if (setup.trade_info) {
+    const ti = setup.trade_info;
+    const is06 = (strategySettings.stop === '06x');
+    const stopP = is06 ? ti.stop_loss_06x : ti.stop_loss_10x;
+    if (stopP && stopP > 0) {
+      activePriceLines.push(candleSeries.createPriceLine({
+        price: stopP, color: '#f87171', lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: `Stop (${is06 ? '0.6x' : '1.0x'}) $${stopP}`
+      }));
+    }
+    const exitP = is06 ? ti.exit_price_06x : ti.exit_price_10x;
+    if (exitP && exitP > 0) {
+      activePriceLines.push(candleSeries.createPriceLine({
+        price: exitP, color: '#38bdf8', lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: `Exit $${exitP}`
+      }));
+    }
+  }
 }
 
 function applyCandleMarkers(data) {
@@ -2447,6 +3157,11 @@ function resetChartScale() {
   const setup = currentChartData.setup;
   const data = currentChartData;
 
+  const container = document.getElementById('chart_tv');
+  if (container && container.clientWidth > 0 && container.clientHeight > 0) {
+    chart.applyOptions({ width: container.clientWidth, height: container.clientHeight });
+  }
+
   if (data.bars && data.bars.length > 0) {
     let evIdx = data.bars.findIndex(b => b.time === setup.date);
     if (evIdx < 0) evIdx = data.bars.length - 1;
@@ -2486,6 +3201,89 @@ function renderDossier(s, eps, st, cat) {
   document.getElementById('dos_sym_date').textContent = `${s.symbol} • ${s.date}`;
   document.getElementById('dos_sector').textContent = s.sector || 'Unknown';
   document.getElementById('dos_themes').textContent = s.themes || s.theme || 'General';
+
+  // QM Breakout Strategy Trade Execution & Sizing Card
+  const stratCard = document.getElementById('card_strategy_trade');
+  if (stratCard) {
+    if (s && s.trade_info) {
+      stratCard.style.display = 'flex';
+      const ti = s.trade_info;
+      const use06 = (strategySettings.stop === '06x');
+      const isWin = use06 ? ti.is_win_06x : ti.is_win_10x;
+      const realizedR = use06 ? ti.r_06x : ti.r_10x;
+      const sizedR = use06 ? ti.sized_r_06x : ti.sized_r_10x;
+      const gainPct = use06 ? ti.gain_pct_06x : ti.gain_pct_10x;
+      const stopPrice = use06 ? ti.stop_loss_06x : ti.stop_loss_10x;
+      const riskPct = use06 ? ti.risk_pct_06x : ti.risk_pct_10x;
+      const exitPrice = use06 ? ti.exit_price_06x : ti.exit_price_10x;
+      const exitDate = use06 ? ti.exit_date_06x : ti.exit_date_10x;
+      const exitReason = use06 ? ti.exit_reason_06x : ti.exit_reason_10x;
+      const barsHeld = use06 ? ti.bars_06x : ti.bars_10x;
+      const mfeR = use06 ? ti.mfe_r_06x : ti.mfe_r_10x;
+      const maeR = use06 ? ti.mae_r_06x : ti.mae_r_10x;
+
+      const badgeEl = document.getElementById('dos_strat_result_badge');
+      if (badgeEl) {
+        if (isWin) {
+          badgeEl.className = 'pctile-badge pctile-high';
+          badgeEl.textContent = `🟢 WIN (${realizedR > 0 ? '+' : ''}${realizedR.toFixed(2)} R)`;
+        } else {
+          badgeEl.className = 'pctile-badge pctile-low';
+          badgeEl.textContent = `🔴 LOSS (${realizedR.toFixed(2)} R)`;
+        }
+      }
+
+      document.getElementById('dos_strat_entry').textContent = `$${ti.entry_price.toFixed(2)}`;
+      document.getElementById('dos_strat_stop').textContent = `$${stopPrice.toFixed(2)} (-${riskPct.toFixed(1)}%) [${use06 ? '0.6x' : '1.0x'}]`;
+      document.getElementById('dos_strat_exit').textContent = `$${exitPrice.toFixed(2)} on ${exitDate}`;
+
+      let humanExit = '10 EMA Close Violation';
+      if (exitReason && exitReason.includes('stop')) humanExit = 'Initial Stop Loss Breached';
+      else if (exitReason && exitReason.includes('max')) humanExit = 'Max Holding (250 bars)';
+      document.getElementById('dos_strat_exit_reason').textContent = humanExit;
+
+      const rEl = document.getElementById('dos_strat_r');
+      rEl.textContent = `${realizedR > 0 ? '+' : ''}${realizedR.toFixed(2)} R`;
+      rEl.style.color = realizedR > 0 ? '#34d399' : '#f87171';
+      document.getElementById('dos_strat_gain_pct').textContent = `${gainPct > 0 ? '+' : ''}${gainPct.toFixed(1)}% gain`;
+
+      const sizedEl = document.getElementById('dos_strat_sized_r');
+      sizedEl.textContent = `${sizedR > 0 ? '+' : ''}${sizedR.toFixed(2)} R`;
+      sizedEl.style.color = sizedR > 0 ? '#c084fc' : '#f87171';
+      document.getElementById('dos_strat_size_mult').textContent = `Conviction: ${ti.pos_size_mult.toFixed(2)}x`;
+
+      document.getElementById('dos_strat_mfe').textContent = `+${mfeR.toFixed(2)} R`;
+      document.getElementById('dos_strat_mae').textContent = `-${maeR.toFixed(2)} R`;
+      document.getElementById('dos_strat_bars').textContent = `${barsHeld} bars`;
+
+      // Sizing Factors
+      document.getElementById('dos_strat_total_mult_badge').textContent = `${ti.pos_size_mult.toFixed(2)}x Sizing`;
+      document.getElementById('dos_strat_s_ep').textContent = `${ti.s_ep.toFixed(2)}x`;
+      document.getElementById('dos_strat_s_pole').textContent = `${ti.s_pole.toFixed(2)}x`;
+      document.getElementById('dos_strat_s_rvol').textContent = `${ti.s_rvol.toFixed(2)}x`;
+      document.getElementById('dos_strat_s_pb').textContent = `${ti.s_pb.toFixed(2)}x`;
+
+      // Regime Checklist
+      document.getElementById('dos_strat_spy_status').innerHTML = ti.spy_above_200sma
+        ? '<span style="color:#10b981; font-weight:700;">✓ Bull Market (SPY ≥ 200 SMA)</span>'
+        : '<span style="color:#f87171; font-weight:700;">✗ Bear Market (SPY &lt; 200 SMA)</span>';
+
+      let qqqText = '<span style="color:#94a3b8;">Market Baseline</span>';
+      if (ti.qqq_pullback) qqqText = '<span style="color:#fbbf24; font-weight:700;">Pullback Divergence (+0.238 R)</span>';
+      else if (ti.qqq_bull_stack) qqqText = '<span style="color:#38bdf8; font-weight:700;">Bull Stack (+0.108 R)</span>';
+      document.getElementById('dos_strat_qqq_status').innerHTML = qqqText;
+
+      document.getElementById('dos_strat_tech_status').innerHTML = ti.qqq_spy_ratio_bull
+        ? '<span style="color:#38bdf8; font-weight:700;">✓ Tech Leading ((QQQ/SPY) Bull)</span>'
+        : '<span style="color:#94a3b8;">Tech Lagging / Neutral</span>';
+
+      document.getElementById('dos_strat_macro_status').innerHTML = ti.is_leading_macro
+        ? '<span style="color:#10b981; font-weight:700;">✓ Leading Sector/Theme (Score ≥ 65)</span>'
+        : '<span style="color:#94a3b8;">Standard Universe</span>';
+    } else {
+      stratCard.style.display = 'none';
+    }
+  }
 
   // Sector & Theme Momentum Backdrop
   if (st) {
@@ -2927,6 +3725,8 @@ function clearDossier() {
   if (document.getElementById('dos_stage2')) document.getElementById('dos_stage2').textContent = '--';
   if (document.getElementById('dos_dist_52w')) document.getElementById('dos_dist_52w').textContent = '--';
   if (document.getElementById('dos_rs_posture_status')) document.getElementById('dos_rs_posture_status').textContent = '--';
+  const stratCard = document.getElementById('card_strategy_trade');
+  if (stratCard) stratCard.style.display = 'none';
 }
 
 // Filter Actions

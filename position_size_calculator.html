@@ -1,0 +1,444 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Position Size & Risk Calculator</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    :root {
+      --background: #0b0f19;
+      --card: #111827;
+      --border: #1f2937;
+      --foreground: #f9fafb;
+      --muted-foreground: #9ca3af;
+    }
+  </style>
+</head>
+<body class="bg-[#0b0f19] text-[#f9fafb] min-h-screen p-4 sm:p-8 flex items-center justify-center font-sans antialiased">
+  <div class="w-full max-w-2xl bg-[#111827] border border-[#1f2937] rounded-2xl shadow-2xl overflow-hidden">
+    
+    <!-- Header -->
+    <div class="px-6 py-5 border-b border-[#1f2937] flex items-center justify-between bg-[#111827]/80">
+      <div class="flex items-center space-x-3">
+        <div class="w-10 h-10 rounded-xl bg-blue-600/20 border border-blue-500/30 flex items-center justify-center text-blue-400 font-bold text-lg">
+          📐
+        </div>
+        <div>
+          <h1 class="text-lg font-bold text-white tracking-tight">Position Size Calculator</h1>
+          <p class="text-xs text-gray-400">Fixed-risk share sizing & execution ladder</p>
+        </div>
+      </div>
+      <div id="directionBadge" class="px-3 py-1 rounded-full text-xs font-semibold uppercase tracking-wider bg-emerald-500/15 text-emerald-400 border border-emerald-500/30">
+        LONG
+      </div>
+    </div>
+
+    <div class="p-6 space-y-6">
+      
+      <!-- Primary Input Form -->
+      <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+        <!-- Entry Price -->
+        <div class="space-y-1.5">
+          <label class="block text-xs font-medium text-gray-400 uppercase tracking-wider">
+            Entry Price ($)
+          </label>
+          <div class="relative">
+            <span class="absolute inset-y-0 left-0 pl-3 flex items-center text-gray-400 text-sm font-semibold">$</span>
+            <input 
+              type="number" 
+              id="entryPrice" 
+              step="any" 
+              value="100.00" 
+              placeholder="0.00"
+              class="w-full pl-8 pr-3 py-2.5 bg-[#0b0f19] border border-[#1f2937] rounded-xl text-sm font-semibold text-white focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all shadow-inner"
+            >
+          </div>
+        </div>
+
+        <!-- Stop Loss -->
+        <div class="space-y-1.5">
+          <label class="block text-xs font-medium text-gray-400 uppercase tracking-wider">
+            Stop Loss ($)
+          </label>
+          <div class="relative">
+            <span class="absolute inset-y-0 left-0 pl-3 flex items-center text-gray-400 text-sm font-semibold">$</span>
+            <input 
+              type="number" 
+              id="stopLoss" 
+              step="any" 
+              value="95.00" 
+              placeholder="0.00"
+              class="w-full pl-8 pr-3 py-2.5 bg-[#0b0f19] border border-[#1f2937] rounded-xl text-sm font-semibold text-white focus:outline-none focus:ring-2 focus:ring-rose-500 focus:border-transparent transition-all shadow-inner"
+            >
+          </div>
+        </div>
+
+        <!-- Max $ Loss -->
+        <div class="space-y-1.5">
+          <label class="block text-xs font-medium text-gray-400 uppercase tracking-wider">
+            Max $ Loss (Risk)
+          </label>
+          <div class="relative">
+            <span class="absolute inset-y-0 left-0 pl-3 flex items-center text-gray-400 text-sm font-semibold">$</span>
+            <input 
+              type="number" 
+              id="maxLoss" 
+              step="any" 
+              value="500" 
+              placeholder="500"
+              class="w-full pl-8 pr-3 py-2.5 bg-[#0b0f19] border border-[#1f2937] rounded-xl text-sm font-semibold text-white focus:outline-none focus:ring-2 focus:ring-amber-500 focus:border-transparent transition-all shadow-inner"
+            >
+          </div>
+        </div>
+      </div>
+
+      <!-- Quick Risk Presets & Account Calculator Toggle -->
+      <div class="flex flex-wrap items-center justify-between gap-2 pt-1 border-t border-[#1f2937]">
+        <div class="flex items-center space-x-1.5 text-xs text-gray-400">
+          <span>Quick Risk:</span>
+          <button type="button" onclick="setRisk(250)" class="px-2.5 py-1 rounded-lg bg-[#0b0f19] border border-[#1f2937] hover:bg-gray-800 text-gray-200 font-mono transition-colors">$250</button>
+          <button type="button" onclick="setRisk(500)" class="px-2.5 py-1 rounded-lg bg-[#0b0f19] border border-[#1f2937] hover:bg-gray-800 text-gray-200 font-mono transition-colors">$500</button>
+          <button type="button" onclick="setRisk(1000)" class="px-2.5 py-1 rounded-lg bg-[#0b0f19] border border-[#1f2937] hover:bg-gray-800 text-gray-200 font-mono transition-colors">$1k</button>
+          <button type="button" onclick="setRisk(2000)" class="px-2.5 py-1 rounded-lg bg-[#0b0f19] border border-[#1f2937] hover:bg-gray-800 text-gray-200 font-mono transition-colors">$2k</button>
+        </div>
+
+        <button 
+          type="button" 
+          id="toggleAcctBtn" 
+          onclick="toggleAccountHelper()" 
+          class="text-xs text-blue-400 hover:text-blue-300 font-medium flex items-center space-x-1 underline decoration-dotted"
+        >
+          <span>Calculate from % Account Risk</span>
+        </button>
+      </div>
+
+      <!-- Optional Account Size Calculator Drawer -->
+      <div id="accountDrawer" class="hidden p-4 rounded-xl bg-[#0b0f19] border border-[#1f2937] space-y-3 transition-all">
+        <div class="flex items-center justify-between">
+          <span class="text-xs font-semibold text-gray-300 uppercase tracking-wider">Account Risk Sizing Helper</span>
+          <span class="text-xs text-gray-400">Max Loss = Account Size × Risk %</span>
+        </div>
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <div>
+            <label class="block text-xs text-gray-400 mb-1">Account Portfolio Value ($)</label>
+            <input 
+              type="number" 
+              id="accountSize" 
+              value="50000" 
+              step="any"
+              class="w-full px-3 py-1.5 bg-[#111827] border border-[#1f2937] rounded-lg text-sm font-semibold text-white"
+              oninput="calcAccountRisk()"
+            >
+          </div>
+          <div>
+            <label class="block text-xs text-gray-400 mb-1">Risk Percentage (%)</label>
+            <div class="flex space-x-1.5">
+              <input 
+                type="number" 
+                id="accountRiskPct" 
+                value="1.0" 
+                step="0.1" 
+                class="w-full px-3 py-1.5 bg-[#111827] border border-[#1f2937] rounded-lg text-sm font-semibold text-white"
+                oninput="calcAccountRisk()"
+              >
+              <button type="button" onclick="setAccountPct(0.5)" class="px-2 py-1 text-xs bg-[#111827] border border-[#1f2937] rounded-lg hover:bg-gray-800 text-gray-300">0.5%</button>
+              <button type="button" onclick="setAccountPct(1.0)" class="px-2 py-1 text-xs bg-[#111827] border border-[#1f2937] rounded-lg hover:bg-gray-800 text-gray-300">1.0%</button>
+              <button type="button" onclick="setAccountPct(2.0)" class="px-2 py-1 text-xs bg-[#111827] border border-[#1f2937] rounded-lg hover:bg-gray-800 text-gray-300">2.0%</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Hero Output Card -->
+      <div id="resultCard" class="p-5 rounded-2xl bg-gradient-to-br from-blue-600/15 via-[#111827] to-emerald-600/15 border border-blue-500/40 shadow-xl relative overflow-hidden">
+        <div class="flex flex-col sm:flex-row sm:items-end justify-between gap-4">
+          <div>
+            <span class="text-xs uppercase font-bold tracking-widest text-blue-400">Position Size Allowed</span>
+            <div class="flex items-baseline space-x-3 mt-1">
+              <span id="sharesDisplay" class="text-4xl sm:text-5xl font-extrabold tracking-tight text-white font-mono">100</span>
+              <span class="text-lg font-bold text-gray-400">shares</span>
+            </div>
+          </div>
+
+          <div class="sm:text-right">
+            <span class="text-xs uppercase font-medium text-gray-400">Total Capital Required</span>
+            <div id="positionCostDisplay" class="text-xl sm:text-2xl font-bold font-mono text-white mt-0.5">$10,000.00</div>
+          </div>
+        </div>
+
+        <!-- Metrics Grid -->
+        <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 mt-5 pt-4 border-t border-gray-800 text-xs">
+          <div class="bg-[#0b0f19]/70 p-2.5 rounded-xl border border-gray-800">
+            <span class="text-gray-400 block">Risk / Share</span>
+            <span id="riskPerShareDisplay" class="font-bold font-mono text-white text-sm block mt-0.5">$5.00</span>
+            <span id="riskPctDisplay" class="text-[11px] text-rose-400 font-medium">5.00% stop</span>
+          </div>
+
+          <div class="bg-[#0b0f19]/70 p-2.5 rounded-xl border border-gray-800">
+            <span class="text-gray-400 block">Actual Dollar Risk</span>
+            <span id="actualLossDisplay" class="font-bold font-mono text-rose-400 text-sm block mt-0.5">$500.00</span>
+            <span id="budgetUtilizationDisplay" class="text-[11px] text-gray-400 font-medium">100% of budget</span>
+          </div>
+
+          <div class="bg-[#0b0f19]/70 p-2.5 rounded-xl border border-gray-800">
+            <span class="text-gray-400 block">Direction</span>
+            <span id="directionDisplay" class="font-bold text-emerald-400 text-sm block mt-0.5">LONG</span>
+            <span id="spreadDisplay" class="text-[11px] text-gray-400 font-medium">$5.00 distance</span>
+          </div>
+
+          <div class="bg-[#0b0f19]/70 p-2.5 rounded-xl border border-gray-800">
+            <span class="text-gray-400 block">Break-even</span>
+            <span id="breakevenDisplay" class="font-bold font-mono text-white text-sm block mt-0.5">$100.00</span>
+            <span class="text-[11px] text-gray-400 font-medium">Excl. commission</span>
+          </div>
+        </div>
+
+        <!-- Notification Banner / Warnings -->
+        <div id="alertBanner" class="hidden mt-4 p-3 rounded-xl text-xs font-medium"></div>
+      </div>
+
+      <!-- Target R-Multiples Ladder -->
+      <div class="space-y-2.5">
+        <div class="flex items-center justify-between">
+          <span class="text-xs font-bold uppercase tracking-wider text-gray-400">Profit Targets (R-Multiples)</span>
+          <span class="text-[11px] text-gray-400">Based on actual shares risked</span>
+        </div>
+
+        <div class="grid grid-cols-2 sm:grid-cols-4 gap-2.5 text-xs font-mono">
+          <!-- 1R -->
+          <div class="p-2.5 rounded-xl bg-[#0b0f19] border border-[#1f2937] flex flex-col justify-between">
+            <div class="flex items-center justify-between text-gray-400 mb-1">
+              <span class="font-semibold text-emerald-400">1.0 R</span>
+              <span id="r1Gain" class="text-emerald-400 font-medium">+$500</span>
+            </div>
+            <div id="r1Price" class="font-bold text-sm text-white">$105.00</div>
+          </div>
+
+          <!-- 2R -->
+          <div class="p-2.5 rounded-xl bg-[#0b0f19] border border-[#1f2937] flex flex-col justify-between">
+            <div class="flex items-center justify-between text-gray-400 mb-1">
+              <span class="font-semibold text-emerald-400">2.0 R</span>
+              <span id="r2Gain" class="text-emerald-400 font-medium">+$1,000</span>
+            </div>
+            <div id="r2Price" class="font-bold text-sm text-white">$110.00</div>
+          </div>
+
+          <!-- 3R -->
+          <div class="p-2.5 rounded-xl bg-[#0b0f19] border border-[#1f2937] flex flex-col justify-between">
+            <div class="flex items-center justify-between text-gray-400 mb-1">
+              <span class="font-semibold text-blue-400">3.0 R</span>
+              <span id="r3Gain" class="text-blue-400 font-medium">+$1,500</span>
+            </div>
+            <div id="r3Price" class="font-bold text-sm text-white">$115.00</div>
+          </div>
+
+          <!-- 5R -->
+          <div class="p-2.5 rounded-xl bg-[#0b0f19] border border-[#1f2937] flex flex-col justify-between">
+            <div class="flex items-center justify-between text-gray-400 mb-1">
+              <span class="font-semibold text-purple-400">5.0 R</span>
+              <span id="r5Gain" class="text-purple-400 font-medium">+$2,500</span>
+            </div>
+            <div id="r5Price" class="font-bold text-sm text-white">$125.00</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Copy Order String Bar -->
+      <div class="flex items-center justify-between p-3 rounded-xl bg-[#0b0f19] border border-[#1f2937] text-xs">
+        <div class="truncate mr-3 font-mono text-gray-400" id="orderStringDisplay">
+          BUY 100 @ 100.00 | STOP 95.00 | RISK $500.00
+        </div>
+        <button 
+          type="button" 
+          id="copyBtn" 
+          onclick="copyOrderString()" 
+          class="shrink-0 px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-white font-semibold transition-all shadow-sm flex items-center space-x-1.5"
+        >
+          <span id="copyBtnText">Copy Order</span>
+        </button>
+      </div>
+
+    </div>
+  </div>
+
+  <script>
+    const entryEl = document.getElementById('entryPrice');
+    const stopEl = document.getElementById('stopLoss');
+    const maxLossEl = document.getElementById('maxLoss');
+    const directionBadge = document.getElementById('directionBadge');
+
+    const sharesDisplay = document.getElementById('sharesDisplay');
+    const positionCostDisplay = document.getElementById('positionCostDisplay');
+    const riskPerShareDisplay = document.getElementById('riskPerShareDisplay');
+    const riskPctDisplay = document.getElementById('riskPctDisplay');
+    const actualLossDisplay = document.getElementById('actualLossDisplay');
+    const budgetUtilizationDisplay = document.getElementById('budgetUtilizationDisplay');
+    const directionDisplay = document.getElementById('directionDisplay');
+    const spreadDisplay = document.getElementById('spreadDisplay');
+    const breakevenDisplay = document.getElementById('breakevenDisplay');
+    const alertBanner = document.getElementById('alertBanner');
+    const orderStringDisplay = document.getElementById('orderStringDisplay');
+
+    const r1Price = document.getElementById('r1Price');
+    const r1Gain = document.getElementById('r1Gain');
+    const r2Price = document.getElementById('r2Price');
+    const r2Gain = document.getElementById('r2Gain');
+    const r3Price = document.getElementById('r3Price');
+    const r3Gain = document.getElementById('r3Gain');
+    const r5Price = document.getElementById('r5Price');
+    const r5Gain = document.getElementById('r5Gain');
+
+    function fmtMoney(n) {
+      if (isNaN(n) || !isFinite(n)) return '$0.00';
+      return '$' + Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    }
+
+    function calculate() {
+      const entry = parseFloat(entryEl.value);
+      const stop = parseFloat(stopEl.value);
+      const maxLoss = parseFloat(maxLossEl.value);
+
+      alertBanner.classList.add('hidden');
+      alertBanner.className = 'hidden mt-4 p-3 rounded-xl text-xs font-medium';
+
+      if (isNaN(entry) || entry <= 0) {
+        showError('Please enter a valid positive entry price.');
+        return;
+      }
+      if (isNaN(stop) || stop <= 0) {
+        showError('Please enter a valid positive stop loss price.');
+        return;
+      }
+      if (isNaN(maxLoss) || maxLoss <= 0) {
+        showError('Please enter a valid max dollar loss amount.');
+        return;
+      }
+
+      if (entry === stop) {
+        showError('Entry price and Stop Loss cannot be identical ($0 risk per share).');
+        sharesDisplay.innerText = '0';
+        return;
+      }
+
+      const isLong = entry > stop;
+      const riskPerShare = Math.abs(entry - stop);
+      const riskPct = (riskPerShare / entry) * 100;
+
+      // Update direction badges
+      if (isLong) {
+        directionBadge.innerText = 'LONG';
+        directionBadge.className = 'px-3 py-1 rounded-full text-xs font-semibold uppercase tracking-wider bg-emerald-500/15 text-emerald-400 border border-emerald-500/30';
+        directionDisplay.innerText = 'LONG';
+        directionDisplay.className = 'font-bold text-emerald-400 text-sm block mt-0.5';
+      } else {
+        directionBadge.innerText = 'SHORT';
+        directionBadge.className = 'px-3 py-1 rounded-full text-xs font-semibold uppercase tracking-wider bg-rose-500/15 text-rose-400 border border-rose-500/30';
+        directionDisplay.innerText = 'SHORT';
+        directionDisplay.className = 'font-bold text-rose-400 text-sm block mt-0.5';
+      }
+
+      // Calculate shares allowed (floor to stay strictly under or equal to max risk)
+      const allowedShares = Math.floor(maxLoss / riskPerShare);
+      const totalPositionValue = allowedShares * entry;
+      const actualLoss = allowedShares * riskPerShare;
+      const budgetPct = (actualLoss / maxLoss) * 100;
+
+      // Update primary displays
+      sharesDisplay.innerText = allowedShares.toLocaleString('en-US');
+      positionCostDisplay.innerText = fmtMoney(totalPositionValue);
+      riskPerShareDisplay.innerText = fmtMoney(riskPerShare);
+      riskPctDisplay.innerText = riskPct.toFixed(2) + '% of entry';
+      actualLossDisplay.innerText = fmtMoney(actualLoss);
+      budgetUtilizationDisplay.innerText = budgetPct.toFixed(1) + '% budget used';
+      spreadDisplay.innerText = fmtMoney(riskPerShare) + ' stop distance';
+      breakevenDisplay.innerText = fmtMoney(entry);
+
+      if (allowedShares === 0) {
+        showWarning(`Per-share risk of ${fmtMoney(riskPerShare)} exceeds your total risk budget of ${fmtMoney(maxLoss)}. Increase max loss or tighten stop.`);
+      }
+
+      // R-multiples ladder
+      const mult = isLong ? 1 : -1;
+      const target1R = entry + (1 * riskPerShare * mult);
+      const target2R = entry + (2 * riskPerShare * mult);
+      const target3R = entry + (3 * riskPerShare * mult);
+      const target5R = entry + (5 * riskPerShare * mult);
+
+      r1Price.innerText = fmtMoney(target1R);
+      r1Gain.innerText = '+' + fmtMoney(1 * actualLoss);
+
+      r2Price.innerText = fmtMoney(target2R);
+      r2Gain.innerText = '+' + fmtMoney(2 * actualLoss);
+
+      r3Price.innerText = fmtMoney(target3R);
+      r3Gain.innerText = '+' + fmtMoney(3 * actualLoss);
+
+      r5Price.innerText = fmtMoney(target5R);
+      r5Gain.innerText = '+' + fmtMoney(5 * actualLoss);
+
+      // Order snippet string
+      const side = isLong ? 'BUY' : 'SELL SHORT';
+      orderStringDisplay.innerText = `${side} ${allowedShares.toLocaleString()} @ ${entry.toFixed(2)} | STOP ${stop.toFixed(2)} | RISK ${fmtMoney(actualLoss)}`;
+    }
+
+    function showError(msg) {
+      alertBanner.innerText = msg;
+      alertBanner.className = 'mt-4 p-3 rounded-xl text-xs font-semibold bg-rose-500/15 text-rose-400 border border-rose-500/30';
+      alertBanner.classList.remove('hidden');
+      sharesDisplay.innerText = '0';
+      positionCostDisplay.innerText = '$0.00';
+    }
+
+    function showWarning(msg) {
+      alertBanner.innerText = msg;
+      alertBanner.className = 'mt-4 p-3 rounded-xl text-xs font-semibold bg-amber-500/15 text-amber-400 border border-amber-500/30';
+      alertBanner.classList.remove('hidden');
+    }
+
+    function setRisk(val) {
+      maxLossEl.value = val;
+      calculate();
+    }
+
+    function toggleAccountHelper() {
+      const drawer = document.getElementById('accountDrawer');
+      drawer.classList.toggle('hidden');
+    }
+
+    function setAccountPct(pct) {
+      document.getElementById('accountRiskPct').value = pct;
+      calcAccountRisk();
+    }
+
+    function calcAccountRisk() {
+      const acct = parseFloat(document.getElementById('accountSize').value) || 0;
+      const pct = parseFloat(document.getElementById('accountRiskPct').value) || 0;
+      if (acct > 0 && pct > 0) {
+        const computedLoss = (acct * pct) / 100;
+        maxLossEl.value = Math.round(computedLoss * 100) / 100;
+        calculate();
+      }
+    }
+
+    function copyOrderString() {
+      const text = orderStringDisplay.innerText;
+      navigator.clipboard.writeText(text).then(() => {
+        const btnText = document.getElementById('copyBtnText');
+        btnText.innerText = 'Copied! ✓';
+        setTimeout(() => {
+          btnText.innerText = 'Copy Order';
+        }, 2000);
+      });
+    }
+
+    // Attach listeners
+    [entryEl, stopEl, maxLossEl].forEach(input => {
+      input.addEventListener('input', calculate);
+    });
+
+    // Run initial calculation
+    calculate();
+  </script>
+</body>
+</html>

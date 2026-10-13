@@ -47,8 +47,8 @@ Price                                                High Resistance Level (Pole
 ```
 
 ### 2.1 The Momentum Pole
-1. **Minimum Move:** $\ge +30\%$ price advance from swing low to swing high (`QMB_MIN_MOVE = 30.0`).
-2. **Maximum Lookback:** Completed within 50 trading days (`QMB_MOVE_MAX_BARS = 50`).
+1. **Minimum Move:** $\ge +15\%$ price advance from swing low to swing high (`QMB_MIN_MOVE = 15.0`). Accommodates institutional large-cap leaders (e.g. GOOG, MSFT, AAPL) where 15–25% represents a massive 7–10× ADR momentum pole, while UI and strategy filters isolate $\ge +30\%$, $\ge +40\%$, or $\ge +50\%$ moves on higher-beta momentum names.
+2. **Maximum Lookback:** Completed within 35 trading days (`QMB_MOVE_MAX_BARS = 35`).
 3. **Institutional Urgency:** Characterized by steep slope, expansion volume, and sequential above-average true range (ATR) expansions.
 
 ### 2.2 The Consolidation Base

@@ -44,18 +44,40 @@ def _load_calendar_cache():
         except Exception:
             trading_days = []
 
-    # If SPY bars are missing, generate synthetic business days from 2015 to 2030
-    if not trading_days:
-        from pandas.tseries.holiday import USFederalHolidayCalendar, GoodFriday
-        b_days = pd.bdate_range(start="2015-01-01", end="2030-12-31")
-        cal = USFederalHolidayCalendar()
-        holidays = cal.holidays(start="2015-01-01", end="2030-12-31")
-        # Add Good Friday
-        gf = GoodFriday.holidays(GoodFriday(), start="2015-01-01", end="2030-12-31")
-        all_holidays = set(holidays.union(gf))
-        trading_days = [d for d in b_days if d not in all_holidays]
+    # Supplement / extend trading days with official US equity exchange calendar up to 2035
+    from pandas.tseries.holiday import (
+        AbstractHolidayCalendar, Holiday, nearest_workday,
+        USMartinLutherKingJr, USPresidentsDay, USMemorialDay,
+        USLaborDay, USThanksgivingDay, GoodFriday
+    )
 
-    td_series = pd.Series(trading_days)
+    class USTradingCalendar(AbstractHolidayCalendar):
+        rules = [
+            Holiday('New Years Day', month=1, day=1, observance=nearest_workday),
+            USMartinLutherKingJr,
+            USPresidentsDay,
+            GoodFriday,
+            USMemorialDay,
+            Holiday('Juneteenth', month=6, day=19, start_date='2022-01-01', observance=nearest_workday),
+            Holiday('July 4th', month=7, day=4, observance=nearest_workday),
+            USLaborDay,
+            USThanksgivingDay,
+            Holiday('Christmas', month=12, day=25, observance=nearest_workday),
+        ]
+
+    cal = USTradingCalendar()
+    start_date = "2015-01-01"
+    if trading_days:
+        last_spy_dt = trading_days[-1]
+        start_date = (last_spy_dt + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+
+    b_days = pd.bdate_range(start=start_date, end="2035-12-31")
+    holidays = cal.holidays(start=start_date, end="2035-12-31")
+    holidays_set = set(holidays)
+    future_trading_days = [d for d in b_days if d not in holidays_set]
+    trading_days.extend(future_trading_days)
+
+    td_series = pd.Series(trading_days).drop_duplicates().sort_values()
     _TRADING_DAYS_SET = set(td_series.dt.strftime("%Y-%m-%d"))
 
     # Month-ends and quarter-ends
@@ -108,6 +130,13 @@ def _to_str(dt: str | datetime.date | pd.Timestamp) -> str:
     if isinstance(dt, (datetime.date, pd.Timestamp)):
         return dt.strftime("%Y-%m-%d")
     return str(dt)[:10]
+
+
+def is_trading_day(dt: str | datetime.date | pd.Timestamp) -> bool:
+    """Returns True if the date is an exchange trading day (present in _TRADING_DAYS_SET)."""
+    _load_calendar_cache()
+    assert _TRADING_DAYS_SET is not None
+    return _to_str(dt) in _TRADING_DAYS_SET
 
 
 def is_monthly_opex(dt: str | datetime.date | pd.Timestamp) -> bool:

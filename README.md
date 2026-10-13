@@ -18,6 +18,12 @@ Run all commands using the local `.venv` environment:
 # 3. QM Momentum Continuation & EP Catalyst Explorer (Pure Setup Viewer)
 .venv/bin/python serve_qm.py          # QM Viewer → http://127.0.0.1:8785
 
+# 4. Relative Strength (RS) Universe Explorer
+.venv/bin/python serve_rs.py          # RS Viewer → http://127.0.0.1:8786
+
+# 5. Optimized EP Strategy Explorer (Institutional Winning Filters & Dynamic MA Exits)
+.venv/bin/python serve_optimized_ep.py # Optimized Strategy App → http://127.0.0.1:8787
+
 # Optional: Recompute Historical QM Setups & EP Cross-References
 .venv/bin/python mine_qm_setups.py    # Mines data/bars/*.parquet → data/simulations/qm_historical_setups.parquet
 ```

@@ -15,6 +15,7 @@ import pandas as pd
 
 import setups
 import indicators
+import config
 from mine_qm_setups import _match_eps_for_setup
 import serve_qm
 
@@ -435,6 +436,126 @@ class TestQMViewer(unittest.TestCase):
         self.assertIn("dos_stage2", html)
         self.assertIn("dos_dist_52w", html)
         self.assertIn("dos_rs_posture_status", html)
+
+    def test_qm_breakout_strategy_mode_and_trade_info(self):
+        """Verifies Institutional QM Breakout Strategy filtering, dynamic trade KPIs, and trade characteristics payload."""
+        client = serve_qm.app.test_client()
+
+        # 1. Verify /api/events with strategy_mode=1
+        res = client.get("/api/events?strategy_mode=1")
+        self.assertEqual(res.status_code, 200)
+        data = res.get_json()
+        self.assertTrue(data.get("strategy_mode"))
+        kpis = data.get("strategy_kpis")
+        self.assertIsNotNone(kpis, "Missing strategy_kpis payload")
+        self.assertGreater(kpis.get("total_trades", 0), 0)
+        self.assertIn("win_rate", kpis)
+        self.assertIn("profit_factor", kpis)
+        self.assertIn("expectancy_r", kpis)
+        self.assertIn("total_r", kpis)
+        self.assertIn("sized_total_r", kpis)
+        self.assertIn("avg_win_r", kpis)
+        self.assertIn("avg_loss_r", kpis)
+        self.assertIn("win_loss_ratio", kpis)
+        self.assertIn("max_win_r", kpis)
+        self.assertIn("max_loss_r", kpis)
+        self.assertIn("avg_bars", kpis)
+
+        # All events returned in strategy mode must be breakouts
+        events = data.get("events", [])
+        self.assertGreater(len(events), 0)
+        for ev in events[:30]:
+            self.assertEqual(ev.get("state"), "breakout")
+
+        # 2. Verify specific strategy filter configuration: Leading macro + SPY 200 SMA + 0.6x Stop + Dynamic Sizing
+        res_lead = client.get("/api/events?strategy_mode=1&strat_macro=leading&strat_spy=spy200&strat_stop=06x&strat_sizing=dynamic&strat_rs=rs90_lead")
+        self.assertEqual(res_lead.status_code, 200)
+        lead_data = res_lead.get_json()
+        lead_kpis = lead_data.get("strategy_kpis")
+        self.assertIsNotNone(lead_kpis)
+        self.assertGreaterEqual(lead_kpis["total_trades"], 100)
+        self.assertGreater(lead_kpis["expectancy_r"], 0.0)
+        self.assertGreater(lead_kpis["profit_factor"], 1.0)
+        self.assertGreater(lead_kpis["sized_total_r"], 0.0)
+
+        # 3. Verify /api/chart returns trade_info object for breakout setups
+        sample_ev = events[0]
+        sym = sample_ev["symbol"]
+        dt = sample_ev["date"]
+        res_chart = client.get(f"/api/chart?symbol={sym}&date={dt}")
+        self.assertEqual(res_chart.status_code, 200)
+        d_chart = res_chart.get_json()
+        setup = d_chart.get("setup", {})
+        self.assertIn("trade_info", setup, f"Setup for {sym} {dt} missing trade_info")
+        ti = setup["trade_info"]
+        self.assertIn("entry_price", ti)
+        self.assertIn("stop_loss_06x", ti)
+        self.assertIn("risk_pct_06x", ti)
+        self.assertIn("r_06x", ti)
+        self.assertIn("sized_r_06x", ti)
+        self.assertIn("pos_size_mult", ti)
+        self.assertIn("s_ep", ti)
+        self.assertIn("s_pole", ti)
+        self.assertIn("s_rvol", ti)
+        self.assertIn("s_pb", ti)
+        self.assertIn("exit_date_06x", ti)
+        self.assertIn("exit_price_06x", ti)
+        self.assertIn("exit_reason_06x", ti)
+        self.assertIn("spy_above_200sma", ti)
+        self.assertIn("qqq_bull_stack", ti)
+        self.assertIn("qqq_pullback", ti)
+
+        # 4. Verify UI Elements in index HTML
+        res_idx = client.get("/")
+        self.assertEqual(res_idx.status_code, 200)
+        html = res_idx.data.decode("utf-8")
+        self.assertIn("btn_strategy_toggle", html)
+        self.assertIn("btn_strategy_settings", html)
+        self.assertIn("strategy_kpi_bar", html)
+        self.assertIn("strategy_settings_modal", html)
+        self.assertIn("card_strategy_trade", html)
+        self.assertIn("dos_strat_entry", html)
+        self.assertIn("dos_strat_stop", html)
+        self.assertIn("dos_strat_r", html)
+        self.assertIn("dos_strat_sized_r", html)
+        self.assertIn("dos_strat_s_ep", html)
+        self.assertIn("dos_strat_s_pole", html)
+        self.assertIn("dos_strat_s_rvol", html)
+        self.assertIn("dos_strat_s_pb", html)
+        self.assertIn("toggleStrategyMode()", html)
+        self.assertIn("openStrategySettingsModal()", html)
+        self.assertIn("applyStrategySettings()", html)
+        self.assertIn("updateStrategyKPIs", html)
+
+    def test_large_cap_momentum_setups_and_symbol_search_regression(self):
+        """Verifies institutional large-cap momentum setups (15-25% poles), 3-7 bars cons, and symbol search RS bypass."""
+        import mine_qm_setups
+
+        # 1. Verify QMB config: min_move 15%, 3-month pole duration (63 bars), and 3-bar min consolidation
+        self.assertEqual(config.QMB_MIN_MOVE, 15.0)
+        self.assertEqual(config.QMB_MOVE_MAX_BARS, 63)
+        self.assertEqual(config.QMB_CONS_MIN, 3)
+
+        # 2. Verify GOOGL scans multiple historical setups across 2016-2026
+        googl_setups = mine_qm_setups.scan_single_symbol("GOOGL")
+        self.assertGreaterEqual(len(googl_setups), 40, "GOOGL should yield >=40 historical setups with 3-7 bars and 3-mo pole")
+        bo_setups = [s for s in googl_setups if s["state"] == "breakout"]
+        self.assertGreaterEqual(len(bo_setups), 10, "GOOGL should yield >=10 historical breakout episodes")
+        short_cons = [s for s in googl_setups if 3 <= s["cons_bars"] <= 7]
+        self.assertGreaterEqual(len(short_cons), 15, "GOOGL should yield >=15 short 3-7 bar consolidations")
+
+        # 3. Verify /api/events with search=GOOGL and cons_bars=3-7
+        client = serve_qm.app.test_client()
+
+        res_events = client.get("/api/events?cons_bars=3-7")
+        self.assertEqual(res_events.status_code, 200)
+
+        # Check UI template has min_move 15% option and cons_bars 3-7 option
+        res_idx = client.get("/")
+        html = res_idx.data.decode("utf-8")
+        self.assertIn('value="15"', html)
+        self.assertIn('value="20"', html)
+        self.assertIn('value="3-7"', html)
 
 
 if __name__ == "__main__":

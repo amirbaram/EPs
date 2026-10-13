@@ -181,6 +181,10 @@ def scan_single_symbol(sym: str) -> List[Dict[str, Any]]:
         df = indicators.add_indicators(df)
         highs = df["high"].to_numpy(float)
         lows = df["low"].to_numpy(float)
+        closes = df["close"].to_numpy(float)
+        e10 = df["ema10"].to_numpy(float)
+        e20 = df["ema20"].to_numpy(float)
+        s50 = df["sma50"].to_numpy(float)
         n = len(highs)
         W = setups.config.QMB_MOVE_LOOKBACK + setups.config.QMB_CONS_MAX
         min_bars = W + 30
@@ -203,6 +207,14 @@ def scan_single_symbol(sym: str) -> List[Dict[str, Any]]:
                 continue
             cons_low = float(np.min(lows[hi_pos : i + 1]))
             if (1.0 - cons_low / highs[hi_pos]) * 100.0 > setups.config.QMB_MAX_PULLBACK:
+                continue
+
+            # Fast surf pre-filter in numpy: reject 50-SMA floor breaches or non-rising trends immediately
+            c_s = closes[hi_pos + 1 : i + 1]
+            s50_s = s50[hi_pos + 1 : i + 1]
+            if np.any(c_s < s50_s):
+                continue
+            if not (e10[i] > e20[i] and s50[i] > s50[hi_pos + 1]):
                 continue
 
             res = setups.detect_qm_breakout(df.iloc[: i + 1])
@@ -361,11 +373,8 @@ def main() -> None:
     print(f"Total symbols to scan: {len(sym_list)} using {args.workers} workers (streaming to disk)...")
     t0 = time.time()
 
-    temp_dir = Path("data/simulations/_qm_parts")
+    temp_dir = Path(f"data/simulations/_qm_parts_{os.getpid()}")
     temp_dir.mkdir(parents=True, exist_ok=True)
-    # Clean previous temporary parts if any
-    for old_f in temp_dir.glob("part_*.parquet"):
-        old_f.unlink(missing_ok=True)
 
     processed = 0
     total = len(sym_list)
@@ -415,12 +424,8 @@ def main() -> None:
     print(f"Saved {len(res_df)} historical setups to {out_p}")
 
     # Clean up part files
-    for pf in part_files:
-        pf.unlink(missing_ok=True)
-    try:
-        temp_dir.rmdir()
-    except Exception:
-        pass
+    import shutil
+    shutil.rmtree(temp_dir, ignore_errors=True)
 
     # Summary statistics
     bks = (res_df["state"] == "breakout").sum()
