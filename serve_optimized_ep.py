@@ -55,19 +55,20 @@ _EXTREME_PEAK_MODEL = None
 
 
 def compute_watchlist_ev(it: Dict[str, Any]) -> float:
-    """Computes institutional Expected Value (EV in R-multiples) for active watchlist setups.
+    """Computes actionable institutional Forward Expected Value (EV in R-multiples).
+    
+    Prioritizes fresh high-quality setups (Days 1 to 5) with immense remaining expansion runway,
+    high Relative Strength (RS >= 90), Stage 2 leadership, and low ML climax exhaustion.
     
     Active Longs:
-      EV = (Unrealized R * Position Sizing Multiplier)
-         + Remaining Climax Runway Headroom (Low ML Exhaustion * Sizing Multiplier * 4.0)
-         + Institutional Quality Bonus (RS score / 100 + Stage 2 bonus + V2 Conviction bonus).
+      EV = (Freshness Boost [Days 1-5] + Early Traction Confirmation + RS Leadership Bonus
+           + Stage 2 Posture + V2 Conviction + Exhaustion Runway Headroom) * Sizing Multiplier.
+      Mature trades (> 5 days) experience a decay in forward remaining expectancy as initial edge
+      has already been captured.
     
     Coiling Setups:
-      EV = (P_win * Target R * Position Sizing Multiplier) - ((1 - P_win) * 0.50 R loss).
-      Where:
-        Target R is inversely proportional to stop risk % (massive asymmetry for tight invalidations).
-        P_win reflects Stage 2, RS leadership, pre-pivot base tightness, V2 conviction, and proximity to trigger.
-        0.50 R accounts for Delayed Breakout 0-risk order cancellations when price drops before breakout.
+      EV = Asymmetric Target R (based on tight stop loss risk %) * Win Probability * Size
+           + Quality Bonus + Immediacy Bonus (proximity to trigger <= 2%).
     """
     status = it.get("status")
     sug_mult = safe_float(it.get("suggested_size_mult", 1.0), 1.0)
@@ -76,28 +77,45 @@ def compute_watchlist_ev(it: Dict[str, Any]) -> float:
     v2_50 = safe_float(it.get("v2_conviction_50", 0.0), 0.0)
     
     if status == "Active Long":
+        days = int(it.get("days_in_trade", 1))
         unr_r = safe_float(it.get("unrealized_r", 0.0), 0.0)
         exh_prob = safe_float(it.get("current_high_exhaustion_prob", 0.1), 0.1)
         climax_th = safe_float(it.get("climax_threshold", 0.55), 0.55)
         headroom = max(0.0, climax_th - exh_prob)
         
-        curr_ev = unr_r * sug_mult
-        runway_ev = headroom * 4.0 * sug_mult
-        quality_bonus = (rs / 100.0) + (0.50 if stage2 else 0.0) + (v2_50 * 2.0)
-        return round(curr_ev + runway_ev + quality_bonus, 2)
+        # Freshness weighting: Days 1 to 5 are the primary impulse expansion sweet spot
+        if days <= 5:
+            freshness_boost = 3.5 - (days * 0.2)
+            traction_bonus = min(2.5, max(0.0, unr_r * 0.9))  # early proof that breakout is holding green
+        else:
+            freshness_boost = max(0.5, 2.5 - ((days - 5) * 0.15))
+            traction_bonus = min(1.0, max(0.0, unr_r * 0.15))  # diminish weight of already-banked gains
+            
+        rs_mult = (rs / 100.0) * 2.0
+        stage2_bonus = 1.0 if stage2 else 0.0
+        v2_bonus = v2_50 * 2.5
+        runway_ev = (headroom / climax_th) * 3.0
+        
+        forward_ev = (freshness_boost + traction_bonus + rs_mult + stage2_bonus + v2_bonus + runway_ev) * sug_mult
+        return round(forward_ev, 2)
     else:
         dist = safe_float(it.get("dist_to_trigger", 0.0), 0.0)
         stop_risk_pct = max(0.4, safe_float(it.get("dynamic_stop_loss_pct", 5.0), 5.0))
         tight = safe_float(it.get("pre_consol_tightness_20d", 20.0), 20.0)
         
-        target_r = min(12.0, max(2.0, 8.0 / stop_risk_pct))
-        p_win = 0.38 + (0.07 if stage2 else 0.0) + ((rs / 100.0) * 0.08) + (v2_50 * 0.20)
+        target_r = min(10.0, max(2.5, 8.0 / stop_risk_pct))
+        p_win = 0.40 + (0.08 if stage2 else 0.0) + ((rs / 100.0) * 0.10) + (v2_50 * 0.20)
         if tight <= 15.0:
             p_win += 0.05
-        if dist > 5.0:
-            p_win = max(0.15, p_win - (dist - 5.0) * 0.02)
+        if dist <= 2.0:
+            p_win += 0.08
+        elif dist <= 5.0:
+            p_win += 0.03
+        else:
+            p_win = max(0.15, p_win - (dist - 5.0) * 0.03)
             
-        ev = (p_win * target_r * sug_mult) - ((1.0 - p_win) * 0.50)
+        ev = (p_win * target_r * sug_mult) - ((1.0 - p_win) * 0.40)
+        ev += ((rs / 100.0) * 2.0) + (1.0 if stage2 else 0.0) + (2.5 if dist <= 2.0 else 0.5)
         return round(ev, 2)
 
 
@@ -2748,7 +2766,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         }
 
         const rsColor = it.rs_score >= 90 ? '#38bdf8' : (it.rs_score >= 80 ? '#22c55e' : '#94a3b8');
-        const archBadge = `<span class="badge-arch" style="font-size:9.5px; font-weight:600;">${it.archetype ? it.archetype.replace(/^[^\s]+\s*/, '') : 'Core'}</span>`;
+        const archBadge = `<span class="badge-arch" style="font-size:9.5px; font-weight:600;">${it.archetype ? it.archetype.replace(/^[^\\s]+[\\s]*/, '') : 'Core'}</span>`;
 
         const evVal = it.expected_value_r !== undefined ? it.expected_value_r : 0.0;
         const evColor = evVal >= 5.0 ? '#c084fc' : (evVal >= 2.0 ? '#38bdf8' : (evVal >= 0 ? '#22c55e' : '#ef4444'));
@@ -2799,7 +2817,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           opt.textContent = `${i + 1}. ${t.symbol} · ${statusShort} (${perf})${evStr} · RS:${t.rs_score}`;
         } else {
           const rSign = t.r_multiple >= 0 ? '+' : '';
-          const archClean = t.archetype ? t.archetype.replace(/^[^\s]+\s*/, '') : 'EP';
+          const archClean = t.archetype ? t.archetype.replace(/^[^\\s]+[\\s]*/, '') : 'EP';
           opt.textContent = `${i + 1}. ${t.symbol} · ${t.entry_date} (${rSign}${t.r_multiple.toFixed(2)}R) · ${archClean}`;
         }
         sel.appendChild(opt);
@@ -2893,7 +2911,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           statusBadge.style.display = 'inline-block';
         }
         if (archBadge) {
-          archBadge.textContent = tr.archetype ? tr.archetype.replace(/^[^\s]+\s*/, '') : 'Core';
+          archBadge.textContent = tr.archetype ? tr.archetype.replace(/^[^\\s]+[\\s]*/, '') : 'Core';
           archBadge.style.display = 'inline-block';
         }
         const fullMeta = `EP: ${tr.ep_date} · RS: ${tr.rs_score} · ${tr.sector || tr.theme || 'Tech'}`;
@@ -2907,7 +2925,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           statusBadge.style.display = 'inline-block';
         }
         if (archBadge) {
-          archBadge.textContent = tr.archetype ? tr.archetype.replace(/^[^\s]+\s*/, '') : 'Core';
+          archBadge.textContent = tr.archetype ? tr.archetype.replace(/^[^\\s]+[\\s]*/, '') : 'Core';
           archBadge.style.display = 'inline-block';
         }
         const fullMeta = `${tr.sector} · Entry: ${tr.entry_date} · Sizing: ${tr.v2_size_mult}x`;
