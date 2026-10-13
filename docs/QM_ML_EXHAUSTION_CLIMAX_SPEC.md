@@ -111,7 +111,7 @@ Price
 
 The other session should engineer a feature vector $X_t \in \mathbb{R}^{24}$ computed on each open trade bar $t \in [t_{\text{entry}} + 1, t_{\text{exit}}]$ to predict the probability that current bar high is within $\le 3$ bars of the trade's terminal peak.
 
-### 4.1 Group 1: Moving Average & ADR Stretch (Parabolic Extension)
+### 4.1 Group 1: Moving Average, ADR Stretch & RSI Momentum Extremes
 | Feature Name | Mathematical Formula | Institutional Rationale |
 |---|---|---|
 | `feat_dist_ema10_pct` | $(Close_t - \text{EMA}_{10,t}) / \text{EMA}_{10,t}$ | Measures short-term extension above primary momentum moving average. |
@@ -119,6 +119,17 @@ The other session should engineer a feature vector $X_t \in \mathbb{R}^{24}$ com
 | `feat_dist_sma50_pct` | $(Close_t - \text{SMA}_{50,t}) / \text{SMA}_{50,t}$ | Baseline trend extension. |
 | `feat_adr_multiple` | $(High_t - \text{EMA}_{20,t}) / \text{ADR}_{14,t}$ | How many daily ADRs price is stretched above 20 EMA. $> 4.0\times$ is climax danger. |
 | `feat_unrealized_r` | $(Close_t - Entry) / (Entry - Stop)$ | Current open R-multiple. Exhaustion model should only fire when $\ge +2.5\text{ R}$. |
+| `feat_rsi14` | $\text{RSI}(Close, 14)$ | Standard oscillator level. Values $\ge 80.0$ indicate intense buying pressure. |
+| `feat_rsi3_extreme` | $\text{RSI}(Close, 3)$ | **Ultra-fast 3-period RSI.** In fast 3–5 day breakouts, $\text{RSI}_3 \ge 90.0$ pinpoints blow-off tops with high precision. |
+| `feat_rsi_divergence` | $\text{RSI}_{14,t} - \text{RSI}_{14, t-3} \text{ where } High_t > High_{t-3}$ | **Bearish momentum divergence.** Price prints higher high while internal momentum decelerates. |
+| `feat_rsi_vs_sma` | $\text{RSI}_{14,t} - \text{SMA}_5(\text{RSI}_{14})_t$ | Measures the rate of oscillator exhaustion relative to its rolling baseline. |
+
+> **💡 Crucial Research Note on RSI in Momentum Breakouts:**  
+> In the baseline EP model (`ep_exhaustion_classifier.pkl`), standard $\text{RSI}_{14}$ was intentionally omitted from the primary 22 features because fundamental EP gap runners experience sustained multi-month drift where standard $\text{RSI}_{14}$ stays pinned between 75 and 85 without reversing, causing naive models to exit far too early.  
+> **However, for QM momentum breakouts, RSI is highly valuable when implemented correctly:**  
+> 1. Rather than relying on standard $\text{RSI}_{14} \ge 70$ (which triggers prematurely), the model must use **extreme overbought thresholds ($\text{RSI}_3 \ge 90$ or $\text{RSI}_{14} \ge 82$)**;  
+> 2. It must combine RSI with **Volume Exhaustion (`feat_bar_rvol` $\ge 2.5\times$)** and **Upper Wick Rejection (`feat_upper_wick_ratio` $\ge 0.35$)**;  
+> 3. It must evaluate **Momentum Divergence (`feat_rsi_divergence`)** to detect when buying energy has depleted despite a marginal new high.
 
 ### 4.2 Group 2: Candle Geometry & Climax Volume
 | Feature Name | Mathematical Formula | Institutional Rationale |
