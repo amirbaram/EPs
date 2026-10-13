@@ -1936,9 +1936,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             </div>
           </div>
         </div>
+        <div class="chart-container" id="chart_div"></div>
       </div>
-      <div class="chart-container" id="chart_div"></div>
-    </div>
 
     <!-- Right Pane: Institutional Trade Dossier -->
     <div class="pane-dossier">
