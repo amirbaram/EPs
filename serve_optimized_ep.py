@@ -18,6 +18,7 @@ Usage:
 """
 from __future__ import annotations
 
+import datetime as dt
 import json
 import os
 import sys
@@ -36,6 +37,10 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import datastore
+import ep_catalyst_enricher
+import indicators
+import scanner_core
+from zoneinfo import ZoneInfo
 from ep_ml_engine import engine as ml_engine
 import thematic_engine
 
@@ -44,7 +49,60 @@ EP_SCORED_PATH = ROOT / "data" / "simulations" / "ep_combined_study_scored.parqu
 RS_SCORED_PATH = ROOT / "data" / "simulations" / "rs_universe_scores.parquet"
 PORT = 8787
 EXTREME_PEAK_MODEL_PATH = ROOT / "data" / "models" / "ep_extreme_peak_classifier.pkl"
+INTRADAY_CACHE_PATH = ROOT / "data" / "cache" / "intraday_watchlist_status.json"
+MONITOR_SETTINGS_FILE = ROOT / "data" / "cache" / "monitor_settings.json"
 _EXTREME_PEAK_MODEL = None
+
+
+def apply_intraday_cache_to_watchlist(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Overlays real-time intraday price, high, exhaustion, and alert states from monitor cache."""
+    if not INTRADAY_CACHE_PATH.exists():
+        return items
+    try:
+        data = json.loads(INTRADAY_CACHE_PATH.read_text(encoding="utf-8"))
+        positions = data.get("positions", {})
+        if not positions:
+            return items
+
+        for it in items:
+            sym = it.get("symbol")
+            if sym in positions:
+                p = positions[sym]
+                if "current_price" in p:
+                    it["current_price"] = p["current_price"]
+                if "intraday_high" in p:
+                    it["intraday_high"] = p["intraday_high"]
+                if "intraday_low" in p:
+                    it["intraday_low"] = p["intraday_low"]
+                if "intraday_open" in p:
+                    it["intraday_open"] = p["intraday_open"]
+                if "unrealized_r" in p:
+                    it["unrealized_r"] = p["unrealized_r"]
+                if "unrealized_pct" in p:
+                    it["unrealized_pct"] = p["unrealized_pct"]
+                if "peak_intraday_r" in p:
+                    it["peak_intraday_r"] = p["peak_intraday_r"]
+                if "exhaustion_prob" in p:
+                    it["current_high_exhaustion_prob"] = p["exhaustion_prob"]
+                if "exhaustion_pct" in p:
+                    it["current_high_exhaustion_pct"] = p["exhaustion_pct"]
+                if "alert_state" in p:
+                    it["alert_state"] = p["alert_state"]
+                if "alert_action" in p:
+                    it["alert_action"] = p["alert_action"]
+                    if p.get("is_alert"):
+                        it["climax_action"] = p["alert_action"]
+                if "is_alert" in p:
+                    it["is_alert"] = p["is_alert"]
+                if "last_bar_time" in p:
+                    it["last_bar_time"] = p["last_bar_time"]
+                if "recommended_ma_price" in p:
+                    it["recommended_ma_price"] = p["recommended_ma_price"]
+                if "recommended_ma_buffer_pct" in p:
+                    it["recommended_ma_buffer_pct"] = p["recommended_ma_buffer_pct"]
+    except Exception:
+        pass
+    return items
 
 
 def get_extreme_peak_model():
@@ -278,7 +336,7 @@ def get_active_watchlist(force_reload: bool = False) -> List[Dict[str, Any]]:
     """Scans and caches active in-flight trades and coiling setups from the last 20-25 trading days."""
     global _WATCHLIST
     if _WATCHLIST is not None and not force_reload:
-        return _WATCHLIST
+        return apply_intraday_cache_to_watchlist([dict(x) for x in _WATCHLIST])
 
     if not EP_SCORED_PATH.exists():
         return []
@@ -427,6 +485,27 @@ def get_active_watchlist(force_reload: bool = False) -> List[Dict[str, Any]]:
         sell_half_rule = f"Sell 50% partial profit into extreme high when ML Exhaustion ≥ 50.0% (locks peak R, retains remainder on {rec_ma_name})"
         exit_rule = f"Close below {rec_ma_name.split(' ')[0]} triggers full exit of position at market close"
 
+        # Suggested Position Size according to Setup Quality & Institutional Trade Rules
+        if v2_50 >= 0.25 and (arch_name == "👑 Pinnacle Elite" or rs >= 85.0):
+            sug_mult = 1.50
+            sug_label = "1.50x Max Allocation"
+            sug_desc = f"Apex institutional quality: Pinnacle Elite / High RS ({rs:.0f}) + High V2 Conviction P(+50%): {v2_50*100:.1f}% ≥ 25%."
+        elif v2_50 >= 0.20 or rs >= 80.0:
+            sug_mult = 1.25
+            sug_label = "1.25x Enhanced Allocation"
+            sug_desc = f"Solid institutional setup: Strong Conviction P(+50%): {v2_50*100:.1f}% and High RS ({rs:.0f}) leadership."
+        elif v2_50 >= 0.10:
+            sug_mult = 1.00
+            sug_label = "1.00x Base Allocation"
+            sug_desc = f"Standard institutional EP allocation: 1.0 R risk budget under {arch_name} rules."
+        else:
+            sug_mult = 0.75
+            sug_label = "0.75x Defensive Allocation"
+            sug_desc = f"Defensive / speculative setup: Lower V2 Conviction ({v2_50*100:.1f}% < 10%). Size down to contain downside."
+
+        # Fundamental Catalyst & SEC Filings are loaded on-demand by /api/chart for selected setup
+        cat_dossier = None
+
         if broke_out and not stopped_out:
             unr_r = round((curr_close - trigger_px) / risk_pts, 2)
             unr_pct = round(((curr_close / trigger_px) - 1.0) * 100.0, 1)
@@ -461,6 +540,10 @@ def get_active_watchlist(force_reload: bool = False) -> List[Dict[str, Any]]:
                 "v2_breakout": round(v2_50, 4),
                 "v2_conviction_50": round(v2_50, 4),
                 "v2_win_prob": v2_win,
+                "suggested_size_mult": sug_mult,
+                "suggested_size_label": sug_label,
+                "suggested_size_desc": sug_desc,
+                "catalyst": cat_dossier,
                 "days_in_trade": len(fwd) - breakout_idx if breakout_idx is not None else 1,
                 "days_coiling": 0,
                 "trade_type": "Trade 1: Base EP Delayed Breakout (Days 2-5)",
@@ -518,6 +601,10 @@ def get_active_watchlist(force_reload: bool = False) -> List[Dict[str, Any]]:
                 "v2_breakout": round(v2_50, 4),
                 "v2_conviction_50": round(v2_50, 4),
                 "v2_win_prob": v2_win,
+                "suggested_size_mult": sug_mult,
+                "suggested_size_label": sug_label,
+                "suggested_size_desc": sug_desc,
+                "catalyst": cat_dossier,
                 "days_in_trade": 0,
                 "days_coiling": len(fwd),
                 "trade_type": "Trade 1: Base EP Delayed Breakout (Days 2-5)",
@@ -550,7 +637,7 @@ def get_active_watchlist(force_reload: bool = False) -> List[Dict[str, Any]]:
             })
 
     _WATCHLIST = items
-    return _WATCHLIST
+    return apply_intraday_cache_to_watchlist([dict(x) for x in _WATCHLIST])
 
 
 @app.route("/api/reload_dataset", methods=["GET", "POST"])
@@ -1034,22 +1121,116 @@ def api_watchlist():
     n_active = sum(1 for x in items if x["status"] == "Active Long")
     n_coiling = sum(1 for x in items if x["status"] == "Coiling Setup")
 
+    intra_meta = {}
+    if INTRADAY_CACHE_PATH.exists():
+        try:
+            cdata = json.loads(INTRADAY_CACHE_PATH.read_text(encoding="utf-8"))
+            intra_meta = {
+                "market_open": cdata.get("market_open", False),
+                "timestamp_et": cdata.get("timestamp_et", ""),
+                "alerts_count": cdata.get("alerts_count", 0),
+                "active_count": cdata.get("active_count", n_active),
+            }
+        except Exception:
+            pass
+
     return jsonify({
         "items": filtered,
         "count": len(filtered),
         "total_active": n_active,
         "total_coiling": n_coiling,
+        "intraday_meta": intra_meta,
     })
+
+
+@app.route("/api/intraday_watchlist")
+def api_intraday_watchlist():
+    """Returns real-time intraday active watchlist status, alerts, and positions telemetry."""
+    if not INTRADAY_CACHE_PATH.exists():
+        return jsonify({
+            "status": "no_cache",
+            "market_open": False,
+            "active_count": 0,
+            "alerts_count": 0,
+            "positions": {},
+        })
+    try:
+        data = json.loads(INTRADAY_CACHE_PATH.read_text(encoding="utf-8"))
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/monitor_settings", methods=["GET", "POST"])
+def api_monitor_settings():
+    """Reads or updates intraday monitor interval and rate-limit settings."""
+    if request.method == "POST":
+        data = request.get_json() or {}
+        interval = int(data.get("poll_interval_sec", data.get("interval", 300)))
+        interval = max(60, min(3600, interval))
+        payload = {
+            "interval_sec": interval,
+            "poll_interval_sec": interval,
+            "interval_min": round(interval / 60.0, 1),
+            "poll_interval_min": round(interval / 60.0, 1),
+            "recommended_interval_sec": 300,
+            "rate_limit_guidance": "5 to 15-minute polling is optimal for institutional daily EP tracking while preventing Yahoo Finance IP throttling.",
+            "updated_at": dt.datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d %H:%M:%S ET"),
+            "suggestion": "5 to 15-minute polling is optimal for institutional daily EP tracking while preventing Yahoo Finance IP throttling."
+        }
+        MONITOR_SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        MONITOR_SETTINGS_FILE.write_text(json.dumps(payload, indent=2))
+        return jsonify({"status": "ok", "poll_interval_sec": interval, "settings": payload})
+
+    if MONITOR_SETTINGS_FILE.exists():
+        try:
+            d = json.loads(MONITOR_SETTINGS_FILE.read_text(encoding="utf-8"))
+            sec = d.get("poll_interval_sec", d.get("interval_sec", 300))
+            d["poll_interval_sec"] = sec
+            d["interval_sec"] = sec
+            d["recommended_interval_sec"] = 300
+            d["rate_limit_guidance"] = d.get("rate_limit_guidance", "5 to 15-minute polling is optimal for institutional daily EP tracking while preventing Yahoo Finance IP throttling.")
+            return jsonify(d)
+        except Exception:
+            pass
+    return jsonify({
+        "interval_sec": 300,
+        "poll_interval_sec": 300,
+        "interval_min": 5.0,
+        "poll_interval_min": 5.0,
+        "recommended_interval_sec": 300,
+        "rate_limit_guidance": "5 to 15-minute polling is optimal for institutional daily EP tracking while preventing Yahoo Finance IP throttling.",
+        "updated_at": "",
+        "suggestion": "5 to 15-minute polling is optimal for institutional daily EP tracking while preventing Yahoo Finance IP throttling."
+    })
+
+
+@app.route("/api/run_monitor_cycle", methods=["POST"])
+def api_run_monitor_cycle():
+    """Triggers an immediate intraday evaluation cycle."""
+    try:
+        import intraday_watchlist_monitor
+        res = intraday_watchlist_monitor.run_intraday_cycle(force=True)
+        return jsonify({"status": "ok", "result": res})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/api/chart")
 def api_chart():
-    """Generates TradingView Lightweight Charts payload with candlesticks, moving averages, and markers."""
+    """Generates TradingView Lightweight Charts payload with candlesticks, full EMAs, Larsson ribbon, and catalyst."""
     symbol = request.args.get("symbol", "").strip().upper()
     ep_date = request.args.get("ep_date", "").strip()
     entry_date = request.args.get("entry_date", "").strip()
     exit_date = request.args.get("exit_date", "").strip()
     exit_mode = request.args.get("exit_mode", "adaptive")
+    history_mode = request.args.get("history", "setup").strip().lower()
+
+    try:
+        larsson_fastest = int(request.args.get("larsson_fastest", "32"))
+    except (ValueError, TypeError):
+        larsson_fastest = 32
+    larsson_fastest = max(3, min(80, larsson_fastest))
 
     if not symbol:
         return jsonify({"error": "Symbol required"}), 400
@@ -1059,35 +1240,72 @@ def api_chart():
         return jsonify({"error": f"No bar data available for {symbol}"}), 404
 
     bars = bars.copy()
+    bars["ema8"] = bars["close"].ewm(span=8, adjust=False).mean()
     bars["ema10"] = bars["close"].ewm(span=10, adjust=False).mean()
     bars["ema20"] = bars["close"].ewm(span=20, adjust=False).mean()
-    bars["sma50"] = bars["close"].rolling(50).mean()
-    bars["sma200"] = bars["close"].rolling(200).mean()
+    bars["ema21"] = bars["close"].ewm(span=21, adjust=False).mean()
+    bars["sma50"] = bars["close"].rolling(50, min_periods=20).mean()
+    bars["sma200"] = bars["close"].rolling(200, min_periods=50).mean()
+    bars["vol_ma20"] = bars["volume"].rolling(20, min_periods=5).mean()
 
-    # Find setup range
-    ep_matches = np.where(bars.index.strftime("%Y-%m-%d") == ep_date)[0]
-    if len(ep_matches) > 0:
-        ep_idx = int(ep_matches[0])
-        start_idx = max(0, ep_idx - 65)  # 65 bars prior (chart to left)
-        if exit_date and exit_date not in ["None", "Pending", ""]:
-            end_matches = np.where(bars.index.strftime("%Y-%m-%d") == exit_date)[0]
-            if len(end_matches) > 0:
-                end_idx = min(len(bars), int(end_matches[0]) + 30)
-            else:
-                end_idx = min(len(bars), ep_idx + 180)
-        else:
-            end_idx = len(bars)
-        view_bars = bars.iloc[start_idx:end_idx].copy()
+    # Larsson Line Ribbon calculation
+    if larsson_fastest == 32:
+        larsson_spans = (32, 35, 50, 58)
+    elif larsson_fastest <= 20:
+        larsson_spans = (larsson_fastest, int(round(larsson_fastest * 1.5)), int(round(larsson_fastest * 2.0)), int(round(larsson_fastest * 2.625)))
     else:
-        view_bars = bars.tail(250).copy()
+        larsson_spans = (larsson_fastest, int(round(larsson_fastest * 35.0 / 32.0)), int(round(larsson_fastest * 50.0 / 32.0)), int(round(larsson_fastest * 58.0 / 32.0)))
 
-    # Format Candlesticks & Volume
+    s1, s2, s3, s4 = larsson_spans
+    e1 = bars["close"].ewm(span=s1, adjust=False).mean()
+    e2 = bars["close"].ewm(span=s2, adjust=False).mean()
+    e3 = bars["close"].ewm(span=s3, adjust=False).mean()
+    e4 = bars["close"].ewm(span=s4, adjust=False).mean()
+    bullish = (e1 >= e2) & (e2 >= e3) & (e3 >= e4)
+    bearish = (e1 < e2) & (e2 < e3) & (e3 < e4)
+    valid_l = e1.notna() & e2.notna() & e3.notna() & e4.notna()
+
+    bars["larsson_fast"] = e1
+    bars["larsson_slow"] = e4
+    bars["larsson_state"] = "gray"
+    bars.loc[valid_l & bullish, "larsson_state"] = "yellow"
+    bars.loc[valid_l & bearish, "larsson_state"] = "blue"
+
+    # Slice according to history depth setting
+    if history_mode == "full":
+        view_bars = bars.copy()
+    elif history_mode == "2y":
+        view_bars = bars.tail(504).copy()
+    elif history_mode == "1y":
+        view_bars = bars.tail(252).copy()
+    elif history_mode == "6m":
+        view_bars = bars.tail(126).copy()
+    else:  # "setup"
+        ep_matches = np.where(bars.index.strftime("%Y-%m-%d") == ep_date)[0]
+        if len(ep_matches) > 0:
+            ep_idx = int(ep_matches[0])
+            start_idx = max(0, ep_idx - 65)  # 65 bars prior (chart to left)
+            if exit_date and exit_date not in ["None", "Pending", ""]:
+                end_matches = np.where(bars.index.strftime("%Y-%m-%d") == exit_date)[0]
+                end_idx = min(len(bars), int(end_matches[0]) + 30) if len(end_matches) > 0 else min(len(bars), ep_idx + 180)
+            else:
+                end_idx = len(bars)
+            view_bars = bars.iloc[start_idx:end_idx].copy()
+        else:
+            view_bars = bars.tail(250).copy()
+
+    # Format Candlesticks & Indicators
     candle_data = []
     volume_data = []
+    vol_ma20_data = []
+    ema8_data = []
     ema10_data = []
     ema20_data = []
+    ema21_data = []
     sma50_data = []
     sma200_data = []
+    larsson_fast_data = []
+    larsson_slow_data = []
 
     for t, r in view_bars.iterrows():
         t_str = t.strftime("%Y-%m-%d")
@@ -1100,23 +1318,47 @@ def api_chart():
             "time": t_str, "value": float(r["volume"]),
             "color": "rgba(34, 197, 94, 0.4)" if c >= o else "rgba(239, 68, 68, 0.4)"
         })
-        if pd.notna(r["ema10"]):
+        if pd.notna(r.get("vol_ma20")):
+            vol_ma20_data.append({"time": t_str, "value": round(float(r["vol_ma20"]), 0)})
+        if pd.notna(r.get("ema8")):
+            ema8_data.append({"time": t_str, "value": round(float(r["ema8"]), 2)})
+        if pd.notna(r.get("ema10")):
             ema10_data.append({"time": t_str, "value": round(float(r["ema10"]), 2)})
-        if pd.notna(r["ema20"]):
+        if pd.notna(r.get("ema20")):
             ema20_data.append({"time": t_str, "value": round(float(r["ema20"]), 2)})
-        if pd.notna(r["sma50"]):
+        if pd.notna(r.get("ema21")):
+            ema21_data.append({"time": t_str, "value": round(float(r["ema21"]), 2)})
+        if pd.notna(r.get("sma50")):
             sma50_data.append({"time": t_str, "value": round(float(r["sma50"]), 2)})
-        if pd.notna(r["sma200"]):
+        if pd.notna(r.get("sma200")):
             sma200_data.append({"time": t_str, "value": round(float(r["sma200"]), 2)})
+        if pd.notna(r.get("larsson_fast")):
+            larsson_fast_data.append({"time": t_str, "value": round(float(r["larsson_fast"]), 2), "state": r.get("larsson_state", "gray")})
+        if pd.notna(r.get("larsson_slow")):
+            larsson_slow_data.append({"time": t_str, "value": round(float(r["larsson_slow"]), 2), "state": r.get("larsson_state", "gray")})
+
+    # Fetch Fundamental Catalyst Dossier & SEC EDGAR Filings
+    try:
+        cat_dossier = ep_catalyst_enricher.get_catalyst_dossier(symbol, ep_date)
+    except Exception:
+        cat_dossier = None
 
     return jsonify({
         "symbol": symbol,
         "candles": candle_data,
         "volume": volume_data,
+        "vol_ma20": vol_ma20_data,
+        "ema8": ema8_data,
         "ema10": ema10_data,
         "ema20": ema20_data,
+        "ema21": ema21_data,
         "sma50": sma50_data,
         "sma200": sma200_data,
+        "larsson_fast": larsson_fast_data,
+        "larsson_slow": larsson_slow_data,
+        "larsson_spans": list(larsson_spans),
+        "catalyst": cat_dossier,
+        "history_mode": history_mode,
         "ep_date": ep_date,
         "entry_date": entry_date,
         "exit_date": exit_date,
@@ -1205,9 +1447,19 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
     /* Center Pane: Chart */
     .pane-chart { flex: 1; border-right: 1px solid var(--border); display: flex; flex-direction: column; background: #090c13; min-width: 0; overflow: hidden; position: relative; }
-    .chart-top-bar { padding: 6px 14px; background: #0c101a; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; flex-shrink: 0; }
-    .chart-ticker { font-size: 16px; font-weight: 800; color: #fff; letter-spacing: 0.5px; }
-    .chart-sub { font-size: 11px; color: var(--text-muted); margin-left: 8px; }
+    .chart-top-bar { padding: 6px 12px; background: #0c101a; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; flex-shrink: 0; gap: 8px; min-height: 42px; }
+    .chart-meta-group { display: flex; align-items: center; gap: 8px; min-width: 0; flex-shrink: 1; }
+    .chart-ticker { font-size: 16px; font-weight: 800; color: #fff; letter-spacing: 0.5px; flex-shrink: 0; }
+    .chart-sub { font-size: 11px; color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 250px; }
+    .chart-nav-group { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
+    .btn-nav { background: #131929; border: 1px solid #27344d; color: #cbd5e1; font-size: 11px; font-weight: 700; padding: 3px 9px; border-radius: 4px; cursor: pointer; display: inline-flex; align-items: center; gap: 4px; transition: all 0.15s ease; }
+    .btn-nav:hover:not(:disabled) { background: #1e293b; border-color: var(--accent); color: #fff; }
+    .btn-nav:disabled { opacity: 0.35; cursor: not-allowed; }
+    .nav-stock-select { max-width: 190px; font-size: 11px; font-weight: 600; padding: 3px 8px; background: #131929; border: 1px solid #27344d; color: #fff; border-radius: 4px; outline: none; text-overflow: ellipsis; }
+    .nav-counter { font-size: 10.5px; font-weight: 700; color: var(--accent); background: rgba(56, 189, 248, 0.1); border: 1px solid rgba(56, 189, 248, 0.25); padding: 2px 7px; border-radius: 4px; white-space: nowrap; }
+    .fs-hint { font-size: 10px; color: #64748b; margin-left: 6px; white-space: nowrap; }
+    .chart-controls-group { display: flex; align-items: center; gap: 8px; font-size: 11px; position: relative; flex-shrink: 0; }
+    .chart-legends-bar { font-size: 10.5px; display: flex; gap: 8px; align-items: center; margin-left: 4px; white-space: nowrap; }
     .chart-container { flex: 1; min-height: 0; width: 100%; height: 100%; position: relative; overflow: hidden; }
 
     /* Right Pane: Dossier */
@@ -1224,6 +1476,167 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     .badge-status { font-size: 10px; padding: 2px 6px; border-radius: 4px; font-weight: 700; }
     .status-active { background: rgba(34, 197, 94, 0.2); color: var(--green); border: 1px solid rgba(34, 197, 94, 0.4); }
     .status-coiling { background: rgba(245, 158, 11, 0.2); color: var(--amber); border: 1px solid rgba(245, 158, 11, 0.4); }
+    @keyframes alertPulse {
+      0% { box-shadow: 0 0 0 0 rgba(192, 132, 252, 0.7); }
+      70% { box-shadow: 0 0 0 8px rgba(192, 132, 252, 0); }
+      100% { box-shadow: 0 0 0 0 rgba(192, 132, 252, 0); }
+    }
+    .row-alert-pulse {
+      background: rgba(192, 132, 252, 0.15) !important;
+      border-left: 3px solid #c084fc !important;
+    }
+    .badge-alert-pulse {
+      background: #c084fc;
+      color: #0b0f19;
+      font-weight: 800;
+      font-size: 9px;
+      padding: 2px 6px;
+      border-radius: 4px;
+      display: inline-block;
+      animation: alertPulse 1.5s infinite;
+      margin-left: 4px;
+    }
+    .badge-elevated {
+      background: rgba(245, 158, 11, 0.2);
+      color: #fbbf24;
+      border: 1px solid rgba(245, 158, 11, 0.4);
+      font-weight: 700;
+      font-size: 9px;
+      padding: 2px 5px;
+      border-radius: 4px;
+      margin-left: 4px;
+    }
+    .monitor-indicator {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 10px;
+      border-radius: 14px;
+      font-size: 11px;
+      font-weight: 700;
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      color: var(--text-muted);
+    }
+    .monitor-indicator.live {
+      background: rgba(34, 197, 94, 0.12);
+      border-color: rgba(34, 197, 94, 0.3);
+      color: #4ade80;
+    }
+    .monitor-indicator.alerting {
+      background: rgba(192, 132, 252, 0.2);
+      border-color: #c084fc;
+      color: #e9d5ff;
+      animation: alertPulse 1.5s infinite;
+    }
+
+    /* Fullscreen Chart Mode */
+    .pane-chart.fullscreen {
+      position: fixed !important;
+      inset: 0 !important;
+      width: 100vw !important;
+      height: 100vh !important;
+      z-index: 9999 !important;
+      background: #090c13 !important;
+    }
+    .pane-chart.fullscreen .chart-top-bar {
+      padding: 10px 24px;
+      background: #0c101a;
+      border-bottom: 1px solid #1e293b;
+      box-shadow: 0 4px 20px rgba(0, 0, 0, 0.6);
+    }
+    .pane-chart.fullscreen .chart-ticker { font-size: 22px; }
+    .pane-chart.fullscreen .chart-sub { max-width: 500px; font-size: 12px; }
+    .pane-chart.fullscreen .nav-stock-select { max-width: 320px; font-size: 12px; padding: 4px 10px; }
+    .pane-chart.fullscreen .btn-nav { font-size: 12px; padding: 5px 14px; }
+    .pane-chart.fullscreen .btn-toggle { font-size: 12px; padding: 5px 12px; }
+    .pane-chart.fullscreen .chart-legends-bar { font-size: 11.5px; gap: 12px; }
+    .pane-chart.fullscreen .fs-hint { display: inline-block !important; }
+
+    /* Popover Settings Panels */
+    .settings-popover {
+      position: absolute;
+      background: #0f172a;
+      border: 1px solid #1e293b;
+      border-radius: 8px;
+      box-shadow: 0 12px 30px rgba(0, 0, 0, 0.8);
+      z-index: 100;
+      padding: 12px 14px;
+      width: 320px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .popover-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 12px;
+      font-weight: 700;
+      color: #fff;
+      border-bottom: 1px solid #1e293b;
+      padding-bottom: 6px;
+    }
+    .popover-close {
+      background: none;
+      border: none;
+      color: var(--text-muted);
+      font-size: 16px;
+      cursor: pointer;
+      line-height: 1;
+    }
+    .popover-close:hover { color: #fff; }
+    .popover-sec-title {
+      font-size: 10px;
+      font-weight: 700;
+      color: var(--accent);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      margin-bottom: 4px;
+    }
+    .popover-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 11px;
+      margin-bottom: 4px;
+    }
+    .popover-row label {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      cursor: pointer;
+      color: #cbd5e1;
+      font-size: 11px;
+    }
+    .suggestion-box {
+      background: rgba(56, 189, 248, 0.08);
+      border: 1px solid rgba(56, 189, 248, 0.25);
+      border-radius: 6px;
+      padding: 8px;
+      font-size: 10.5px;
+      color: #cbd5e1;
+      line-height: 1.4;
+    }
+    .filing-item {
+      background: #131826;
+      border: 1px solid #202b3f;
+      border-radius: 4px;
+      padding: 5px 8px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 10.5px;
+      margin-bottom: 4px;
+    }
+    .filing-link {
+      color: #38bdf8;
+      text-decoration: none;
+      font-weight: 700;
+      font-size: 10.5px;
+      flex-shrink: 0;
+    }
+    .filing-link:hover { text-decoration: underline; }
   </style>
 </head>
 <body>
@@ -1374,6 +1787,41 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           <option value="stage2">Stage 2 Bullish Only (Price > 50 > 200)</option>
         </select>
       </div>
+
+      <div style="display:flex; align-items:center; gap:8px; margin-left:auto; position:relative;">
+        <button class="btn-toggle" id="btn_monitor_settings" onclick="toggleMonitorSettings()" title="Configure intraday monitor polling interval & rate limit safety">⚙️ Detector Settings</button>
+        <div id="monitor_pill" class="monitor-indicator">
+          <span id="monitor_dot" style="display:inline-block; width:7px; height:7px; border-radius:50%; background:#94a3b8;"></span>
+          <span id="monitor_text">⚡ Intraday Monitor: Standby</span>
+        </div>
+
+        <!-- Detector Settings Popover -->
+        <div id="monitor_settings_panel" class="settings-popover" style="display:none; top:36px; right:0;">
+          <div class="popover-header">
+            <span>⚡ Intraday Exhaustion Detector</span>
+            <button class="popover-close" onclick="toggleMonitorSettings()">&times;</button>
+          </div>
+          <div>
+            <div class="popover-sec-title">POLLING INTERVAL &amp; RATE-LIMIT PROTECTION</div>
+            <div class="popover-row">
+              <span>Check Interval:</span>
+              <select id="sel_monitor_interval" class="ctl-select" onchange="saveMonitorInterval(this.value)">
+                <option value="300" selected>5 Min (Recommended: Safe &amp; Responsive)</option>
+                <option value="600">10 Min (Standard Institutional)</option>
+                <option value="900">15 Min (Defensive / Minimal Footprint)</option>
+                <option value="120">2 Min (Fast Scalping / Elevated IP Risk)</option>
+              </select>
+            </div>
+            <div class="suggestion-box" style="margin-top:6px;">
+              💡 <strong>Institutional Guidance</strong>: YFinance imposes hourly IP rate blocks if polled continuously under 1 minute. A <strong>5 to 15 minute</strong> interval allows high-fidelity detection of intraday exhaustion spikes while guaranteeing 100% uninterrupted uptime across 40+ tickers.
+            </div>
+          </div>
+          <div style="border-top:1px solid #1e293b; padding-top:8px;">
+            <div class="popover-sec-title">ON-DEMAND MANUAL REFRESH</div>
+            <button class="btn-toggle" style="width:100%; justify-content:center; display:flex;" onclick="runMonitorCycleNow()">⚡ Run Check Cycle Now</button>
+          </div>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -1405,17 +1853,75 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     </div>
 
     <!-- Center Pane: TradingView Chart -->
-    <div class="pane-chart">
-      <div class="chart-top-bar">
-        <div>
+    <div class="pane-chart" id="pane_chart">
+      <div class="chart-top-bar" id="chart_top_bar">
+        <!-- Left: Ticker & Context Badges -->
+        <div class="chart-meta-group">
           <span class="chart-ticker" id="c_ticker">-</span>
-          <span class="chart-sub" id="c_meta">-</span>
+          <span id="c_badge_status" class="badge-status status-active" style="display:none;">Active</span>
+          <span id="c_badge_arch" class="badge-arch" style="display:none; font-size:9.5px; padding:2px 5px;">-</span>
+          <span class="chart-sub" id="c_meta" title="">-</span>
         </div>
-        <div style="font-size:11px; display:flex; gap:12px; align-items:center;">
-          <span id="c_trigger_legend" style="color:#22c55e;">── Breakout Trigger (D1 High)</span>
-          <span id="c_stop_legend" style="color:#ef4444;">── Stop Loss</span>
-          <span id="c_ma_legend" style="color:#0284c7;">── Active Trailing MA</span>
-          <span id="c_climax_legend" style="color:#c084fc; display:none;">── 50% Climax Take</span>
+
+        <!-- Center: Interactive Stock Navigation Controls -->
+        <div class="chart-nav-group">
+          <button class="btn-nav" id="btn_nav_prev" onclick="selectPreviousTrade()" title="Previous Stock (← arrow key)">◀ Prev</button>
+          <select id="sel_nav_stock" class="ctl-select nav-stock-select" onchange="onNavStockSelect(this.value)" title="Select Stock from Current List"></select>
+          <button class="btn-nav" id="btn_nav_next" onclick="selectNextTrade()" title="Next Stock (→ arrow key)">Next ▶</button>
+          <span class="nav-counter" id="lbl_nav_counter" title="Position in current filtered list">1 / 54</span>
+          <span id="fs_keyboard_hint" class="fs-hint" style="display:none;">(← / → browse · Esc exit)</span>
+        </div>
+
+        <!-- Right: History, Indicators, Fullscreen & Legends -->
+        <div class="chart-controls-group">
+          <!-- History Depth Selection -->
+          <div class="ctl-group" style="gap:4px;">
+            <span class="ctl-label" style="font-size:10px;">HISTORY:</span>
+            <select id="sel_chart_history" class="ctl-select" onchange="onChartHistoryChange()" style="font-size:10px; padding:2px 6px;">
+              <option value="setup" selected>Setup Focus (-40D/+60D)</option>
+              <option value="6m">6 Months</option>
+              <option value="1y">1 Year</option>
+              <option value="2y">2 Years</option>
+              <option value="full">Full History</option>
+            </select>
+          </div>
+          <button class="btn-toggle" id="btn_chart_settings" onclick="toggleChartSettings()" title="Configure Moving Averages, Larsson Ribbon &amp; Indicators" style="font-size:10.5px; padding:2px 7px;">⚙️ Indicators</button>
+          <button class="btn-toggle" id="btn_chart_fullscreen" onclick="toggleChartFullscreen()" title="Toggle Fullscreen Chart" style="font-size:10.5px; padding:2px 7px;">⛶ Fullscreen</button>
+          <div class="chart-legends-bar">
+            <span id="c_trigger_legend" style="color:#22c55e;">── Breakout</span>
+            <span id="c_stop_legend" style="color:#ef4444;">── Stop</span>
+            <span id="c_ma_legend" style="color:#0284c7;">── Trail MA</span>
+            <span id="c_climax_legend" style="color:#c084fc; display:none;">── 50% Climax</span>
+          </div>
+
+          <!-- Chart Settings Popover -->
+          <div id="chart_settings_panel" class="settings-popover" style="display:none; top:36px; right:0;">
+            <div class="popover-header">
+              <span>⚙️ Chart Indicators &amp; Ribbons</span>
+              <button class="popover-close" onclick="toggleChartSettings()">&times;</button>
+            </div>
+            <div>
+              <div class="popover-sec-title">📈 MOVING AVERAGES</div>
+              <div class="popover-row"><label><input type="checkbox" id="chk_ema8" onchange="toggleIndicatorSeries()"> <span style="color:#ec4899;">8 EMA (Fast Momentum)</span></label></div>
+              <div class="popover-row"><label><input type="checkbox" id="chk_ema10" onchange="toggleIndicatorSeries()"> <span style="color:#f59e0b;">10 EMA (Fast Velocity Trail)</span></label></div>
+              <div class="popover-row"><label><input type="checkbox" id="chk_ema20" onchange="toggleIndicatorSeries()"> <span style="color:#38bdf8;">20 EMA (Swing Baseline)</span></label></div>
+              <div class="popover-row"><label><input type="checkbox" id="chk_ema21" onchange="toggleIndicatorSeries()"> <span style="color:#6366f1;">21 EMA (Dynamic Trail Anchor)</span></label></div>
+              <div class="popover-row"><label><input type="checkbox" id="chk_sma50" onchange="toggleIndicatorSeries()"> <span style="color:#a855f7;">50 SMA (Institutional Baseline)</span></label></div>
+              <div class="popover-row"><label><input type="checkbox" id="chk_sma200" onchange="toggleIndicatorSeries()"> <span style="color:#cbd5e1;">200 SMA (Long-term Trend)</span></label></div>
+              <div class="popover-row"><label><input type="checkbox" id="chk_vol_ma20" checked onchange="toggleIndicatorSeries()"> <span style="color:#38bdf8;">20-Day Volume MA</span></label></div>
+            </div>
+            <div style="border-top:1px solid #1e293b; padding-top:8px;">
+              <div class="popover-sec-title">🟡 LARSSON LINE RIBBON</div>
+              <div class="popover-row">
+                <label><input type="checkbox" id="chk_larsson" onchange="toggleIndicatorSeries()"> <span style="color:#facc15; font-weight:700;">Larsson Line Ribbon</span></label>
+              </div>
+              <div class="popover-row" style="background:#111827; padding:4px 6px; border-radius:4px; margin-top:4px;">
+                <span>Fastest EMA:</span>
+                <input type="number" id="cfg_larsson_fastest" value="32" min="3" max="80" style="width:42px; background:#1e293b; color:#38bdf8; border:1px solid #334155; border-radius:3px; padding:2px; font-size:11px; text-align:center; font-weight:700;" onchange="onLarssonFastestChange()">
+                <span id="lbl_larsson_spans" style="color:#64748b; font-size:10px;">(32, 35, 50, 58)</span>
+              </div>
+            </div>
+          </div>
         </div>
       </div>
       <div class="chart-container" id="chart_div"></div>
@@ -1424,14 +1930,18 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <!-- Right Pane: Institutional Trade Dossier -->
     <div class="pane-dossier">
       <!-- Card 1: Setup Execution & Return -->
-      <div class="d-card">
+      <div class="d-card" id="card_exec">
         <div class="d-card-title"><span id="d_card1_title">🛡️ 1. Setup Status &amp; Execution</span><span id="d_r_badge" class="badge-sz sz-15">+0.0R</span></div>
         <div class="d-row"><span class="d-lbl">Trade Type:</span><span class="d-val hl" id="d_trade_type">Trade 1 Base EP Delayed Breakout</span></div>
         <div class="d-row"><span class="d-lbl">Trader Archetype:</span><span class="d-val hl" id="d_archetype">-</span></div>
         <div class="d-row"><span class="d-lbl" id="d_lbl_entry">Entry (D1 Breakout):</span><span class="d-val hl" id="d_entry">-</span></div>
         <div class="d-row"><span class="d-lbl" id="d_lbl_stop">Stop Loss / Invalidation:</span><span class="d-val" id="d_stop" style="color:var(--red);">-</span></div>
         <div class="d-row"><span class="d-lbl">Initial Risk %:</span><span class="d-val" id="d_risk_pct">-</span></div>
-        <div class="d-row"><span class="d-lbl">Allocation &amp; Sizing:</span><span class="d-val" id="d_size_mult">-</span></div>
+        <div class="d-row"><span class="d-lbl">Suggested Size:</span><span class="d-val hl" id="d_size_mult">-</span></div>
+        <div id="d_size_desc_row" style="background:#0f172a; padding:6px 8px; border-radius:4px; border:1px solid #1e293b; font-size:10px; line-height:1.35; margin-bottom:5px;">
+          <div style="font-weight:700; color:var(--accent); margin-bottom:2px;" id="d_size_title">1.00x Base Allocation</div>
+          <div id="d_size_desc" style="color:#94a3b8;">Standard institutional EP allocation: 1.0 R risk budget.</div>
+        </div>
         <div class="d-row"><span class="d-lbl" id="d_lbl_exit">Current / Exit Price:</span><span class="d-val" id="d_exit">-</span></div>
         <div class="d-row"><span class="d-lbl" id="d_lbl_exit_reason">Unrealized / Exit Result:</span><span class="d-val" id="d_exit_reason" style="color:var(--amber);">-</span></div>
         <div class="d-row"><span class="d-lbl" id="d_lbl_hold">Holding Period:</span><span class="d-val" id="d_hold">-</span></div>
@@ -1439,7 +1949,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       </div>
 
       <!-- Card 2: Position Management & ML Exhaustion -->
-      <div class="d-card">
+      <div class="d-card" id="card_pos_mgmt">
         <div class="d-card-title"><span>🤖 2. Position Management &amp; ML Exhaustion</span></div>
         <div class="d-row"><span class="d-lbl">Recommended Trailing MA:</span><span class="d-val hl" id="d_rec_ma">-</span></div>
         <div class="d-row"><span class="d-lbl">Current MA Price &amp; Buffer:</span><span class="d-val" id="d_ma_level">-</span></div>
@@ -1450,22 +1960,54 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <div class="d-row"><span class="d-lbl">Strategy Rationale:</span><span class="d-val" id="d_plan_desc" style="font-size:10px; color:#cbd5e1; text-align:right; max-width:210px;">-</span></div>
       </div>
 
-      <!-- Card 3: Chart to Left & RS Setup -->
-      <div class="d-card">
-        <div class="d-card-title"><span>👈 3. Chart to Left &amp; RS Setup</span></div>
-        <div class="d-row"><span class="d-lbl">Pre-EP 20D Runup:</span><span class="d-val" id="d_pre_runup">-</span></div>
-        <div class="d-row"><span class="d-lbl">20D Base Tightness:</span><span class="d-val" id="d_base_tight">-</span></div>
-        <div class="d-row"><span class="d-lbl">Distance to 52W High:</span><span class="d-val" id="d_dist_52w">-</span></div>
+      <!-- Card 3: Fundamental Catalyst & SEC EDGAR Filings -->
+      <div class="d-card" id="card_catalyst">
+        <div class="d-card-title">
+          <span style="color:#c084fc;">📰 3. Fundamental Catalyst &amp; SEC EDGAR</span>
+          <span id="cat_tier_badge" class="badge-status status-active" style="background:#2e1065; color:#c4b5fd; border:1px solid #7c3aed; font-size:9.5px;">Tier-1 Catalyst</span>
+        </div>
+        <div style="display:flex; flex-direction:column; gap:6px;">
+          <div style="background:#131722; border-left:3px solid #8b5cf6; padding:6px 8px; border-radius:4px;">
+            <div style="font-size:9.5px; color:#94a3b8; text-transform:uppercase; font-weight:700;" id="cat_category">Catalyst Category</div>
+            <div style="font-size:11.5px; font-weight:700; color:#fff; margin-top:2px;" id="cat_headline">Headline Loading...</div>
+          </div>
+          <div style="font-size:10.5px; color:#cbd5e1; line-height:1.4; background:#0b0e14; padding:6px 8px; border-radius:4px; border:1px solid #1e283d;">
+            <div style="font-size:9.5px; color:#38bdf8; font-weight:700; margin-bottom:2px; text-transform:uppercase;">🏛️ Institutional Repricing Trajectory:</div>
+            <div id="cat_analysis">Institutional volume surge triggering structural repricing.</div>
+          </div>
+          <div>
+            <div style="font-size:9.5px; color:var(--text-muted); text-transform:uppercase; font-weight:700; margin-bottom:4px; display:flex; justify-content:space-between;">
+              <span>Official SEC EDGAR Filings (T-3 to T+1):</span>
+              <span id="filing_count_badge" style="color:#38bdf8;">0 Filings</span>
+            </div>
+            <div id="filings_list" style="display:flex; flex-direction:column; gap:3px;">
+              <div style="color:var(--text-muted); font-style:italic; font-size:10px;">No official SEC filings in window.</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Card 4: Relative Strength (RS) & Technical Posture -->
+      <div class="d-card" id="card_rs_posture">
+        <div class="d-card-title"><span>🏆 4. Relative Strength (RS) &amp; Posture</span></div>
         <div class="d-row"><span class="d-lbl">Breakout RS Rating:</span><span class="d-val hl" id="d_rs">-</span></div>
         <div class="d-row"><span class="d-lbl">Stage 2 Posture:</span><span class="d-val pos" id="d_stage2">-</span></div>
+        <div class="d-row"><span class="d-lbl">Distance to 52W High:</span><span class="d-val" id="d_dist_52w">-</span></div>
+        <div class="d-row"><span class="d-lbl">20D Base Tightness:</span><span class="d-val" id="d_base_tight">-</span></div>
+        <div class="d-row"><span class="d-lbl">Pre-EP 20D Runup:</span><span class="d-val" id="d_pre_runup">-</span></div>
+      </div>
+
+      <!-- Card 5: Sector & Theme Momentum Backdrop -->
+      <div class="d-card" id="card_sec_theme">
+        <div class="d-card-title"><span>🌊 5. Sector &amp; Theme Momentum Backdrop</span></div>
         <div class="d-row"><span class="d-lbl">Theme Momentum:</span><span class="d-val" id="d_thm_mom">-</span></div>
         <div class="d-row"><span class="d-lbl">Sector Momentum:</span><span class="d-val" id="d_sec_mom">-</span></div>
         <div class="d-row"><span class="d-lbl">Thematic Archetype:</span><span class="d-val hl" id="d_thm_arch">-</span></div>
       </div>
 
-      <!-- Card 4: Day 1 EP Catalyst Quality -->
-      <div class="d-card">
-        <div class="d-card-title"><span>⚡ 4. Day 1 EP Catalyst Quality</span></div>
+      <!-- Card 6: Day 1 EP Catalyst Quality -->
+      <div class="d-card" id="card_ep_metrics">
+        <div class="d-card-title"><span>⚡ 6. Day 1 EP Catalyst Metrics</span></div>
         <div class="d-row"><span class="d-lbl">Day 1 Gap %:</span><span class="d-val pos" id="d_gap">-</span></div>
         <div class="d-row"><span class="d-lbl">Day 1 RVOL:</span><span class="d-val hl" id="d_rvol">-</span></div>
         <div class="d-row"><span class="d-lbl">Close Position in Range:</span><span class="d-val" id="d_close_pos">-</span></div>
@@ -1473,9 +2015,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <div class="d-row"><span class="d-lbl">V2 Rolling Conviction P(+50%):</span><span class="d-val hl" id="d_v2_prob">-</span></div>
       </div>
 
-      <!-- Card 5: Market Health at Entry (SPY & QQQ) -->
-      <div class="d-card">
-        <div class="d-card-title"><span>🌐 5. Market Health at Entry (SPY &amp; QQQ)</span></div>
+      <!-- Card 7: Market Health at Entry (SPY & QQQ) -->
+      <div class="d-card" id="card_mkt_health">
+        <div class="d-card-title"><span>🌐 7. Market Health at Entry (SPY &amp; QQQ)</span></div>
         <div class="d-row"><span class="d-lbl">SPY Above 50 SMA:</span><span class="d-val pos" id="d_spy_50">-</span></div>
         <div class="d-row"><span class="d-lbl">SPY 20D Momentum:</span><span class="d-val" id="d_spy_mom">-</span></div>
         <div class="d-row"><span class="d-lbl">QQQ Above 50 SMA:</span><span class="d-val pos" id="d_qqq_50">-</span></div>
@@ -1496,11 +2038,43 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     let currentSortBy = 'r_multiple';
     let currentSortDir = 'desc';
     let chart, candleSeries, volumeSeries, maSeries, triggerLine, stopLine, climaxLine;
+    let ema8Series, ema10Series, ema20Series, ema21Series, sma50Series, sma200Series, volMa20Series;
+    let larssonFastSeries, larssonSlowSeries;
+    let currentChartData = null;
+    let currentPollIntervalSec = 300;
+    let pollTimerId = null;
+    let isFullscreen = false;
 
     window.onload = function() {
       initChart();
+      initIndicatorSettings();
+      loadMonitorSettings();
       loadData();
       preloadWatchlistCount();
+      resetWatchlistPolling();
+
+      window.addEventListener('keydown', (e) => {
+        if (e.target && (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT' || e.target.tagName === 'TEXTAREA')) {
+          if (e.key === 'Escape') {
+            e.target.blur();
+            if (isFullscreen) toggleChartFullscreen();
+          }
+          return;
+        }
+        if (e.key === 'Escape') {
+          if (isFullscreen) toggleChartFullscreen();
+          const cs = document.getElementById('chart_settings_panel');
+          if (cs) cs.style.display = 'none';
+          const ms = document.getElementById('monitor_settings_panel');
+          if (ms) ms.style.display = 'none';
+        } else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') {
+          e.preventDefault();
+          selectPreviousTrade();
+        } else if (e.key === 'ArrowRight' || e.key === 'ArrowDown') {
+          e.preventDefault();
+          selectNextTrade();
+        }
+      });
     };
 
     function initChart() {
@@ -1535,6 +2109,28 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         scaleMargins: { top: 0.82, bottom: 0.0 }
       });
 
+      // Indicator Lines
+      volMa20Series = chart.addLineSeries({
+        priceFormat: { type: 'volume' },
+        priceScaleId: 'volume_scale',
+        color: '#38bdf8',
+        lineWidth: 1.5,
+        title: 'Vol 20 MA',
+        priceLineVisible: false
+      });
+
+      ema8Series = chart.addLineSeries({ color: '#ec4899', lineWidth: 1, title: '8 EMA', priceLineVisible: false });
+      ema10Series = chart.addLineSeries({ color: '#f59e0b', lineWidth: 1, title: '10 EMA', priceLineVisible: false });
+      ema20Series = chart.addLineSeries({ color: '#38bdf8', lineWidth: 1, title: '20 EMA', priceLineVisible: false });
+      ema21Series = chart.addLineSeries({ color: '#6366f1', lineWidth: 1, title: '21 EMA', priceLineVisible: false });
+      sma50Series = chart.addLineSeries({ color: '#a855f7', lineWidth: 1, title: '50 SMA', priceLineVisible: false });
+      sma200Series = chart.addLineSeries({ color: '#cbd5e1', lineWidth: 1, title: '200 SMA', priceLineVisible: false });
+
+      // Larsson Ribbon Lines
+      larssonFastSeries = chart.addLineSeries({ color: '#facc15', lineWidth: 1.5, title: 'Larsson Fast', priceLineVisible: false });
+      larssonSlowSeries = chart.addLineSeries({ color: '#0284c7', lineWidth: 1.5, title: 'Larsson Slow', priceLineVisible: false });
+
+      // Active Strategy Trailing MA
       maSeries = chart.addLineSeries({ color: '#38bdf8', lineWidth: 2 });
 
       // Robust ResizeObserver ensures canvas always matches container without overflowing
@@ -1546,6 +2142,157 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         }
       });
       ro.observe(el);
+    }
+
+    function initIndicatorSettings() {
+      const saved = JSON.parse(localStorage.getItem('ep_chart_indicators') || '{}');
+      const list = ['chk_ema8', 'chk_ema10', 'chk_ema20', 'chk_ema21', 'chk_sma50', 'chk_sma200', 'chk_vol_ma20', 'chk_larsson'];
+      list.forEach(id => {
+        const el = document.getElementById(id);
+        if (el) {
+          if (saved[id] !== undefined) {
+            el.checked = saved[id];
+          } else if (id === 'chk_vol_ma20') {
+            el.checked = true;
+          } else {
+            el.checked = false;
+          }
+        }
+      });
+      const savedFastest = localStorage.getItem('ep_larsson_fastest');
+      if (savedFastest && document.getElementById('cfg_larsson_fastest')) {
+        document.getElementById('cfg_larsson_fastest').value = savedFastest;
+      }
+    }
+
+    function toggleIndicatorSeries() {
+      if (!currentChartData) return;
+      const states = {};
+      const map = [
+        { id: 'chk_ema8', series: ema8Series, data: currentChartData.ema8 },
+        { id: 'chk_ema10', series: ema10Series, data: currentChartData.ema10 },
+        { id: 'chk_ema20', series: ema20Series, data: currentChartData.ema20 },
+        { id: 'chk_ema21', series: ema21Series, data: currentChartData.ema21 },
+        { id: 'chk_sma50', series: sma50Series, data: currentChartData.sma50 },
+        { id: 'chk_sma200', series: sma200Series, data: currentChartData.sma200 },
+        { id: 'chk_vol_ma20', series: volMa20Series, data: currentChartData.vol_ma20 },
+        { id: 'chk_larsson', series: larssonFastSeries, data: currentChartData.larsson_fast, slowSeries: larssonSlowSeries, slowData: currentChartData.larsson_slow }
+      ];
+
+      map.forEach(item => {
+        const el = document.getElementById(item.id);
+        const checked = el ? el.checked : false;
+        states[item.id] = checked;
+        if (item.series) {
+          item.series.setData(checked && item.data ? item.data : []);
+        }
+        if (item.slowSeries) {
+          item.slowSeries.setData(checked && item.slowData ? item.slowData : []);
+        }
+      });
+
+      localStorage.setItem('ep_chart_indicators', JSON.stringify(states));
+    }
+
+    function toggleChartFullscreen() {
+      isFullscreen = !isFullscreen;
+      const p = document.getElementById('pane_chart');
+      const b = document.getElementById('btn_chart_fullscreen');
+      const hint = document.getElementById('fs_keyboard_hint');
+      if (p) p.classList.toggle('fullscreen', isFullscreen);
+      if (b) {
+        b.textContent = isFullscreen ? '🗗 Minimize' : '⛶ Fullscreen';
+        b.title = isFullscreen ? 'Exit Fullscreen (Esc)' : 'Toggle Fullscreen Chart';
+      }
+      if (hint) {
+        hint.style.display = isFullscreen ? 'inline' : 'none';
+      }
+      setTimeout(() => {
+        if (chart) {
+          const el = document.getElementById('chart_div');
+          chart.applyOptions({ width: el.clientWidth, height: el.clientHeight });
+        }
+      }, 80);
+    }
+
+    function toggleChartSettings() {
+      const p = document.getElementById('chart_settings_panel');
+      if (!p) return;
+      p.style.display = (p.style.display === 'none' || !p.style.display) ? 'flex' : 'none';
+    }
+
+    function toggleMonitorSettings() {
+      const p = document.getElementById('monitor_settings_panel');
+      if (!p) return;
+      p.style.display = (p.style.display === 'none' || !p.style.display) ? 'flex' : 'none';
+    }
+
+    async function loadMonitorSettings() {
+      try {
+        const res = await fetch('/api/monitor_settings');
+        if (res.ok) {
+          const data = await res.json();
+          currentPollIntervalSec = data.poll_interval_sec || 300;
+          const sel = document.getElementById('sel_monitor_interval');
+          if (sel) sel.value = String(currentPollIntervalSec);
+          resetWatchlistPolling();
+        }
+      } catch (e) {}
+    }
+
+    async function saveMonitorInterval(val) {
+      try {
+        const sec = parseInt(val, 10);
+        const res = await fetch('/api/monitor_settings', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ poll_interval_sec: sec })
+        });
+        if (res.ok) {
+          const data = await res.json();
+          currentPollIntervalSec = data.poll_interval_sec;
+          resetWatchlistPolling();
+          alert(`Detector interval updated to ${Math.round(currentPollIntervalSec / 60)} minutes.`);
+        }
+      } catch (e) {
+        alert('Failed to update monitor settings: ' + e.message);
+      }
+    }
+
+    async function runMonitorCycleNow() {
+      try {
+        const res = await fetch('/api/run_monitor_cycle', { method: 'POST' });
+        if (res.ok) {
+          const data = await res.json();
+          alert(`Check cycle complete: ${data.alerts_count} alert(s) found out of ${data.active_count} active setups.`);
+          loadWatchlistData();
+        }
+      } catch (e) {
+        alert('Failed to run cycle: ' + e.message);
+      }
+    }
+
+    function resetWatchlistPolling() {
+      if (pollTimerId) clearInterval(pollTimerId);
+      pollTimerId = setInterval(() => {
+        if (mainMode === 'watchlist') {
+          loadWatchlistData();
+        }
+      }, currentPollIntervalSec * 1000);
+    }
+
+    function onChartHistoryChange() {
+      if (selectedTrade) {
+        selectTrade(selectedTrade);
+      }
+    }
+
+    function onLarssonFastestChange() {
+      const val = document.getElementById('cfg_larsson_fastest').value;
+      localStorage.setItem('ep_larsson_fastest', val);
+      if (selectedTrade) {
+        selectTrade(selectedTrade);
+      }
     }
 
     function setMainMode(mode) {
@@ -1641,6 +2388,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       });
 
       renderClosedTable();
+      populateNavStockSelect();
       if (currentTrades.length > 0) {
         const matched = currentTrades.find(t => selectedTrade && t.symbol === selectedTrade.symbol && t.entry_date === selectedTrade.entry_date);
         selectTrade(matched || currentTrades[0]);
@@ -1675,6 +2423,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       });
 
       renderWatchlistTable();
+      populateNavStockSelect();
       if (currentWatchlist.length > 0) {
         const matched = currentWatchlist.find(t => selectedTrade && t.symbol === selectedTrade.symbol && t.ep_date === selectedTrade.ep_date);
         selectTrade(matched || currentWatchlist[0]);
@@ -1734,6 +2483,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         currentTrades = data.trades || [];
         document.getElementById('tbl_count_lbl').textContent = `QUALIFIED TRADES (${currentTrades.length})`;
         renderClosedTable();
+        populateNavStockSelect();
 
         if (currentTrades.length > 0) {
           const matched = currentTrades.find(t => t.symbol === prevSelectedSym && t.entry_date === prevSelectedEntry);
@@ -1765,6 +2515,29 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         }
         currentWatchlist = items;
 
+        // Update Intraday Monitor telemetry pill
+        const pill = document.getElementById('monitor_pill');
+        const dot = document.getElementById('monitor_dot');
+        const mText = document.getElementById('monitor_text');
+        const iMeta = data.intraday_meta || {};
+        if (pill && dot && mText) {
+          if (iMeta.market_open) {
+            if (iMeta.alerts_count > 0) {
+              pill.className = 'monitor-indicator alerting';
+              dot.style.background = '#c084fc';
+              mText.textContent = `🚨 ${iMeta.alerts_count} INTRADAY SELL HALF ALERT(S)`;
+            } else {
+              pill.className = 'monitor-indicator live';
+              dot.style.background = '#22c55e';
+              mText.textContent = `⚡ Intraday Monitor: Live (${iMeta.timestamp_et ? iMeta.timestamp_et.split(' ')[1] + ' ET' : 'Open'})`;
+            }
+          } else {
+            pill.className = 'monitor-indicator';
+            dot.style.background = '#94a3b8';
+            mText.textContent = `⚪ Intraday Monitor: Market Closed`;
+          }
+        }
+
         const activeCount = items.filter(x => x.status === 'Active Long').length;
         const coilingCount = items.filter(x => x.status === 'Coiling Setup').length;
         const topGain = items.length > 0 ? Math.max(...items.map(x => x.unrealized_r)) : 0.0;
@@ -1789,6 +2562,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
         document.getElementById('tbl_count_lbl').textContent = `WATCHLIST SETUPS (${items.length})`;
         renderWatchlistTable();
+        populateNavStockSelect();
 
         if (currentWatchlist.length > 0) {
           selectTrade(currentWatchlist[0]);
@@ -1841,17 +2615,28 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       tbody.innerHTML = '';
       currentWatchlist.forEach((it, i) => {
         const row = document.createElement('tr');
+        const isAlert = it.is_alert || (it.alert_state && it.alert_state.includes('🚨')) || (it.current_high_exhaustion_pct >= (it.climax_threshold_pct || 50.0));
+        const isElevated = (!isAlert && (it.alert_state === '⚠️ ELEVATED_WATCH' || it.current_high_exhaustion_pct >= ((it.climax_threshold_pct || 50.0) - 5.0)));
+
         if (selectedTrade && selectedTrade.symbol === it.symbol && selectedTrade.ep_date === it.ep_date) {
-          row.className = 'selected';
+          row.className = isAlert ? 'selected row-alert-pulse' : 'selected';
+        } else if (isAlert) {
+          row.className = 'row-alert-pulse';
         }
 
         const isActive = (it.status === 'Active Long');
-        const statusBadge = isActive ? '<span class="badge-status status-active">Active Long</span>' : '<span class="badge-status status-coiling">Coiling Setup</span>';
+        let statusBadge = isActive ? '<span class="badge-status status-active">Active Long</span>' : '<span class="badge-status status-coiling">Coiling Setup</span>';
+        if (isAlert) {
+          statusBadge += `<span class="badge-alert-pulse" title="${it.alert_action || 'ML Climax Exhaustion Detected'}">🚨 SELL HALF</span>`;
+        } else if (isElevated) {
+          statusBadge += `<span class="badge-elevated" title="${it.alert_action || 'Elevated Exhaustion'}">⚠️ WATCH</span>`;
+        }
         
         let gainCol = '';
         if (isActive) {
           const rColor = it.unrealized_r >= 0 ? 'var(--green)' : 'var(--red)';
-          gainCol = `<span style="color:${rColor}; font-weight:700;">+${it.unrealized_r.toFixed(2)}R (+${it.unrealized_pct}%)</span>`;
+          const exhPct = it.current_high_exhaustion_pct !== undefined ? it.current_high_exhaustion_pct : 0.0;
+          gainCol = `<span style="color:${rColor}; font-weight:700;">+${it.unrealized_r.toFixed(2)}R (+${it.unrealized_pct}%)</span><div style="font-size:9.5px; color:${isAlert ? '#c084fc' : (isElevated ? '#fbbf24' : 'var(--text-muted)')}; font-weight:600;">Exh: ${exhPct}%</div>`;
         } else {
           gainCol = `<span style="color:var(--amber); font-weight:600;">${it.dist_to_trigger.toFixed(1)}% to Trigger</span>`;
         }
@@ -1874,6 +2659,103 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       });
     }
 
+    function getActiveList() {
+      return (mainMode === 'watchlist') ? currentWatchlist : currentTrades;
+    }
+
+    function populateNavStockSelect() {
+      const list = getActiveList();
+      const sel = document.getElementById('sel_nav_stock');
+      if (!sel) return;
+      sel.innerHTML = '';
+      if (!list || list.length === 0) {
+        const opt = document.createElement('option');
+        opt.value = '-1';
+        opt.textContent = 'No stocks available';
+        sel.appendChild(opt);
+        updateNavControls();
+        return;
+      }
+
+      list.forEach((t, i) => {
+        const opt = document.createElement('option');
+        opt.value = i;
+        if (mainMode === 'watchlist') {
+          const isAct = (t.status === 'Active Long');
+          const perf = isAct ? `+${t.unrealized_r.toFixed(2)}R` : `${t.dist_to_trigger.toFixed(1)}% dist`;
+          const statusShort = isAct ? 'Active' : 'Coiling';
+          opt.textContent = `${i + 1}. ${t.symbol} · ${statusShort} (${perf}) · RS:${t.rs_score}`;
+        } else {
+          const rSign = t.r_multiple >= 0 ? '+' : '';
+          const archClean = t.archetype ? t.archetype.replace(/^[^\s]+\s*/, '') : 'EP';
+          opt.textContent = `${i + 1}. ${t.symbol} · ${t.entry_date} (${rSign}${t.r_multiple.toFixed(2)}R) · ${archClean}`;
+        }
+        sel.appendChild(opt);
+      });
+      updateNavControls();
+    }
+
+    function updateNavControls() {
+      const list = getActiveList();
+      const sel = document.getElementById('sel_nav_stock');
+      const lbl = document.getElementById('lbl_nav_counter');
+      const btnPrev = document.getElementById('btn_nav_prev');
+      const btnNext = document.getElementById('btn_nav_next');
+
+      if (!list || list.length === 0 || !selectedTrade) {
+        if (lbl) lbl.textContent = '0 / 0';
+        if (btnPrev) btnPrev.disabled = true;
+        if (btnNext) btnNext.disabled = true;
+        return;
+      }
+
+      const curIdx = list.findIndex(t => t.symbol === selectedTrade.symbol && (t.entry_date === selectedTrade.entry_date || t.ep_date === selectedTrade.ep_date));
+      const activeIdx = curIdx >= 0 ? curIdx : 0;
+
+      if (lbl) lbl.textContent = `${activeIdx + 1} / ${list.length}`;
+      if (btnPrev) btnPrev.disabled = (activeIdx <= 0);
+      if (btnNext) btnNext.disabled = (activeIdx >= list.length - 1);
+      if (sel && sel.value != activeIdx) {
+        sel.value = activeIdx;
+      }
+    }
+
+    function onNavStockSelect(idxVal) {
+      const list = getActiveList();
+      const idx = parseInt(idxVal, 10);
+      if (list && idx >= 0 && idx < list.length) {
+        selectTrade(list[idx]);
+        scrollTableRowIntoView(idx);
+      }
+    }
+
+    function selectPreviousTrade() {
+      const list = getActiveList();
+      if (!list || list.length === 0 || !selectedTrade) return;
+      const curIdx = list.findIndex(t => t.symbol === selectedTrade.symbol && (t.entry_date === selectedTrade.entry_date || t.ep_date === selectedTrade.ep_date));
+      if (curIdx > 0) {
+        selectTrade(list[curIdx - 1]);
+        scrollTableRowIntoView(curIdx - 1);
+      }
+    }
+
+    function selectNextTrade() {
+      const list = getActiveList();
+      if (!list || list.length === 0 || !selectedTrade) return;
+      const curIdx = list.findIndex(t => t.symbol === selectedTrade.symbol && (t.entry_date === selectedTrade.entry_date || t.ep_date === selectedTrade.ep_date));
+      if (curIdx >= 0 && curIdx < list.length - 1) {
+        selectTrade(list[curIdx + 1]);
+        scrollTableRowIntoView(curIdx + 1);
+      }
+    }
+
+    function scrollTableRowIntoView(idx) {
+      const tbody = document.getElementById('trade_rows');
+      if (tbody && tbody.children && tbody.children[idx]) {
+        tbody.children[idx].scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+      }
+    }
+
     async function selectTrade(tr) {
       selectedTrade = tr;
       if (mainMode === 'closed') {
@@ -1888,11 +2770,40 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
       // Update Chart header
       document.getElementById('c_ticker').textContent = tr.symbol;
+      const statusBadge = document.getElementById('c_badge_status');
+      const archBadge = document.getElementById('c_badge_arch');
+      const cMeta = document.getElementById('c_meta');
+
       if (isWl) {
-        document.getElementById('c_meta').textContent = `${tr.status} · ${tr.archetype || 'EP'} · EP: ${tr.ep_date} · RS: ${tr.rs_score} · ${tr.sector || tr.theme || 'Tech'}`;
+        if (statusBadge) {
+          statusBadge.textContent = tr.status || 'Active';
+          statusBadge.className = isActiveLong ? 'badge-status status-active' : 'badge-status status-coiling';
+          statusBadge.style.display = 'inline-block';
+        }
+        if (archBadge) {
+          archBadge.textContent = tr.archetype ? tr.archetype.replace(/^[^\s]+\s*/, '') : 'Core';
+          archBadge.style.display = 'inline-block';
+        }
+        const fullMeta = `EP: ${tr.ep_date} · RS: ${tr.rs_score} · ${tr.sector || tr.theme || 'Tech'}`;
+        cMeta.textContent = fullMeta;
+        cMeta.title = `${tr.symbol} · ${tr.status} · ${tr.archetype} · ${fullMeta}`;
       } else {
-        document.getElementById('c_meta').textContent = `${tr.archetype} · ${tr.sector} · Entry: ${tr.entry_date} · Sizing: ${tr.v2_size_mult}x`;
+        if (statusBadge) {
+          const rStr = (tr.r_multiple >= 0 ? '+' : '') + tr.r_multiple.toFixed(2) + ' R';
+          statusBadge.textContent = rStr;
+          statusBadge.className = tr.r_multiple >= 0 ? 'badge-status status-active' : 'badge-status status-coiling';
+          statusBadge.style.display = 'inline-block';
+        }
+        if (archBadge) {
+          archBadge.textContent = tr.archetype ? tr.archetype.replace(/^[^\s]+\s*/, '') : 'Core';
+          archBadge.style.display = 'inline-block';
+        }
+        const fullMeta = `${tr.sector} · Entry: ${tr.entry_date} · Sizing: ${tr.v2_size_mult}x`;
+        cMeta.textContent = fullMeta;
+        cMeta.title = `${tr.symbol} · ${tr.archetype} · ${fullMeta}`;
       }
+
+      updateNavControls();
 
       // Update Trade Classification & Setup Status
       document.getElementById('d_trade_type').textContent = tr.trade_type || 'Trade 1: Base EP Delayed Breakout (Days 2-5)';
@@ -1900,6 +2811,13 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
       // Update Dossier Card 1
       const rBadge = document.getElementById('d_r_badge');
+      const sugLabel = tr.suggested_size_label || (tr.v2_size_mult ? `${tr.v2_size_mult}x Allocation` : '1.00x Base Allocation');
+      const sugDesc = tr.suggested_size_desc || (tr.position_management_plan || 'Standard institutional EP allocation: 1.0 R risk budget under institutional rules.');
+
+      document.getElementById('d_size_mult').textContent = sugLabel;
+      document.getElementById('d_size_title').textContent = sugLabel;
+      document.getElementById('d_size_desc').textContent = sugDesc;
+
       if (isWl) {
         if (isActiveLong) {
           rBadge.textContent = `+${tr.unrealized_r.toFixed(2)} R`;
@@ -1910,7 +2828,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           document.getElementById('d_lbl_stop').textContent = 'Stop Loss:';
           document.getElementById('d_stop').textContent = `$${tr.stop_price.toFixed(2)} (-${tr.dynamic_stop_loss_pct}%)`;
           document.getElementById('d_risk_pct').textContent = `${tr.dynamic_stop_loss_pct}%`;
-          document.getElementById('d_size_mult').textContent = `Active Long (${tr.days_in_trade}d in trade)`;
           document.getElementById('d_lbl_exit').textContent = 'Current Price:';
           document.getElementById('d_exit').textContent = `$${tr.current_price.toFixed(2)}`;
           document.getElementById('d_lbl_exit_reason').textContent = 'Unrealized Gain:';
@@ -1928,7 +2845,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           document.getElementById('d_lbl_stop').textContent = 'Invalidation (D1 Low):';
           document.getElementById('d_stop').textContent = `$${tr.stop_price.toFixed(2)} (-${tr.dynamic_stop_loss_pct}%)`;
           document.getElementById('d_risk_pct').textContent = `${tr.dynamic_stop_loss_pct}%`;
-          document.getElementById('d_size_mult').textContent = 'Pending Breakout';
           document.getElementById('d_lbl_exit').textContent = 'Current Price:';
           document.getElementById('d_exit').textContent = `$${tr.current_price.toFixed(2)}`;
           document.getElementById('d_lbl_exit_reason').textContent = 'Setup Status:';
@@ -1948,7 +2864,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         document.getElementById('d_lbl_stop').textContent = isMlStop ? 'Stop Loss (🤖 20D MAE):' : 'Stop Loss (🛡️ D1 Low):';
         document.getElementById('d_stop').textContent = `$${tr.stop_price.toFixed(2)} (-${tr.dynamic_stop_loss_pct}%)`;
         document.getElementById('d_risk_pct').textContent = `${tr.dynamic_stop_loss_pct}%`;
-        document.getElementById('d_size_mult').textContent = `${tr.v2_size_mult}x allocation (V2 Win: ${((tr.v2_win_prob || 0.5) * 100).toFixed(0)}%)`;
         document.getElementById('d_lbl_exit').textContent = 'Exit Price & Date:';
         document.getElementById('d_exit').textContent = `$${tr.exit_price.toFixed(2)} (${tr.exit_date})`;
         document.getElementById('d_lbl_exit_reason').textContent = 'Exit Reason:';
@@ -2001,10 +2916,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         document.getElementById('d_plan_desc').textContent = `Matched institutional strategy: ${tr.archetype} trailed with ${recMaName}.`;
       }
 
-      // Update Dossier Cards 3, 4, 5
+      // Update Dossier Cards 4 & 5: RS & Sector/Theme
       document.getElementById('d_pre_runup').textContent = `${(tr.pre_runup_20d || 0) > 0 ? '+' : ''}${tr.pre_runup_20d || 0}% (Base)`;
-      document.getElementById('d_base_tight').textContent = `${tr.pre_consol_tightness_20d || 0}%`;
-      document.getElementById('d_dist_52w').textContent = `-${tr.pre_dist_52w_high || 0}%`;
+      document.getElementById('d_base_tight').textContent = `${tr.pre_consol_tightness_20d || 0}% consolidation`;
+      document.getElementById('d_dist_52w').textContent = `-${tr.pre_dist_52w_high || 0}% from 52W High`;
       document.getElementById('d_rs').textContent = `${tr.rs_score_breakout || tr.rs_score || 50} (RS Score)`;
       document.getElementById('d_stage2').textContent = (tr.stage2_breakout || tr.stage2) ? 'YES (Bullish Posture)' : 'NO';
 
@@ -2021,7 +2936,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       const archName = tr.thematic_archetype || tr.primary_archetype || 'Leading Trend';
       document.getElementById('d_thm_arch').textContent = archName;
 
-      // Card 4: Catalyst & ML
+      // Card 6: Day 1 EP Catalyst Quality
       document.getElementById('d_gap').textContent = `+${tr.gap_pct || 0}%`;
       document.getElementById('d_rvol').textContent = `${tr.rvol || 0}x volume`;
       document.getElementById('d_close_pos').textContent = `${tr.close_pos || 0.5}`;
@@ -2031,7 +2946,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       const conv50 = (tr.v2_conviction_50 !== undefined && tr.v2_conviction_50 !== null) ? tr.v2_conviction_50 : (tr.v2_breakout || tr.ml_50 || 0);
       document.getElementById('d_v2_prob').textContent = `${Math.round(winP * 100)}% Win | P(+50%): ${(conv50 * 100).toFixed(1)}%`;
 
-      // Card 5: Market Health (SPY & QQQ)
+      // Card 7: Market Health at Entry (SPY & QQQ)
       const spy50 = (tr.spy_above_50_entry !== undefined) ? tr.spy_above_50_entry : true;
       document.getElementById('d_spy_50').textContent = spy50 ? 'YES (Tailwind)' : 'NO (Headwind)';
       document.getElementById('d_spy_50').className = `d-val ${spy50 ? 'pos' : 'neg'}`;
@@ -2064,11 +2979,15 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
       // Fetch Bars & Draw Chart
       const exitMode = document.getElementById('sel_exit_mode') ? document.getElementById('sel_exit_mode').value : 'adaptive';
+      const historyMode = document.getElementById('sel_chart_history') ? document.getElementById('sel_chart_history').value : 'setup';
+      const lFastest = document.getElementById('cfg_larsson_fastest') ? document.getElementById('cfg_larsson_fastest').value : '32';
       const entryDt = isWl ? (tr.trigger_date && tr.trigger_date !== 'Pending' ? tr.trigger_date : tr.ep_date) : tr.entry_date;
       const exitDt = isWl ? 'None' : tr.exit_date;
 
-      const res = await fetch(`/api/chart?symbol=${tr.symbol}&ep_date=${tr.ep_date}&entry_date=${entryDt}&exit_date=${exitDt}&exit_mode=${exitMode}`);
+      const chartUrl = `/api/chart?symbol=${tr.symbol}&ep_date=${tr.ep_date}&entry_date=${entryDt}&exit_date=${exitDt}&exit_mode=${exitMode}&history=${historyMode}&larsson_fastest=${lFastest}`;
+      const res = await fetch(chartUrl);
       const cData = await res.json();
+      currentChartData = cData;
 
       candleSeries.setData(cData.candles);
       volumeSeries.setData(cData.volume);
@@ -2097,6 +3016,52 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       document.getElementById('c_ma_legend').textContent = `── Trailing MA: ${maName}`;
       document.getElementById('c_ma_legend').style.color = maColor;
 
+      // Update Spans & Indicator series
+      if (cData.larsson_spans) {
+        document.getElementById('lbl_larsson_spans').textContent = `(${cData.larsson_spans.join(', ')})`;
+      }
+      toggleIndicatorSeries();
+
+      // Card 3: Fundamental Catalyst & SEC EDGAR Filings
+      const cat = cData.catalyst || tr.catalyst;
+      if (cat) {
+        document.getElementById('cat_category').textContent = cat.category || 'Institutional Event';
+        document.getElementById('cat_headline').textContent = cat.headline || `${tr.symbol} Repricing Event`;
+        document.getElementById('cat_tier_badge').textContent = cat.tier || 'Tier-1 Catalyst';
+        document.getElementById('cat_analysis').textContent = cat.analysis || `${tr.symbol} experienced an institutional volume surge.`;
+
+        const filings = cat.sec_filings || [];
+        document.getElementById('filing_count_badge').textContent = `${filings.length} Filing${filings.length === 1 ? '' : 's'}`;
+        const filingsList = document.getElementById('filings_list');
+        if (filings.length === 0) {
+          filingsList.innerHTML = '<div style="color:var(--text-muted); font-style:italic; font-size:10px; padding:3px 0;">No official SEC filings within 3 days. Catalyst driven by press release or earnings.</div>';
+        } else {
+          filingsList.innerHTML = filings.map(f => {
+            const is8K = f.form && (f.form.includes('8-K') || f.form.includes('6-K'));
+            const badgeCol = is8K ? '#8b5cf6' : '#0284c7';
+            const itemsText = f.items ? `· Items: <b>${f.items}</b>` : '';
+            const linkHtml = f.url ? `<a href="${f.url}" target="_blank" rel="noopener noreferrer" class="filing-link" title="Open official SEC filing on EDGAR archive">View SEC EDGAR ↗</a>` : '';
+            return `
+              <div class="filing-item">
+                <div style="min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; margin-right:8px;">
+                  <span class="badge-status status-active" style="background:${badgeCol}; color:#fff; font-size:9.5px; padding:1px 5px; border-radius:3px;">Form ${f.form}</span>
+                  <span style="color:#cbd5e1; margin-left:6px; font-weight:600;">${f.date}</span>
+                  <span style="color:#94a3b8; margin-left:4px; font-size:10px;">${itemsText}</span>
+                </div>
+                ${linkHtml}
+              </div>
+            `;
+          }).join('');
+        }
+      } else {
+        document.getElementById('cat_category').textContent = 'EP Catalyst';
+        document.getElementById('cat_headline').textContent = `${tr.symbol} Episodic Repricing`;
+        document.getElementById('cat_tier_badge').textContent = 'Tier-1 Institutional Repricing';
+        document.getElementById('cat_analysis').textContent = `${tr.symbol} volume surge triggering structural repricing.`;
+        document.getElementById('filing_count_badge').textContent = '0 Filings';
+        document.getElementById('filings_list').innerHTML = '<div style="color:var(--text-muted); font-style:italic; font-size:10px;">Catalyst data loading...</div>';
+      }
+
       // Price lines
       if (triggerLine) candleSeries.removePriceLine(triggerLine);
       if (stopLine) candleSeries.removePriceLine(stopLine);
@@ -2122,14 +3087,15 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       });
 
       const climaxLegend = document.getElementById('c_climax_legend');
-      if (isWl && isActiveLong && tr.current_high_exhaustion_pct >= (tr.climax_threshold_pct || 50.0)) {
+      if (isWl && isActiveLong && (tr.current_high_exhaustion_pct >= (tr.climax_threshold_pct || 50.0) || tr.is_alert)) {
+        const peakPrice = tr.intraday_high || tr.current_price;
         climaxLine = candleSeries.createPriceLine({
-          price: tr.current_price, color: '#c084fc', lineWidth: 2, lineStyle: 2,
-          title: `🚨 SELL HALF (ML Exhaustion: ${tr.current_high_exhaustion_pct}%)`
+          price: peakPrice, color: '#c084fc', lineWidth: 2, lineStyle: 2,
+          title: `🚨 INTRADAY SELL HALF: $${peakPrice.toFixed(2)} (${tr.current_high_exhaustion_pct}% Exhaustion)`
         });
         if (climaxLegend) {
           climaxLegend.style.display = 'inline';
-          climaxLegend.textContent = `── 🚨 SELL HALF ALERT (${tr.current_high_exhaustion_pct}%)`;
+          climaxLegend.textContent = `── 🚨 INTRADAY SELL HALF (${tr.current_high_exhaustion_pct}%)`;
           climaxLegend.style.color = '#c084fc';
         }
       } else if (!isWl && tr.has_climax && tr.climax_price > 0 && document.getElementById('sel_climax') && document.getElementById('sel_climax').value === 'partial_50') {

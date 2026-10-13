@@ -13,21 +13,24 @@ import trading_calendar
 
 class TestDailyUpdateOrchestrator(unittest.TestCase):
     def test_get_dataset_timestamps(self):
-        """Verifies dataset timestamps inspection returns status for all 3 apps and datastore."""
+        """Verifies dataset timestamps inspection returns status for all 4 apps and datastore."""
         ts = daily_update.get_dataset_timestamps()
         self.assertIn("spy_bars_latest", ts)
         self.assertIn("rs_db_latest", ts)
         self.assertIn("ep_study_latest", ts)
         self.assertIn("qm_setups_latest", ts)
+        self.assertIn("opt_strategy_latest", ts)
         self.assertIn("rs_sessions_count", ts)
         self.assertIn("ep_events_count", ts)
         self.assertIn("qm_setups_count", ts)
+        self.assertIn("opt_strategy_count", ts)
 
         # Datastore and parquets should have non-empty dates
         self.assertIsNotNone(ts["spy_bars_latest"])
         self.assertGreater(ts["rs_sessions_count"], 0)
         self.assertGreater(ts["ep_events_count"], 0)
         self.assertGreater(ts["qm_setups_count"], 0)
+        self.assertGreater(ts["opt_strategy_count"], 0)
 
     def test_get_next_run_time_weekday_schedule(self):
         """Verifies calculation of next run time on trading days and over weekends."""
@@ -78,10 +81,12 @@ class TestDailyUpdateOrchestrator(unittest.TestCase):
     @patch("daily_update.update_rs_database.update_database")
     @patch("daily_update.ep_updater.update_pipeline")
     @patch("daily_update.update_qm_database.run_update")
+    @patch("daily_update.sim_optimized_ep_strategy.run_optimization")
     @patch("daily_update.reload_server")
     def test_run_pipeline_orchestration(
         self,
         mock_reload,
+        mock_opt,
         mock_qm,
         mock_ep,
         mock_rs,
@@ -99,6 +104,7 @@ class TestDailyUpdateOrchestrator(unittest.TestCase):
         self.assertIn("rs_database", res["steps"])
         self.assertIn("ep_study", res["steps"])
         self.assertIn("qm_setups", res["steps"])
+        self.assertIn("optimized_ep_strategy", res["steps"])
         self.assertEqual(len(res["server_reloads"]), len(daily_update.TARGET_SERVERS))
         self.assertIn("8787", res["server_reloads"])
 
@@ -107,6 +113,7 @@ class TestDailyUpdateOrchestrator(unittest.TestCase):
         mock_rs.assert_called_once_with(force=False)
         mock_ep.assert_called_once_with(skip_download=True, full_download=False, dry_run=False)
         mock_qm.assert_called_once_with(force=False)
+        mock_opt.assert_called_once()
         self.assertEqual(mock_reload.call_count, len(daily_update.TARGET_SERVERS))
 
 

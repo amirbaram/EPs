@@ -54,6 +54,8 @@ bash scripts/check.sh                 # Byte-compiles core EP modules + runs tes
 | Precomputed RS Universe Scores (Latest) | `data/simulations/rs_universe_scores.parquet` |
 | Historical QM Mining & EP Linkage Pipeline | `mine_qm_setups.py` |
 | Automated QM Database Incremental Updater | `update_qm_database.py` |
+| Real-Time Intraday Watchlist Climax Monitor | `intraday_watchlist_monitor.py` |
+| Intraday Monitor Start / Stop Shell Wrappers | `scripts/start_intraday_monitor.sh`, `scripts/stop_intraday_monitor.sh` |
 | Automated Daily Universe Ingestion & Multi-App Updater | `daily_update.py` |
 | Daemon Start / Stop Shell Wrappers | `scripts/start_daily_updater.sh`, `scripts/stop_daily_updater.sh` |
 | QM System Architecture & Pipeline Guide | `docs/QM_SYSTEM_GUIDE.md` |

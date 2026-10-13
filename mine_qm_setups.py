@@ -192,29 +192,52 @@ def scan_single_symbol(sym: str) -> List[Dict[str, Any]]:
             return []
 
         raw_hits = []
+        c_min = setups.config.QMB_CONS_MIN
+        c_max = setups.config.QMB_CONS_MAX
+        m_max = setups.config.QMB_MOVE_MAX_BARS
+        min_move = setups.config.QMB_MIN_MOVE
+        max_pb = setups.config.QMB_MAX_PULLBACK
+
         for i in range(min_bars, n):
-            # Fast candidate filter in numpy before heavy setup logic
-            w_start = i - (W + 1)
-            sub_hi = highs[w_start:i]
-            hi_rel = int(np.argmax(sub_hi))
-            hi_pos = w_start + hi_rel
-            cons_bars = i - hi_pos
-            if not (setups.config.QMB_CONS_MIN <= cons_bars <= setups.config.QMB_CONS_MAX):
-                continue
-            mstart = max(0, hi_pos - setups.config.QMB_MOVE_MAX_BARS)
-            move_low = float(np.min(lows[mstart : hi_pos + 1]))
-            if move_low <= 0 or (highs[hi_pos] / move_low - 1.0) * 100.0 < setups.config.QMB_MIN_MOVE:
-                continue
-            cons_low = float(np.min(lows[hi_pos : i + 1]))
-            if (1.0 - cons_low / highs[hi_pos]) * 100.0 > setups.config.QMB_MAX_PULLBACK:
+            # Fast surf pre-filter in numpy: reject non-rising EMA trend immediately
+            if not (e10[i] > e20[i]):
                 continue
 
-            # Fast surf pre-filter in numpy: reject 50-SMA floor breaches or non-rising trends immediately
-            c_s = closes[hi_pos + 1 : i + 1]
-            s50_s = s50[hi_pos + 1 : i + 1]
-            if np.any(c_s < s50_s):
+            h_start = max(0, i - c_max)
+            h_end = i - c_min
+            if h_end < h_start:
                 continue
-            if not (e10[i] > e20[i] and s50[i] > s50[hi_pos + 1]):
+
+            # Fast candidate filter in numpy before heavy setup logic
+            found_candidate = False
+            for hi_pos in range(h_end, h_start - 1, -1):
+                mstart = max(0, hi_pos - m_max)
+                mlow_pos = mstart + int(np.argmin(lows[mstart : hi_pos + 1]))
+                sub_hi = highs[mlow_pos : h_end + 1]
+                hi_abs = mlow_pos + int(np.argmax(sub_hi))
+                if hi_pos != hi_abs:
+                    continue
+
+                move_low = float(lows[mlow_pos])
+                if move_low <= 0 or (highs[hi_pos] / move_low - 1.0) * 100.0 < min_move:
+                    continue
+
+                cons_low = float(np.min(lows[hi_pos : i + 1]))
+                if (1.0 - cons_low / highs[hi_pos]) * 100.0 > max_pb:
+                    continue
+
+                # Fast surf pre-filter in numpy: reject 50-SMA floor breaches or non-rising trends immediately
+                c_s = closes[hi_pos + 1 : i + 1]
+                s50_s = s50[hi_pos + 1 : i + 1]
+                if np.any(c_s < s50_s):
+                    continue
+                if not (s50[i] > s50[hi_pos + 1]):
+                    continue
+
+                found_candidate = True
+                break
+
+            if not found_candidate:
                 continue
 
             res = setups.detect_qm_breakout(df.iloc[: i + 1])
@@ -226,10 +249,12 @@ def scan_single_symbol(sym: str) -> List[Dict[str, Any]]:
         if not raw_hits:
             return []
 
-        # Group into unique consolidation episodes by pole (pole_start, pole_end)
-        poles: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+        # Debounce raw hits by launch trough into unique episodes:
+        # Grinding daily new highs during a runup collapse into the dominant terminal swing high
+        # of the pole rather than creating noisy duplicate daily setups.
+        poles: Dict[str, List[Dict[str, Any]]] = {}
         for h in raw_hits:
-            pole_key = tuple(h["qm_pole"])
+            pole_key = h["qm_pole"][0]
             poles.setdefault(pole_key, []).append(h)
 
         ep_list = _GLOBAL_EP_MAP.get(sym, [])

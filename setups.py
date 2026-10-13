@@ -842,84 +842,111 @@ def detect_qm_breakout(d: pd.DataFrame) -> dict | None:
     n = len(d)
     if n < config.QMB_MOVE_LOOKBACK + config.QMB_CONS_MAX + 30:
         return None
-    # move high found EXCLUDING today (same breakout-day blindness as HTF/flat_base: a new-high
-    # breakout bar used to become its own reference high -> cons_bars=0 -> None)
-    look = d.iloc[-(config.QMB_MOVE_LOOKBACK + config.QMB_CONS_MAX + 1):-1]
-    hi_pos = int(d.index.get_loc(look["high"].idxmax()))
-    hi_p = float(d["high"].iloc[hi_pos])
-    cons_bars = n - 1 - hi_pos
-    if not (config.QMB_CONS_MIN <= cons_bars <= config.QMB_CONS_MAX):
-        return None
-    # 1. qualifying pole: a big move into the high over <= QMB_MOVE_MAX_BARS bars
-    mstart = max(0, hi_pos - config.QMB_MOVE_MAX_BARS)
-    mlow_pos = mstart + int(np.argmin(d["low"].to_numpy(float)[mstart:hi_pos + 1]))   # the move's launch low
-    move_low = float(d["low"].iloc[mlow_pos])
-    if move_low <= 0:
-        return None
-    move = (hi_p / move_low - 1) * 100
-    if move < config.QMB_MIN_MOVE:
-        return None
-    # 2. controlled pole pullback (less is better)
-    cons_low = float(d["low"].iloc[hi_pos:].min())
-    pullback = (1 - cons_low / hi_p) * 100
-    if pullback > config.QMB_MAX_PULLBACK:
-        return None
-    # 3. shakeout-aware surf of the rising 10/20-EMA over the consolidation (pole high -> latest bar)
+
+    c_min = config.QMB_CONS_MIN
+    c_max = config.QMB_CONS_MAX
+    m_max = config.QMB_MOVE_MAX_BARS
+    min_move = config.QMB_MIN_MOVE
+    max_pb = config.QMB_MAX_PULLBACK
+
+    lowA = d["low"].to_numpy(float)
+    highA = d["high"].to_numpy(float)
     closeA = d["close"].to_numpy(float)
-    cons_sl = slice(hi_pos + 1, n)
-    ride = _qm_ride(
-        closeA[cons_sl], d["low"].to_numpy(float)[cons_sl],
-        d["ema10"].to_numpy(float)[cons_sl], d["ema20"].to_numpy(float)[cons_sl],
-        d["sma50"].to_numpy(float)[cons_sl])
-    if ride is None:
+    e10A = d["ema10"].to_numpy(float)
+    e20A = d["ema20"].to_numpy(float)
+    s50A = d["sma50"].to_numpy(float)
+
+    h_start = max(0, n - 1 - c_max)
+    h_end = n - 1 - c_min
+    if h_end < h_start:
         return None
 
-    # 4. breakout-level STACK (shared with HTF): the trigger is the top of the stack (nearest resistance).
-    # `building` while coiling under it; `breakout` the day a level is popped on volume expansion.
-    volA, proj_frac = _project_last_volume(d)                           # project TODAY's partial bar (if live)
-    win = config.QMB_CONTRACT_WIN
-    vbase = volA[max(0, n - 1 - win):n - 1].mean()                      # recent contraction's avg volume
-    vol_ok_arr = np.zeros(n, bool)                                      # QM volume rule per bar
-    for i in range(hi_pos + 1, n):
-        vb = volA[max(0, i - win):i].mean()
-        vol_ok_arr[i] = vb > 0 and volA[i] >= config.QMB_BREAKOUT_VOL * vb
-    st = _breakout_stack(d, hi_pos, n - 1, vol_ok_arr, config.BREAKOUT_STACK_DOWNSWING)
-    trig = st["trigger"]
-    state = "breakout" if st["broke_today"] else "building"
-    provisional = bool(st["broke_today"] and proj_frac is not None)     # today's break used projected volume
-    rend = n - 1
-    lo_start = hi_pos + 1 + int(np.argmin(d["low"].to_numpy(float)[hi_pos + 1:n]))   # consolidation low
-    # 5. higher lows within the rising-support window (from the consolidation low)
-    if not _qm_higher_lows(d, lo_start, rend):
-        return None
-    # 6. assemble (trigger = top of the breakout stack)
-    close = float(closeA[n - 1])
-    pat = patterns.classify_consolidation(d, hi_pos + 1, rend)
-    vol_x = round(float(volA[n - 1] / vbase), 2) if vbase > 0 else None    # latest bar vol vs recent avg
-    idx = d.index
-    iso = lambda j: idx[j].date().isoformat()
-    return {
-        "setup": "qm_breakout",
-        "state": state,
-        "provisional": provisional,          # breakout confirmed on TODAY's projected (partial) volume
-        "vol_proj": round(proj_frac, 2) if proj_frac is not None else None,   # session fraction used
-        "move_pct": round(move, 1),
-        "cons_bars": int(cons_bars),
-        "pullback_pct": round(pullback, 1),
-        "ride_frac": ride["ride_frac"],
-        "shakeouts": ride["shakeouts"],
-        "vol_x": vol_x,
-        "breakouts": st["n_broken"],
-        "levels": st["n_levels"],
-        "pattern": pat["pattern"],
-        "dist_to_trigger_pct": round((trig / close - 1) * 100, 2),
-        "level": round(float(d["low"].to_numpy(float)[lo_start]), 2),   # consolidation low (support)
-        "trigger": round(trig, 2),
-        # chart geometry: pole + consolidation shading, and the stack resistance levels (horizontal)
-        "qm_pole": [iso(mlow_pos), iso(hi_pos)],
-        "qm_cons": [iso(hi_pos + 1), iso(n - 1)],
-        "stack_levels": [round(x, 2) for x in st["levels"]],
-    }
+    # Search candidate pole highs within valid consolidation window [h_start, h_end].
+    # Rather than taking a global idxmax() over 108 bars (which masks fresh rally legs if an older
+    # peak from 2 months ago was higher), anchor candidate poles by finding the launch trough and the
+    # absolute high achieved since that launch low within the valid consolidation window.
+    # Iterating from h_end down to h_start prioritizes the most mature/recent consolidation.
+    for hi_pos in range(h_end, h_start - 1, -1):
+        mstart = max(0, hi_pos - m_max)
+        mlow_pos = mstart + int(np.argmin(lowA[mstart : hi_pos + 1]))
+        sub_hi = highA[mlow_pos : h_end + 1]
+        hi_abs = mlow_pos + int(np.argmax(sub_hi))
+        if hi_pos != hi_abs:
+            continue
+
+        hi_p = float(highA[hi_pos])
+        cons_bars = n - 1 - hi_pos
+        move_low = float(lowA[mlow_pos])
+        if move_low <= 0:
+            continue
+        move = (hi_p / move_low - 1.0) * 100.0
+        if move < min_move:
+            continue
+
+        # 2. controlled pole pullback (less is better)
+        cons_low = float(lowA[hi_pos:].min())
+        pullback = (1.0 - cons_low / hi_p) * 100.0
+        if pullback > max_pb:
+            continue
+
+        # 3. shakeout-aware surf of the rising 10/20-EMA over the consolidation (pole high -> latest bar)
+        cons_sl = slice(hi_pos + 1, n)
+        ride = _qm_ride(
+            closeA[cons_sl], lowA[cons_sl],
+            e10A[cons_sl], e20A[cons_sl],
+            s50A[cons_sl])
+        if ride is None:
+            continue
+
+        # 4. breakout-level STACK (shared with HTF): the trigger is the top of the stack (nearest resistance).
+        # `building` while coiling under it; `breakout` the day a level is popped on volume expansion.
+        volA, proj_frac = _project_last_volume(d)                           # project TODAY's partial bar (if live)
+        win = config.QMB_CONTRACT_WIN
+        vbase = volA[max(0, n - 1 - win):n - 1].mean()                      # recent contraction's avg volume
+        vol_ok_arr = np.zeros(n, bool)                                      # QM volume rule per bar
+        for i in range(hi_pos + 1, n):
+            vb = volA[max(0, i - win):i].mean()
+            vol_ok_arr[i] = vb > 0 and volA[i] >= config.QMB_BREAKOUT_VOL * vb
+        st = _breakout_stack(d, hi_pos, n - 1, vol_ok_arr, config.BREAKOUT_STACK_DOWNSWING)
+        trig = st["trigger"]
+        state = "breakout" if st["broke_today"] else "building"
+        provisional = bool(st["broke_today"] and proj_frac is not None)     # today's break used projected volume
+        rend = n - 1
+        lo_start = hi_pos + 1 + int(np.argmin(lowA[hi_pos + 1:n]))   # consolidation low
+        # 5. higher lows within the rising-support window (from the consolidation low)
+        if not _qm_higher_lows(d, lo_start, rend):
+            continue
+
+        # 6. assemble (trigger = top of the breakout stack)
+        close = float(closeA[n - 1])
+        pat = patterns.classify_consolidation(d, hi_pos + 1, rend)
+        vol_x = round(float(volA[n - 1] / vbase), 2) if vbase > 0 else None    # latest bar vol vs recent avg
+        idx = d.index
+        iso = lambda j: idx[j].date().isoformat()
+        return {
+            "setup": "qm_breakout",
+            "state": state,
+            "provisional": provisional,          # breakout confirmed on TODAY's projected (partial) volume
+            "vol_proj": round(proj_frac, 2) if proj_frac is not None else None,   # session fraction used
+            "move_pct": round(move, 1),
+            "cons_bars": int(cons_bars),
+            "pullback_pct": round(pullback, 1),
+            "ride_frac": ride["ride_frac"],
+            "shakeouts": ride["shakeouts"],
+            "vol_x": vol_x,
+            "breakouts": st["n_broken"],
+            "levels": st["n_levels"],
+            "pattern": pat["pattern"],
+            "dist_to_trigger_pct": round((trig / close - 1) * 100, 2),
+            "level": round(float(lowA[lo_start]), 2),   # consolidation low (support)
+            "trigger": round(trig, 2),
+            # chart geometry: pole + consolidation shading, and the stack resistance levels (horizontal)
+            "qm_pole": [iso(mlow_pos), iso(hi_pos)],
+            "qm_cons": [iso(hi_pos + 1), iso(n - 1)],
+            "stack_levels": [round(x, 2) for x in st["levels"]],
+        }
+
+    return None
 
 
 def _ema_rider_state(d: pd.DataFrame) -> dict | None:

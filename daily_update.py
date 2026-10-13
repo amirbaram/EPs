@@ -45,6 +45,7 @@ import trading_calendar
 import update_rs_database
 import update_qm_database
 import scripts.update_ep_dataset as ep_updater
+import sim_optimized_ep_strategy
 
 PID_FILE = ROOT / "data" / "daily_updater.pid"
 LOG_FILE = ROOT / "logs" / "daily_update.log"
@@ -126,6 +127,18 @@ def get_dataset_timestamps() -> Dict[str, Any]:
         except Exception:
             pass
 
+    opt_latest = None
+    opt_count = 0
+    opt_path = ROOT / "data" / "simulations" / "optimized_ep_strategy_trades.parquet"
+    if opt_path.exists():
+        try:
+            df_opt = pd.read_parquet(opt_path, columns=["entry_date"])
+            opt_count = len(df_opt)
+            if not df_opt.empty:
+                opt_latest = str(df_opt["entry_date"].max())
+        except Exception:
+            pass
+
     return {
         "spy_bars_latest": spy_latest,
         "rs_db_latest": rs_latest,
@@ -134,6 +147,8 @@ def get_dataset_timestamps() -> Dict[str, Any]:
         "ep_events_count": ep_count,
         "qm_setups_latest": qm_latest,
         "qm_setups_count": qm_count,
+        "opt_strategy_latest": opt_latest,
+        "opt_strategy_count": opt_count,
     }
 
 
@@ -196,7 +211,7 @@ def run_pipeline(
         summary["steps"]["ep_study"] = {"status": "error", "error": str(e)}
 
     # STEP 4: Update QM Setups Database & EP Cross-References (Port 8785)
-    logger.info("▶ STEP 4/5: Mining QM Setups & cross-referencing EP igniters (Port 8785)...")
+    logger.info("▶ STEP 4/6: Mining QM Setups & cross-referencing EP igniters (Port 8785)...")
     t0 = time.time()
     try:
         qm_updated = update_qm_database.run_update(force=force)
@@ -209,8 +224,22 @@ def run_pipeline(
         logger.error(f"❌ Error updating QM Setups: {e}")
         summary["steps"]["qm_setups"] = {"status": "error", "error": str(e)}
 
-    # STEP 5: Hot-reload active servers across all 4 ports
-    logger.info("▶ STEP 5/5: Notifying live dashboard applications (8782, 8785, 8786, 8787)...")
+    # STEP 5: Update Optimized EP Strategy Dataset (Port 8787)
+    logger.info("▶ STEP 5/6: Synchronizing Optimized EP Strategy dataset (Port 8787)...")
+    t0 = time.time()
+    try:
+        sim_optimized_ep_strategy.run_optimization()
+        summary["steps"]["optimized_ep_strategy"] = {
+            "status": "ok",
+            "duration_s": round(time.time() - t0, 1),
+        }
+        logger.info(f"✅ Optimized EP Strategy step completed in {time.time() - t0:.1f}s.")
+    except Exception as e:
+        logger.error(f"❌ Error updating Optimized EP Strategy: {e}")
+        summary["steps"]["optimized_ep_strategy"] = {"status": "error", "error": str(e)}
+
+    # STEP 6: Hot-reload active servers across all 4 ports
+    logger.info("▶ STEP 6/6: Notifying live dashboard applications (8782, 8785, 8786, 8787)...")
     for port, app_name in TARGET_SERVERS:
         summary["server_reloads"][str(port)] = reload_server(port, app_name)
 

@@ -172,6 +172,89 @@ class TestOptimizedEPViewer(unittest.TestCase):
         for it in resp_coil.json["items"]:
             self.assertEqual(it["status"], "Coiling Setup")
 
+        # Verify sizing and institutional fields in active/coiling items
+        first_act = [x for x in data["items"] if x["status"] == "Active Long"][0]
+        self.assertIn("suggested_size_mult", first_act)
+        self.assertIn("suggested_size_label", first_act)
+        self.assertIn("suggested_size_desc", first_act)
+        self.assertIn("current_high_exhaustion_pct", first_act)
+        self.assertIn("climax_threshold_pct", first_act)
+        self.assertIn("climax_sell_half_rule", first_act)
+        self.assertIn("climax_action", first_act)
+        self.assertIn("trailing_exit_rule", first_act)
+        self.assertIn("position_management_plan", first_act)
+
+    def test_api_monitor_settings_contract(self):
+        """Verifies GET and POST for /api/monitor_settings."""
+        # GET
+        resp = self.client.get("/api/monitor_settings")
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json
+        self.assertIn("poll_interval_sec", data)
+        self.assertIn("recommended_interval_sec", data)
+        self.assertIn("rate_limit_guidance", data)
+        self.assertEqual(data["recommended_interval_sec"], 300)
+
+        # POST valid
+        resp_post = self.client.post("/api/monitor_settings", json={"poll_interval_sec": 600})
+        self.assertEqual(resp_post.status_code, 200)
+        self.assertEqual(resp_post.json["poll_interval_sec"], 600)
+
+        # Restore default 300
+        self.client.post("/api/monitor_settings", json={"poll_interval_sec": 300})
+
+    def test_chart_indicators_history_and_larsson_contract(self):
+        """Verifies /api/chart returns extended indicators, history depth, and Larsson spans."""
+        sample_sym = str(self.df["symbol"].iloc[0])
+        ep_date = str(self.df["ep_date"].iloc[0])[:10]
+        entry_date = str(self.df["entry_date"].iloc[0])[:10]
+        exit_date = str(self.df["exit_date"].iloc[0])[:10]
+
+        # Test history=6m and larsson_fastest=32
+        url = f"/api/chart?symbol={sample_sym}&ep_date={ep_date}&entry_date={entry_date}&exit_date={exit_date}&history=6m&larsson_fastest=32"
+        resp = self.client.get(url)
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json
+        self.assertIn("vol_ma20", data)
+        self.assertIn("ema8", data)
+        self.assertIn("ema21", data)
+        self.assertIn("larsson_fast", data)
+        self.assertIn("larsson_slow", data)
+        self.assertIn("larsson_spans", data)
+        self.assertEqual(data["larsson_spans"], [32, 35, 50, 58])
+        self.assertEqual(data["history_mode"], "6m")
+
+        # Test history=1y and custom larsson_fastest=25
+        url_1y = f"/api/chart?symbol={sample_sym}&ep_date={ep_date}&entry_date={entry_date}&exit_date={exit_date}&history=1y&larsson_fastest=25"
+        resp_1y = self.client.get(url_1y)
+        self.assertEqual(resp_1y.status_code, 200)
+        data_1y = resp_1y.json
+        self.assertEqual(data_1y["larsson_spans"], [25, 27, 39, 45])
+        self.assertGreater(len(data_1y["candles"]), len(data["candles"]))
+
+    def test_index_ui_elements_extended(self):
+        """Verifies all new HTML UI elements for settings, indicators, and dossier cards exist."""
+        resp = self.client.get("/")
+        self.assertEqual(resp.status_code, 200)
+        html = resp.data.decode("utf-8")
+        self.assertIn("btn_monitor_settings", html)
+        self.assertIn("monitor_settings_panel", html)
+        self.assertIn("sel_monitor_interval", html)
+        self.assertIn("btn_chart_settings", html)
+        self.assertIn("btn_chart_fullscreen", html)
+        self.assertIn("sel_chart_history", html)
+        self.assertIn("chart_settings_panel", html)
+        self.assertIn("card_catalyst", html)
+        self.assertIn("card_rs_posture", html)
+        self.assertIn("card_sec_theme", html)
+        self.assertIn("d_size_desc", html)
+        self.assertIn("btn_nav_prev", html)
+        self.assertIn("btn_nav_next", html)
+        self.assertIn("sel_nav_stock", html)
+        self.assertIn("lbl_nav_counter", html)
+        self.assertIn("fs_keyboard_hint", html)
+
 
 if __name__ == "__main__":
     unittest.main()
+

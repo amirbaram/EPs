@@ -557,6 +557,47 @@ class TestQMViewer(unittest.TestCase):
         self.assertIn('value="20"', html)
         self.assertIn('value="3-7"', html)
 
+    def test_googl_april_2026_pole_absolute_high_regression(self):
+        """Regression test: verifies GOOGL April 2026 setup (pole starting 2026-03-30 into mid-April)
+
+        is detected. Previously, an older peak from Feb 3, 2026 (348.55) masked the fresh rally
+        leg due to global 108-bar idxmax(). With launch-trough anchoring, the absolute high achieved
+        since the launch low within the valid consolidation window is properly identified.
+        """
+        import datastore
+        import mine_qm_setups
+
+        df = datastore.load_bars("GOOGL")
+        self.assertIsNotNone(df, "GOOGL bars must be present in datastore")
+        df = indicators.add_indicators(df)
+
+        # 1. Verify building state on 2026-04-24
+        loc_apr24 = df.index.get_loc("2026-04-24")
+        res_build = setups.detect_qm_breakout(df.iloc[: loc_apr24 + 1])
+        self.assertIsNotNone(res_build, "GOOGL on 2026-04-24 should be detected as building QM setup")
+        self.assertEqual(res_build["state"], "building")
+        self.assertEqual(res_build["qm_pole"][0], "2026-03-30")
+        self.assertEqual(res_build["qm_pole"][1], "2026-04-17")
+        self.assertGreaterEqual(res_build["move_pct"], 25.0)
+        self.assertGreaterEqual(res_build["ride_frac"], setups.config.QMB_MIN_RIDE_FRAC)
+
+        # 2. Verify breakout state on 2026-04-30
+        loc_apr30 = df.index.get_loc("2026-04-30")
+        res_break = setups.detect_qm_breakout(df.iloc[: loc_apr30 + 1])
+        self.assertIsNotNone(res_break, "GOOGL on 2026-04-30 should be detected as breakout QM setup")
+        self.assertEqual(res_break["state"], "breakout")
+        self.assertEqual(res_break["qm_pole"][0], "2026-03-30")
+
+        # 3. Verify scan_single_symbol captures the April 2026 episode with launch-trough debouncing
+        googl_episodes = mine_qm_setups.scan_single_symbol("GOOGL")
+        apr_episodes = [
+            e for e in googl_episodes
+            if e["qm_pole_start"] == "2026-03-30" and "2026-04" in e["date"]
+        ]
+        self.assertEqual(len(apr_episodes), 1, "Grinding daily highs should debounce into exactly 1 April episode")
+        self.assertEqual(apr_episodes[0]["date"], "2026-04-30")
+        self.assertEqual(apr_episodes[0]["state"], "breakout")
+
 
 if __name__ == "__main__":
     unittest.main()

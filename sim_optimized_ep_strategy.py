@@ -136,6 +136,77 @@ def compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
     return rsi.fillna(50.0)
 
 
+def precompute_climax_probabilities(
+    bars: pd.DataFrame,
+    entry_bar: int,
+    max_exit_bar: int,
+    entry_px: float,
+    stop_px: float,
+    climax_model: Optional[dict],
+    v2_conviction: float = 0.10,
+    rs_score: float = 75.0,
+) -> Dict[int, float]:
+    """Vectorized batch prediction of climax probabilities across candidate trade bars."""
+    if climax_model is None or entry_bar >= max_exit_bar:
+        return {}
+
+    cal_lgb = climax_model.get("cal_lgb")
+    cal_xgb = climax_model.get("cal_xgb")
+    feature_cols = climax_model.get("feature_cols", [])
+    risk_dollar = max(0.01, entry_px - stop_px)
+
+    candidate_bars = []
+    end_idx = min(max_exit_bar + 1, len(bars))
+    for f in range(entry_bar, end_idx):
+        c_r = (float(bars["high"].iloc[f]) - entry_px) / risk_dollar
+        if c_r >= 1.20:
+            candidate_bars.append(f)
+
+    if not candidate_bars:
+        return {}
+
+    sub = bars.iloc[candidate_bars]
+    c_r_arr = (sub["high"].values.astype(float) - entry_px) / risk_dollar
+    gain_since_entry = ((sub["high"].values.astype(float) - entry_px) / entry_px) * 100.0
+
+    batch_dict = {
+        "rsi14": sub["rsi14"].values.astype(float) if "rsi14" in sub else np.full(len(sub), 50.0),
+        "rsi9": sub["rsi9"].values.astype(float) if "rsi9" in sub else np.full(len(sub), 50.0),
+        "rsi5": sub["rsi5"].values.astype(float) if "rsi5" in sub else np.full(len(sub), 50.0),
+        "rsi14_max5": sub["rsi14_max5"].values.astype(float) if "rsi14_max5" in sub else np.full(len(sub), 50.0),
+        "rsi14_max10": sub["rsi14_max10"].values.astype(float) if "rsi14_max10" in sub else np.full(len(sub), 50.0),
+        "rsi14_diff3": sub["rsi14_diff3"].values.astype(float) if "rsi14_diff3" in sub else np.zeros(len(sub)),
+        "rsi_bearish_divergence": sub["rsi_bearish_divergence"].values.astype(int) if "rsi_bearish_divergence" in sub else np.zeros(len(sub)),
+        "rsi_divergence_delta": sub["rsi_divergence_delta"].values.astype(float) if "rsi_divergence_delta" in sub else np.zeros(len(sub)),
+        "consec_rsi_70": sub["consec_rsi_70"].values.astype(int) if "consec_rsi_70" in sub else np.zeros(len(sub)),
+        "consec_rsi_75": sub["consec_rsi_75"].values.astype(int) if "consec_rsi_75" in sub else np.zeros(len(sub)),
+        "ext_ema10_pct": sub["ext_ema10_pct"].values.astype(float) if "ext_ema10_pct" in sub else np.zeros(len(sub)),
+        "ext_ema20_pct": sub["ext_ema20_pct"].values.astype(float) if "ext_ema20_pct" in sub else np.zeros(len(sub)),
+        "ext_sma50_pct": sub["ext_sma50_pct"].values.astype(float) if "ext_sma50_pct" in sub else np.zeros(len(sub)),
+        "ext_ema10_adr": sub["ext_ema10_adr"].values.astype(float) if "ext_ema10_adr" in sub else np.zeros(len(sub)),
+        "ext_ema20_adr": sub["ext_ema20_adr"].values.astype(float) if "ext_ema20_adr" in sub else np.zeros(len(sub)),
+        "ext_sma50_adr": sub["ext_sma50_adr"].values.astype(float) if "ext_sma50_adr" in sub else np.zeros(len(sub)),
+        "upper_wick_pct": sub["upper_wick_pct"].values.astype(float) if "upper_wick_pct" in sub else np.zeros(len(sub)),
+        "close_pos": sub["close_pos"].values.astype(float) if "close_pos" in sub else np.full(len(sub), 0.5),
+        "range_to_adr": sub["range_to_adr"].values.astype(float) if "range_to_adr" in sub else np.ones(len(sub)),
+        "rvol": sub["rvol"].values.astype(float) if "rvol" in sub else np.ones(len(sub)),
+        "volume_churn": sub["volume_churn"].values.astype(float) if "volume_churn" in sub else np.ones(len(sub)),
+        "gain_since_entry": gain_since_entry,
+        "current_r": c_r_arr,
+        "gain_3d": sub["gain_3d"].values.astype(float) if "gain_3d" in sub else np.zeros(len(sub)),
+        "gain_5d": sub["gain_5d"].values.astype(float) if "gain_5d" in sub else np.zeros(len(sub)),
+        "adr20_pct": sub["adr20_pct"].values.astype(float) if "adr20_pct" in sub else np.full(len(sub), 3.0),
+        "rs_score": np.full(len(sub), rs_score),
+        "v2_conviction": np.full(len(sub), v2_conviction),
+    }
+    df_batch = pd.DataFrame(batch_dict).reindex(columns=feature_cols, fill_value=0.0)
+    p_lgb = cal_lgb.predict_proba(df_batch)[:, 1] if cal_lgb is not None else np.zeros(len(sub))
+    p_xgb = cal_xgb.predict_proba(df_batch)[:, 1] if cal_xgb is not None else np.zeros(len(sub))
+    probs = 0.55 * p_lgb + 0.45 * p_xgb
+
+    return {bar_idx: float(prob) for bar_idx, prob in zip(candidate_bars, probs)}
+
+
 def detect_climax_harvest(
     bars: pd.DataFrame,
     entry_bar: int,
@@ -146,6 +217,7 @@ def detect_climax_harvest(
     climax_model: Optional[dict],
     v2_conviction: float = 0.10,
     rs_score: float = 75.0,
+    prob_lookup: Optional[Dict[int, float]] = None,
 ) -> Dict[str, Any]:
     """Evaluates whether an active trade hit an extreme climax peak before trailing exit."""
     if climax_model is None or entry_bar >= exit_bar:
@@ -155,50 +227,54 @@ def detect_climax_harvest(
     cal_xgb = climax_model.get("cal_xgb")
     feature_cols = climax_model.get("feature_cols", [])
     risk_dollar = max(0.01, entry_px - stop_px)
+    end_idx = min(exit_bar + 1, len(bars))
 
-    for f in range(entry_bar, min(exit_bar + 1, len(bars))):
+    for f in range(entry_bar, end_idx):
         c_r = (float(bars["high"].iloc[f]) - entry_px) / risk_dollar
         if c_r < 1.20:
             continue
 
-        row = bars.iloc[f]
-        feats = {
-            "rsi14": float(row.get("rsi14", 50.0)),
-            "rsi9": float(row.get("rsi9", 50.0)),
-            "rsi5": float(row.get("rsi5", 50.0)),
-            "rsi14_max5": float(row.get("rsi14_max5", 50.0)),
-            "rsi14_max10": float(row.get("rsi14_max10", 50.0)),
-            "rsi14_diff3": float(row.get("rsi14_diff3", 0.0)),
-            "rsi_bearish_divergence": int(row.get("rsi_bearish_divergence", 0)),
-            "rsi_divergence_delta": float(row.get("rsi_divergence_delta", 0.0)),
-            "consec_rsi_70": int(row.get("consec_rsi_70", 0)),
-            "consec_rsi_75": int(row.get("consec_rsi_75", 0)),
-            "ext_ema10_pct": float(row.get("ext_ema10_pct", 0.0)),
-            "ext_ema20_pct": float(row.get("ext_ema20_pct", 0.0)),
-            "ext_sma50_pct": float(row.get("ext_sma50_pct", 0.0)),
-            "ext_ema10_adr": float(row.get("ext_ema10_adr", 0.0)),
-            "ext_ema20_adr": float(row.get("ext_ema20_adr", 0.0)),
-            "ext_sma50_adr": float(row.get("ext_sma50_adr", 0.0)),
-            "upper_wick_pct": float(row.get("upper_wick_pct", 0.0)),
-            "close_pos": float(row.get("close_pos", 0.5)),
-            "range_to_adr": float(row.get("range_to_adr", 1.0)),
-            "rvol": float(row.get("rvol", 1.0)),
-            "volume_churn": float(row.get("volume_churn", 1.0)),
-            "gain_since_entry": ((float(row["high"]) - entry_px) / entry_px) * 100.0,
-            "current_r": c_r,
-            "gain_3d": float(row.get("gain_3d", 0.0)),
-            "gain_5d": float(row.get("gain_5d", 0.0)),
-            "adr20_pct": float(row.get("adr20_pct", 3.0)),
-            "rs_score": rs_score,
-            "v2_conviction": v2_conviction,
-        }
-        df_row = pd.DataFrame([feats]).reindex(columns=feature_cols, fill_value=0.0)
-        p_lgb = float(cal_lgb.predict_proba(df_row)[0][1]) if cal_lgb is not None else 0.0
-        p_xgb = float(cal_xgb.predict_proba(df_row)[0][1]) if cal_xgb is not None else 0.0
-        p = float(0.55 * p_lgb + 0.45 * p_xgb)
+        if prob_lookup is not None:
+            p = prob_lookup.get(f, 0.0)
+        else:
+            row = bars.iloc[f]
+            feats = {
+                "rsi14": float(row.get("rsi14", 50.0)),
+                "rsi9": float(row.get("rsi9", 50.0)),
+                "rsi5": float(row.get("rsi5", 50.0)),
+                "rsi14_max5": float(row.get("rsi14_max5", 50.0)),
+                "rsi14_max10": float(row.get("rsi14_max10", 50.0)),
+                "rsi14_diff3": float(row.get("rsi14_diff3", 0.0)),
+                "rsi_bearish_divergence": int(row.get("rsi_bearish_divergence", 0)),
+                "rsi_divergence_delta": float(row.get("rsi_divergence_delta", 0.0)),
+                "consec_rsi_70": int(row.get("consec_rsi_70", 0)),
+                "consec_rsi_75": int(row.get("consec_rsi_75", 0)),
+                "ext_ema10_pct": float(row.get("ext_ema10_pct", 0.0)),
+                "ext_ema20_pct": float(row.get("ext_ema20_pct", 0.0)),
+                "ext_sma50_pct": float(row.get("ext_sma50_pct", 0.0)),
+                "ext_ema10_adr": float(row.get("ext_ema10_adr", 0.0)),
+                "ext_ema20_adr": float(row.get("ext_ema20_adr", 0.0)),
+                "ext_sma50_adr": float(row.get("ext_sma50_adr", 0.0)),
+                "upper_wick_pct": float(row.get("upper_wick_pct", 0.0)),
+                "close_pos": float(row.get("close_pos", 0.5)),
+                "range_to_adr": float(row.get("range_to_adr", 1.0)),
+                "rvol": float(row.get("rvol", 1.0)),
+                "volume_churn": float(row.get("volume_churn", 1.0)),
+                "gain_since_entry": ((float(row["high"]) - entry_px) / entry_px) * 100.0,
+                "current_r": c_r,
+                "gain_3d": float(row.get("gain_3d", 0.0)),
+                "gain_5d": float(row.get("gain_5d", 0.0)),
+                "adr20_pct": float(row.get("adr20_pct", 3.0)),
+                "rs_score": rs_score,
+                "v2_conviction": v2_conviction,
+            }
+            df_row = pd.DataFrame([feats]).reindex(columns=feature_cols, fill_value=0.0)
+            p_lgb = float(cal_lgb.predict_proba(df_row)[0][1]) if cal_lgb is not None else 0.0
+            p_xgb = float(cal_xgb.predict_proba(df_row)[0][1]) if cal_xgb is not None else 0.0
+            p = float(0.55 * p_lgb + 0.45 * p_xgb)
 
         if p >= threshold:
-            fill_px = (float(row["close"]) + float(row["high"])) / 2.0
+            fill_px = (float(bars["close"].iloc[f]) + float(bars["high"].iloc[f])) / 2.0
             climax_r = (fill_px - entry_px) / risk_dollar
             return {
                 "has_climax": True,
@@ -529,10 +605,20 @@ def run_optimization():
         # 3. Extreme Peak Climax Harvesting Simulations (Structural Stop)
         rs_score = float(row.get("rs_score_breakout", row.get("rs_score", 75.0)) or 75.0)
         v2_conv = float(row.get("v2_conviction_50", 0.10) or 0.10)
-        climax_20 = detect_climax_harvest(bars, entry_bar, res_ema20["exit_bar"], entry_px, stop_px, 0.45, climax_model, v2_conv, rs_score)
-        climax_50 = detect_climax_harvest(bars, entry_bar, res_sma50["exit_bar"], entry_px, stop_px, 0.55, climax_model, v2_conv, rs_score)
+        max_exit_b = max(
+            res_ema20.get("exit_bar", entry_bar),
+            res_sma50.get("exit_bar", entry_bar),
+            res_app.get("exit_bar", entry_bar),
+            res_ema20_ml.get("exit_bar", entry_bar),
+            res_sma50_ml.get("exit_bar", entry_bar),
+            res_app_ml.get("exit_bar", entry_bar),
+        )
+        climax_prob_lookup = precompute_climax_probabilities(bars, entry_bar, max_exit_b, entry_px, stop_px, climax_model, v2_conv, rs_score)
+
+        climax_20 = detect_climax_harvest(bars, entry_bar, res_ema20["exit_bar"], entry_px, stop_px, 0.45, climax_model, v2_conv, rs_score, climax_prob_lookup)
+        climax_50 = detect_climax_harvest(bars, entry_bar, res_sma50["exit_bar"], entry_px, stop_px, 0.55, climax_model, v2_conv, rs_score, climax_prob_lookup)
         th_app = 0.55 if app_exit_mode == "sma50" else 0.45
-        climax_app = detect_climax_harvest(bars, entry_bar, res_app["exit_bar"], entry_px, stop_px, th_app, climax_model, v2_conv, rs_score)
+        climax_app = detect_climax_harvest(bars, entry_bar, res_app["exit_bar"], entry_px, stop_px, th_app, climax_model, v2_conv, rs_score, climax_prob_lookup)
 
         # Blended R with 50% partial take at climax high (Structural Stop)
         if climax_20["has_climax"]:
@@ -551,9 +637,9 @@ def run_optimization():
             blended_r_app = res_app["r_multiple"]
 
         # 4. Extreme Peak Climax Harvesting on ML Adaptive Stop Trades
-        climax_20_ml = detect_climax_harvest(bars, entry_bar, res_ema20_ml["exit_bar"], entry_px, ml_stop_px, 0.45, climax_model, v2_conv, rs_score) if res_ema20_ml["exit_bar"] > entry_bar else {"has_climax": False, "climax_r": 0.0}
-        climax_50_ml = detect_climax_harvest(bars, entry_bar, res_sma50_ml["exit_bar"], entry_px, ml_stop_px, 0.55, climax_model, v2_conv, rs_score) if res_sma50_ml["exit_bar"] > entry_bar else {"has_climax": False, "climax_r": 0.0}
-        climax_app_ml = detect_climax_harvest(bars, entry_bar, res_app_ml["exit_bar"], entry_px, ml_stop_px, th_app, climax_model, v2_conv, rs_score) if res_app_ml["exit_bar"] > entry_bar else {"has_climax": False, "climax_r": 0.0}
+        climax_20_ml = detect_climax_harvest(bars, entry_bar, res_ema20_ml["exit_bar"], entry_px, ml_stop_px, 0.45, climax_model, v2_conv, rs_score, climax_prob_lookup) if res_ema20_ml["exit_bar"] > entry_bar else {"has_climax": False, "climax_r": 0.0}
+        climax_50_ml = detect_climax_harvest(bars, entry_bar, res_sma50_ml["exit_bar"], entry_px, ml_stop_px, 0.55, climax_model, v2_conv, rs_score, climax_prob_lookup) if res_sma50_ml["exit_bar"] > entry_bar else {"has_climax": False, "climax_r": 0.0}
+        climax_app_ml = detect_climax_harvest(bars, entry_bar, res_app_ml["exit_bar"], entry_px, ml_stop_px, th_app, climax_model, v2_conv, rs_score, climax_prob_lookup) if res_app_ml["exit_bar"] > entry_bar else {"has_climax": False, "climax_r": 0.0}
 
         if climax_20_ml["has_climax"]:
             blended_r_ml_ema20 = (0.50 * climax_20_ml["climax_r"]) + (0.50 * res_ema20_ml["r_multiple"])
