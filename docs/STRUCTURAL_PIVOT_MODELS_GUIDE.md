@@ -173,10 +173,10 @@ Using Wilder's recursive smoothing ($\alpha = 1/N$) from bar $t-1$'s settled $\t
   - Bounce retracement ratio relative to prior 20D waterfall leg (`bounce_retracement_ratio`, `dist_below_40d_high_adr`)
   - Falling-MA rejection (`rejected_at_falling_ma`, `overhead_rejection_score`, `fade_from_high_adr`)
 
-#### Model 4: Downtrend Pivot Low (`DT Low` — `downtrend_pivot_low_classifier.pkl`)
+#### Model 4: Downtrend Pivot Low (`DT Low` — `downtrend_pivot_low_classifier.pkl` & `downtrend_pivot_low_classifier_v4.pkl`)
 - **Ground-Truth Target (`is_dt_low`)**:
   Bar $t$ is inside `is_primary_downtrend` following a waterfall selloff ($\ge 2.8\text{ ADR}$ 10D drop or $\ge 1.5\text{ ADR}$ below `EMA20`), forms a 17-bar local low ($[t-8, t+8]$ within $0.25\text{ ADR}$), and ignites a snapback relief rally ($\ge 1.5\text{ ADR}$ within 5D and $\ge 2.8\text{ ADR}$ within 10D).
-- **Key Features (48 At-Low / 62 Full-Bar)**:
+- **Key Features (48 At-Low / 62 Full-Bar in V3; 57 At-Low / 78 Full-Bar in V4)**:
   - Downside stretch below `EMA10`, `EMA20`, `SMA50`, `SMA200` (`stretch_below_ema20_adr`, `stretch_below_sma50_adr`, `rel_down_ema20_p95`, `bb_z_low`)
   - Waterfall velocity & acceleration (`drop_3d_adr`, `drop_10d_adr`, `drop_20d_adr`, `waterfall_accel`, `gap_down_on_oversold`)
   - Multi-wave bullish RSI divergence at Low (`bullish_div_low_18d`, `rsi_bull_div_delta_18d`, `bullish_div_low_35d`, `rsi_bull_div_delta_35d`)
@@ -184,7 +184,68 @@ Using Wilder's recursive smoothing ($\alpha = 1/N$) from bar $t-1$'s settled $\t
 
 ---
 
-## 5. Daily Updater & Daemon Integration (`start_daily_updater.sh`)
+## 5. V4 Enhanced Models (`*_v4.pkl`): Families B1–B5 & Exact Piecewise Inverse Wilder's RSI
+
+Alongside the V3 baseline `.pkl` models, Watchlist Studio (`serve_watchlist.py`, port `8789`) includes a **Model Version selector (`V4 Enhanced` vs `V3 Baseline`)** backed by `uptrend_pivot_high_classifier_v4.pkl`, `uptrend_pivot_low_classifier_v4.pkl`, `downtrend_pivot_high_classifier_v4.pkl`, and `downtrend_pivot_low_classifier_v4.pkl`.
+
+### 5.1 Exact Piecewise Closed-Form Inverse Wilder's RSI Target Price ($R \in (0, 100)$)
+Given prior bar $t-1$'s settled Wilder smoothing state $(C_{t-1}, U_{t-1}, D_{t-1})$ and target RSI $R$ with $\gamma = \frac{R}{100 - R}$:
+- **Branch 1 — Up-Move Required ($\text{RSI}_{t-1} \le R \iff U_{t-1} \le \gamma D_{t-1}$)**:
+  $$P_{\text{target}}(R)_t = C_{t-1} + (N - 1)\big(\gamma D_{t-1} - U_{t-1}\big)$$
+- **Branch 2 — Down-Move Required ($\text{RSI}_{t-1} > R \iff U_{t-1} > \gamma D_{t-1}$)**:
+  $$P_{\text{target}}(R)_t = C_{t-1} - (N - 1)\left(\frac{U_{t-1}}{\gamma} - D_{t-1}\right)$$
+
+From these exact target prices ($R = 75$ for Extreme Overbought and $R = 25$ for Extreme Oversold), the engine computes strictly causal ADR-normalized distances (`inv_rsi14_ob75_dist_adr`, `inv_rsi14_os25_dist_adr`) and exact intrabar hit flags (`hit_ob75_intrabar`, `hit_os25_intrabar`).
+
+### 5.2 The 5 Enhancement Feature Families (`B1`–`B5`)
+1. **Family B1 — Structural Overhead Supply & Support Memory**:
+   - `dist_to_prior_swing_high_adr` / `dist_to_prior_swing_low_adr`: Distance in ADR from developing `High[t]`/`Low[t]` to the most recent confirmed structural 5-bar pivot high/low (`<= t-6`).
+   - `avwap_from_60d_high_dist_adr` / `avwap_from_60d_low_dist_adr`: Distance in ADR to the causal Anchored VWAP anchored at the trailing 60-day peak or trough (`<= t-1`).
+   - `overhead_volume_density_60d`: Fraction of the prior 60 days' dollar volume traded within $\pm 0.5\text{ ADR}$ of today's `High[t]` or `Low[t]`.
+2. **Family B2 — Market (`SPY`/`QQQ`) & Relative Strength Synchrony**:
+   - `spy_rsi14_high`, `spy_rsi14_low`, `spy_ext_ema20_adr`, `qqq_rsi14_high`, `qqq_rsi14_low`, `rs_vs_spy_5d_adr`, and `rs_div_at_pivot`.
+3. **Family B3 — Multi-Timeframe (Developing Weekly `W-FRI`) Confluence**:
+   - Strictly causal settled prior-Friday Wilder's RSI state combined with current week-to-date developing `High`/`Low`: `weekly_rsi14_high`, `weekly_rsi14_low`, `weekly_ext_ema10w_adr`, `consec_up_weeks`, `consec_down_weeks`, `hit_weekly_ob75`, `hit_weekly_os25`.
+4. **Family B4 — Dedicated Real-Time Intrabar Partial-Rejection Path (`Sub-Model A+`)**:
+   - Triggers as soon as price stretches to a new high/low (`Sub-Model A`) AND prints a $-0.35\times\text{ ADR}$ micro-pullback off `High[t]` (`intrabar_pullback_035_high`) or $+0.35\times\text{ ADR}$ micro-bounce off `Low[t]` (`intrabar_bounce_035_low`) with pace-adjusted RVOL (`pace_rvol_est`).
+5. **Family B5 — Out-of-Fold Isotonic Probability Calibration**:
+   - Fits a chronological validation-split `IsotonicRegression` calibrator (`calibrator_iso`) mapping the raw tree score (`prob_dual`) to true empirical OOS hit rate (`prob_calibrated`), cutting Brier calibration loss by **36%–60%** across all models.
+
+---
+
+## 6. Models 5 & 6: Major Trend Reversal Pivot Models (`👑 Major Top` & `🚀 Major Bottom`)
+
+While Models 1–4 detect **swing pivots within an ongoing trend** (such as a 10–15 day pullback in an uptrend or a 10-day dead-cat bounce in a downtrend), **Models 5 and 6** are specifically trained to detect **Macro Primary Trend Reversals** — the exact pivot high where an Uptrend terminates and reverses into a structural Downtrend, and the exact pivot low where a Downtrend terminates and reverses into a new structural Uptrend.
+
+### 6.1 Model 5: Major Uptrend Reversal High (`maj_ut_top` — `major_uptrend_reversal_high_classifier.pkl`)
+- **Ground-Truth Target (`is_major_ut_top`)**:
+  Bar $t$ occurs inside `is_primary_uptrend` at a **41-bar macro peak** ($[t-20, t+20]$ within $0.35\text{ ADR}$) after a significant multi-month run ($\ge 4.0\text{ ADR}$ above 60D low or $\ge 1.5\text{ ADR}$ above `SMA50`), and within the next **25 trading sessions** breaks the primary trend:
+  - Price drops $\ge 5.0\text{ ADR}$ from `High[t]` (with closing drop $\ge 3.5\text{ ADR}$),
+  - **Violates the 50-day SMA** (`min_close_25d < SMA50[t] - 0.5*ADR` or drops $> 12\%$), and
+  - **No V-Bottom Recovery**: `Close[t+25]` remains below `High[t] - 2.0*ADR` (filtering out normal intermediate Stage-2 continuation pullbacks).
+- **Macro Reversal Feature Family (`MAJOR_MACRO_HIGH_AT_FEATURES` + `FB_ADDONS`)**:
+  - `run_from_60d_low_adr`, `run_from_120d_low_adr`, `dist_from_60d_high_adr`: Multi-month macro run magnitude.
+  - `bearish_div_60d`, `rsi_div_delta_60d`, `ext50_div_delta_60d`: 60-day macro multi-wave bearish RSI and `SMA50`-extension divergence.
+  - `ema20_slope_accel_adr`, `sma50_slope_accel_adr`, `ema10_vs_ema20_spread_adr`, `ema10_20_spread_chg5_adr`: Momentum deceleration and intermediate ribbon compression (`EMA10 - EMA20` narrowing).
+  - `dist_days_20d_prev`, `up_down_vol_ratio_20d`: Institutional distribution day count ($\text{Close} < \text{Close}_{t-1}$ on $\text{Volume} > \text{Volume}_{t-1}$) and 20-day up/down volume exhaustion prior to bar $t$.
+  - `climax_churn_top`, `failed_60d_breakout`: High-volume upper-wick stalling and failed 60-day bull-trap breakouts.
+
+### 6.2 Model 6: Major Downtrend Reversal Low (`maj_dt_low` — `major_downtrend_reversal_low_classifier.pkl`)
+- **Ground-Truth Target (`is_major_dt_bottom`)**:
+  Bar $t$ occurs inside `is_primary_downtrend` at a **41-bar macro trough** ($[t-20, t+20]$ within $0.35\text{ ADR}$) after a multi-month decline ($\ge 4.0\text{ ADR}$ drop from 60D high or $\ge 1.5\text{ ADR}$ below `SMA50`), and within the next **25 trading sessions** reverses the primary trend up:
+  - Price rallies $\ge 5.0\text{ ADR}$ from `Low[t]` (with closing gain $\ge 3.5\text{ ADR}$),
+  - **Reclaims the 50-day SMA** (`max_close_25d > SMA50[t] - 0.25*ADR` or rallies $> 14\%$), and
+  - **Sustained Trend Change (No Dead-Cat Roll-Over)**: `Close[t+25]` holds $\ge \text{Low}[t] + 2.5\text{ ADR}$ (filtering out ephemeral 3–5 day bear-market relief bounces that roll back over to new lows).
+- **Macro Reversal Feature Family (`MAJOR_MACRO_LOW_AT_FEATURES` + `FB_ADDONS`)**:
+  - `drop_from_60d_high_adr`, `drop_from_120d_high_adr`, `dist_from_60d_low_adr`: Multi-month macro drawdown depth.
+  - `bullish_div_low_60d`, `rsi_bull_div_delta_60d`, `str50_bull_div_delta_60d`: 60-day macro bullish RSI and `SMA50`-stretch divergence at major double/triple bottoms or Wyckoff springs.
+  - `ema20_slope_accel_adr`, `sma50_slope_accel_adr`, `ema10_20_spread_chg5_adr`: Downside deceleration (second derivative turning positive).
+  - `accum_days_20d_prev`, `up_down_vol_ratio_20d`: Institutional accumulation days emerging inside the downtrend.
+  - `climax_absorption_bottom`, `spring_60d_low_reclaim`: Capitulation volume absorption hammer and 60-day low undercut-and-reclaim (Wyckoff spring).
+
+---
+
+## 7. Daily Updater & Daemon Integration (`start_daily_updater.sh`)
 
 The automated EOD pipeline (`daily_update.py`, managed via `./scripts/start_daily_updater.sh` and `./scripts/stop_daily_updater.sh`) runs on every trading day at **16:45 US/Eastern** and performs 7 synchronized steps:
 1. **Full Universe & ETF Bar Synchronization (`datastore.update_daily(full=True)`)**:
@@ -193,7 +254,8 @@ The automated EOD pipeline (`daily_update.py`, managed via `./scripts/start_dail
 3. **Historical EP Study & V2 Conviction Scoring (`scripts/update_ep_dataset.py`)** — Port `8782`
 4. **QM Setups Mining & EP Cross-Reference (`update_qm_database.py`)** — Port `8785`
 5. **Optimized EP Strategy Simulation (`sim_optimized_ep_strategy.py`)** — Port `8787`
-6. **4-Model Structural Swing-Pivot Verification & Auto-Retraining (`update_pivot_models_if_needed`)** — Port `8789`:
-   - Verifies that all 4 `.pkl` models exist and checks their age (`MAX_PIVOT_MODEL_AGE_DAYS = 7`), automatically retraining if missing, stale, or invoked with `--retrain-models`.
+6. **10-Model Structural & Major Reversal Pivot Verification & Auto-Retraining (`update_pivot_models_if_needed`)** — Port `8789`:
+   - Verifies that all 10 `.pkl` models (4 V3 baseline + 4 V4 enhanced + 2 Major Trend Reversal models) exist and checks their age (`MAX_PIVOT_MODEL_AGE_DAYS = 7`), automatically retraining if missing, stale, or invoked with `--retrain-models`.
 7. **Zero-Downtime Hot Reload (`/api/reload_dataset`)**:
    - Sends a POST request to all 5 servers (`8782`, `8785`, `8786`, `8787`, and `8789`) to clear in-memory caches and reload fresh bars and models immediately.
+

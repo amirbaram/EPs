@@ -68,6 +68,8 @@ UPTREND_PIVOT_MODEL_V4_PATH = Path("data/models/uptrend_pivot_high_classifier_v4
 UPTREND_PIVOT_LOW_MODEL_V4_PATH = Path("data/models/uptrend_pivot_low_classifier_v4.pkl")
 DOWNTREND_PIVOT_HIGH_MODEL_V4_PATH = Path("data/models/downtrend_pivot_high_classifier_v4.pkl")
 DOWNTREND_PIVOT_LOW_MODEL_V4_PATH = Path("data/models/downtrend_pivot_low_classifier_v4.pkl")
+MAJOR_UT_TOP_MODEL_PATH = Path("data/models/major_uptrend_reversal_high_classifier.pkl")
+MAJOR_DT_BOTTOM_MODEL_PATH = Path("data/models/major_downtrend_reversal_low_classifier.pkl")
 EXTREME_PEAK_MODEL_PATH = Path("data/models/ep_extreme_peak_classifier.pkl")
 WATCHLISTS_FILE = Path("data/user_watchlists.json")
 ANNOTATIONS_DIR = Path("data/annotations")
@@ -223,7 +225,7 @@ def get_extreme_peak_model() -> Optional[Dict[str, Any]]:
 
 
 def get_all_pivot_models(model_ver: str = "v3") -> Dict[str, Any]:
-    """Lazily loads all 4 structural swing-pivot classifiers for the requested version ('v3' or 'v4')."""
+    """Lazily loads all 6 structural & major trend-reversal swing-pivot classifiers for the requested version ('v3' or 'v4')."""
     global _PIVOT_MODELS_CACHE
     ver = "v4" if str(model_ver or "v3").strip().lower().startswith("v4") else "v3"
     if ver not in _PIVOT_MODELS_CACHE or not isinstance(_PIVOT_MODELS_CACHE.get(ver), dict):
@@ -236,6 +238,8 @@ def get_all_pivot_models(model_ver: str = "v3") -> Dict[str, Any]:
             ("ut_low", UPTREND_PIVOT_LOW_MODEL_V4_PATH if UPTREND_PIVOT_LOW_MODEL_V4_PATH.exists() else UPTREND_PIVOT_LOW_MODEL_PATH),
             ("dt_high", DOWNTREND_PIVOT_HIGH_MODEL_V4_PATH if DOWNTREND_PIVOT_HIGH_MODEL_V4_PATH.exists() else DOWNTREND_PIVOT_HIGH_MODEL_PATH),
             ("dt_low", DOWNTREND_PIVOT_LOW_MODEL_V4_PATH if DOWNTREND_PIVOT_LOW_MODEL_V4_PATH.exists() else DOWNTREND_PIVOT_LOW_MODEL_PATH),
+            ("maj_ut_top", MAJOR_UT_TOP_MODEL_PATH),
+            ("maj_dt_low", MAJOR_DT_BOTTOM_MODEL_PATH),
         ]
         if ver == "v4"
         else [
@@ -243,6 +247,8 @@ def get_all_pivot_models(model_ver: str = "v3") -> Dict[str, Any]:
             ("ut_low", UPTREND_PIVOT_LOW_MODEL_PATH),
             ("dt_high", DOWNTREND_PIVOT_HIGH_MODEL_PATH),
             ("dt_low", DOWNTREND_PIVOT_LOW_MODEL_PATH),
+            ("maj_ut_top", MAJOR_UT_TOP_MODEL_PATH),
+            ("maj_dt_low", MAJOR_DT_BOTTOM_MODEL_PATH),
         ]
     )
     for key, path in path_pairs:
@@ -412,12 +418,12 @@ def _enrich_events_with_intrabar_triggers(
     n_steps: int = 41,
 ) -> List[Dict[str, Any]]:
     """Vectorized causal intrabar price sweep across `[Low, High]` for each detected pivot event:
-    - For Pivot Highs (`ut_high`, `dt_high`): sweeps candidate intrabar high upward from `Low` (`w=0`) to `High` (`w=1`)
+    - For Pivot Highs (`ut_high`, `dt_high`, `maj_ut_top`): sweeps candidate intrabar high upward from `Low` (`w=0`) to `High` (`w=1`)
       to find the **lowest intrabar price** that classifies the bar as a Pivot High (`prob >= threshold`).
-    - For Pivot Lows (`ut_low`, `dt_low`): sweeps candidate intrabar low downward from `High` (`w=0`) to `Low` (`w=1`)
+    - For Pivot Lows (`ut_low`, `dt_low`, `maj_dt_low`): sweeps candidate intrabar low downward from `High` (`w=0`) to `Low` (`w=1`)
       to find the **highest intrabar price** that classifies the bar as a Pivot Low (`prob >= threshold`).
     All candidate-price-dependent features (RSI(14/9/5), ADR extensions, Bollinger Z, 120d p95 stretch,
-    multi-day max/min, consecutive RSI streaks, divergence triggers, weekly W-FRI RSI, Inverse-RSI distance,
+    multi-day max/min, consecutive RSI streaks, 18d/35d/60d divergence triggers, weekly W-FRI RSI, Inverse-RSI distance,
     and developing intrabar rejection) are recomputed from `t-1` causal state so that `dist_from_10d_high_adr` /
     `dist_from_8d_low_adr` never look ahead to future EOD `High[t]` / `Low[t]`.
     """
@@ -491,6 +497,8 @@ def _enrich_events_with_intrabar_triggers(
             "avwap_from_60d_low_dist_adr",
             "inv_rsi75_dist_adr",
             "rs_vs_spy_5d_adr",
+            "run_from_60d_low_adr",
+            "run_from_120d_low_adr",
         ]:
             if col in big.columns:
                 big[col] = big[col].to_numpy() + dh
@@ -499,6 +507,8 @@ def _enrich_events_with_intrabar_triggers(
             big["dist_from_10d_high_adr"] = np.maximum(0.0, -big["breakout_above_10d_adr"].to_numpy())
         if "dist_below_40d_high_adr" in big.columns:
             big["dist_below_40d_high_adr"] = np.maximum(0.0, big["dist_below_40d_high_adr"].to_numpy() - dh)
+        if "dist_from_60d_high_adr" in big.columns:
+            big["dist_from_60d_high_adr"] = big["dist_from_60d_high_adr"].to_numpy() - dh
         if "parabolic_accel" in big.columns:
             big["parabolic_accel"] = (big["thrust_3d_adr"] / 3.0) / np.maximum(0.15, big["thrust_10d_adr"] / 10.0)
         if "ema10_anchor" in big.columns and "ext_ema10_pct" in big.columns:
@@ -547,6 +557,14 @@ def _enrich_events_with_intrabar_triggers(
                 big["rsi_div_delta_35d"] = np.where(is_nh_35, np.maximum(0.0, big["prev_wave_rsi_35"].to_numpy() - big["rsi14_high"].to_numpy()), 0.0)
             if "prev_wave_ext_35" in big.columns and "ext_div_delta_35d" in big.columns:
                 big["ext_div_delta_35d"] = np.where(is_nh_35, np.maximum(0.0, big["prev_wave_ext_35"].to_numpy() - big["ext_ema20_adr"].to_numpy()), 0.0)
+        if "prev_wave_high_60" in big.columns and "prev_wave_rsi_60" in big.columns:
+            is_nh_60 = p_cand >= big["prev_wave_high_60"].to_numpy() * 0.975
+            if "bearish_div_60d" in big.columns:
+                big["bearish_div_60d"] = (is_nh_60 & (big["rsi14_high"].to_numpy() < big["prev_wave_rsi_60"].to_numpy() - 2.0)).astype(float)
+            if "rsi_div_delta_60d" in big.columns:
+                big["rsi_div_delta_60d"] = np.where(is_nh_60, np.maximum(0.0, big["prev_wave_rsi_60"].to_numpy() - big["rsi14_high"].to_numpy()), 0.0)
+            if "prev_wave_ext50_60" in big.columns and "ext50_div_delta_60d" in big.columns:
+                big["ext50_div_delta_60d"] = np.where(is_nh_60, np.maximum(0.0, big["prev_wave_ext50_60"].to_numpy() - big["ext_sma50_adr"].to_numpy()), 0.0)
         for k_col, d_col in [
             ("kiss_falling_ema20_adr", "ext_ema20_adr"),
             ("kiss_falling_sma50_adr", "high_dist_sma50_adr"),
@@ -582,6 +600,8 @@ def _enrich_events_with_intrabar_triggers(
             "failed_high_retest",
             "rejected_at_falling_ma",
             "overhead_rejection_score",
+            "climax_churn_top",
+            "failed_60d_breakout",
         ]:
             if scale_col in big.columns:
                 big[scale_col] = big[scale_col].to_numpy() * w
@@ -614,6 +634,7 @@ def _enrich_events_with_intrabar_triggers(
             "avwap_from_60d_high_dist_adr",
             "avwap_from_60d_low_dist_adr",
             "rs_vs_spy_5d_adr",
+            "dist_from_60d_low_adr",
         ]:
             if col in big.columns:
                 big[col] = big[col].to_numpy() + dl
@@ -635,6 +656,8 @@ def _enrich_events_with_intrabar_triggers(
             "undercut_20d_low_adr",
             "open_to_low_adr",
             "inv_rsi25_dist_adr",
+            "drop_from_60d_high_adr",
+            "drop_from_120d_high_adr",
         ]:
             if col in big.columns:
                 big[col] = big[col].to_numpy() - dl
@@ -677,6 +700,14 @@ def _enrich_events_with_intrabar_triggers(
                 big["bullish_div_low_35d"] = (is_nl_35 & (big["rsi14_low"].to_numpy() > big["prev_wave_rsi_low_35"].to_numpy() + 2.0)).astype(float)
             if "rsi_bull_div_delta_35d" in big.columns:
                 big["rsi_bull_div_delta_35d"] = np.where(is_nl_35, np.maximum(0.0, big["rsi14_low"].to_numpy() - big["prev_wave_rsi_low_35"].to_numpy()), 0.0)
+        if "prev_wave_low_60" in big.columns and "prev_wave_rsi_low_60" in big.columns:
+            is_nl_60 = p_cand <= big["prev_wave_low_60"].to_numpy() * 1.025
+            if "bullish_div_low_60d" in big.columns:
+                big["bullish_div_low_60d"] = (is_nl_60 & (big["rsi14_low"].to_numpy() > big["prev_wave_rsi_low_60"].to_numpy() + 2.0)).astype(float)
+            if "rsi_bull_div_delta_60d" in big.columns:
+                big["rsi_bull_div_delta_60d"] = np.where(is_nl_60, np.maximum(0.0, big["rsi14_low"].to_numpy() - big["prev_wave_rsi_low_60"].to_numpy()), 0.0)
+            if "prev_wave_str50_60" in big.columns and "str50_bull_div_delta_60d" in big.columns:
+                big["str50_bull_div_delta_60d"] = np.where(is_nl_60, np.maximum(0.0, big["prev_wave_str50_60"].to_numpy() - big["stretch_below_sma50_adr"].to_numpy()), 0.0)
         for k_col, d_col in [
             ("kiss_ema10_dist_adr", "low_dist_ema10_adr"),
             ("kiss_ema20_dist_adr", "low_dist_ema20_adr"),
@@ -713,6 +744,8 @@ def _enrich_events_with_intrabar_triggers(
             "failed_low_undercut",
             "ma_undercut_reclaim",
             "day2_washout_reclaim",
+            "climax_absorption_bottom",
+            "spring_60d_low_reclaim",
         ]:
             if scale_col in big.columns:
                 big[scale_col] = big[scale_col].to_numpy() * w
@@ -739,9 +772,6 @@ def _enrich_events_with_intrabar_triggers(
         grid_i = p_cand_mat[i]
         prec = 4 if abs(float(grid_i[-1])) < 10.0 else 2
         ev_prob = float(ev["prob_pct"])
-        # Evaluate the true model probability curve along the intrabar excursion (weighted by sqrt(w)
-        # at the start of the bar so opposite-extreme w=0 cannot fire before price moves toward the pivot,
-        # with a 5% within-leaf tie-breaker slope so flat tree steps interpolate distinctly across thresholds):
         model_curve = np.maximum.accumulate(np.maximum(p_dual_mat[i], p_ex_mat[i]) * np.sqrt(w_1d))
         model_curve = np.minimum(model_curve, ev_prob)
         model_curve[-1] = ev_prob
@@ -782,11 +812,13 @@ def compute_universal_exhaustion(
     model_ver: str = "v3",
     symbol: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Scores the 4-Model Universal Structural Swing-Pivot Suite across ANY ticker, ETF, Sector, Theme, or Ratio:
-    1. `ut_high`: Uptrend Pivot High (Climax Top / Parabolic Stretch & Multi-Wave Divergence)
-    2. `ut_low` : Uptrend Pivot Low (Pullback Buy / Support Kiss / Undercut & Reclaim)
-    3. `dt_high`: Downtrend Pivot High (Bear-Rally Rejection / Overhead Falling-MA Supply)
-    4. `dt_low` : Downtrend Pivot Low (Capitulation Washout / Selling Climax Bottom)
+    """Scores the 6-Model Universal Structural & Major Reversal Swing-Pivot Suite across ANY ticker, ETF, Sector, Theme, or Ratio:
+    1. `ut_high`   : Uptrend Pivot High (Climax Top / Parabolic Stretch & Multi-Wave Divergence)
+    2. `ut_low`    : Uptrend Pivot Low (Pullback Buy / Support Kiss / Undercut & Reclaim)
+    3. `dt_high`   : Downtrend Pivot High (Bear-Rally Rejection / Overhead Falling-MA Supply)
+    4. `dt_low`    : Downtrend Pivot Low (Capitulation Washout / Selling Climax Bottom)
+    5. `maj_ut_top`: Major Uptrend Reversal High (Primary Trend Top -> Downtrend Breakdown)
+    6. `maj_dt_low`: Major Downtrend Reversal Low (Primary Trend Bottom -> Uptrend Turnaround)
     Supports both `model_ver='v3'` (Baseline) and `model_ver='v4'` (Enhanced B1–B5 + Inverse-RSI).
     """
     ver = "v4" if str(model_ver or "v3").strip().lower().startswith("v4") else "v3"
@@ -823,6 +855,18 @@ def compute_universal_exhaustion(
     else:
         p_dl = p_dl_ex = p_dl_fb = zeros
 
+    # 5. Model 5: Major Uptrend Reversal High (maj_ut_top)
+    if "maj_ut_top" in models:
+        p_muh, p_muh_ex, p_muh_fb = tap.score_dual_model_on_features(sub, models["maj_ut_top"], "is_near_major_ut_top")
+    else:
+        p_muh = p_muh_ex = p_muh_fb = zeros
+
+    # 6. Model 6: Major Downtrend Reversal Low (maj_dt_low)
+    if "maj_dt_low" in models:
+        p_mdl, p_mdl_ex, p_mdl_fb = tap.score_dual_model_on_features(sub, models["maj_dt_low"], "is_near_major_dt_bottom")
+    else:
+        p_mdl = p_mdl_ex = p_mdl_fb = zeros
+
     sub_cols = pd.DataFrame(
         {
             "exhaustion_prob": p_uh,
@@ -832,6 +876,8 @@ def compute_universal_exhaustion(
             "ut_low_prob": p_ul,
             "dt_high_prob": p_dh,
             "dt_low_prob": p_dl,
+            "maj_ut_top_prob": p_muh,
+            "maj_dt_low_prob": p_mdl,
         },
         index=sub.index,
     )
@@ -845,11 +891,15 @@ def compute_universal_exhaustion(
     curr_ul = round(float(last_row["ut_low_prob"]) * 100.0, 1)
     curr_dh = round(float(last_row["dt_high_prob"]) * 100.0, 1)
     curr_dl = round(float(last_row["dt_low_prob"]) * 100.0, 1)
+    curr_muh = round(float(last_row["maj_ut_top_prob"]) * 100.0, 1)
+    curr_mdl = round(float(last_row["maj_dt_low_prob"]) * 100.0, 1)
 
     peak5_uh = round(float(sub["ut_high_prob"].tail(5).max()) * 100.0, 1)
     peak5_ul = round(float(sub["ut_low_prob"].tail(5).max()) * 100.0, 1)
     peak5_dh = round(float(sub["dt_high_prob"].tail(5).max()) * 100.0, 1)
     peak5_dl = round(float(sub["dt_low_prob"].tail(5).max()) * 100.0, 1)
+    peak5_muh = round(float(sub["maj_ut_top_prob"].tail(5).max()) * 100.0, 1)
+    peak5_mdl = round(float(sub["maj_dt_low_prob"].tail(5).max()) * 100.0, 1)
 
     curr_prob = curr_uh
     curr_at_high = round(float(last_row["prob_at_high"]) * 100.0, 1)
@@ -857,9 +907,11 @@ def compute_universal_exhaustion(
     peak_5d_prob = peak5_uh
     peak_20d_prob = round(float(sub["ut_high_prob"].tail(20).max()) * 100.0, 1)
 
-    # Determine dominant active 5D signal across all 4 models for the status banner
+    # Determine dominant active 5D signal across all 6 models for the status banner
     max_5d_pair = max(
         [
+            (peak5_muh, "maj_ut_top", "👑 MAJOR UPTREND REVERSAL TOP ALERT (Primary Trend Breakdown Risk)"),
+            (peak5_mdl, "maj_dt_low", "🚀 MAJOR DOWNTREND REVERSAL BOTTOM ALERT (Primary Trend Turnaround)"),
             (peak5_uh, "ut_high", "🔥 Uptrend Pivot High Alert (Scale Out / Tighten Stop)"),
             (peak5_ul, "ut_low", "💎 Uptrend Pullback Pivot Low (Support Reclaim / Buyable Dip)"),
             (peak5_dh, "dt_high", "🔻 Downtrend Bear-Rally Pivot High (Overhead Supply Rejection)"),
@@ -869,7 +921,7 @@ def compute_universal_exhaustion(
     )
 
     if max_5d_pair[0] >= 50.0:
-        status = "climax" if max_5d_pair[1] in ("ut_high", "dt_high") else "pivot_low"
+        status = "climax" if max_5d_pair[1] in ("ut_high", "dt_high", "maj_ut_top") else "pivot_low"
         action_label = max_5d_pair[2]
     elif max_5d_pair[0] >= 40.0:
         status = "elevated"
@@ -910,6 +962,20 @@ def compute_universal_exhaustion(
         "is_near_downtrend_low",
         False,
     )
+    maj_ut_top_events = _enrich_events_with_intrabar_triggers(
+        sub,
+        _extract_snapped_pivot_events(sub, p_muh, p_muh_ex, p_muh_fb, sub["is_near_major_ut_top"].to_numpy(), True, "maj_ut_top"),
+        models.get("maj_ut_top"),
+        "is_near_major_ut_top",
+        True,
+    )
+    maj_dt_low_events = _enrich_events_with_intrabar_triggers(
+        sub,
+        _extract_snapped_pivot_events(sub, p_mdl, p_mdl_ex, p_mdl_fb, sub["is_near_major_dt_bottom"].to_numpy(), False, "maj_dt_low"),
+        models.get("maj_dt_low"),
+        "is_near_major_dt_bottom",
+        False,
+    )
 
     series_data = [
         {
@@ -921,6 +987,8 @@ def compute_universal_exhaustion(
             "ut_low": round(float(r["ut_low_prob"]) * 100.0, 1),
             "dt_high": round(float(r["dt_high_prob"]) * 100.0, 1),
             "dt_low": round(float(r["dt_low_prob"]) * 100.0, 1),
+            "maj_ut_top": round(float(r["maj_ut_top_prob"]) * 100.0, 1),
+            "maj_dt_low": round(float(r["maj_dt_low_prob"]) * 100.0, 1),
             "regime": "UT" if bool(r["is_primary_uptrend"]) else "DT",
         }
         for idx_dt, r in sub[
@@ -931,6 +999,8 @@ def compute_universal_exhaustion(
                 "ut_low_prob",
                 "dt_high_prob",
                 "dt_low_prob",
+                "maj_ut_top_prob",
+                "maj_dt_low_prob",
                 "is_primary_uptrend",
             ]
         ].iterrows()
@@ -945,8 +1015,16 @@ def compute_universal_exhaustion(
         leg_adr = round(float(last_row.get("down_leg_adr_from_ema20", 0.0)), 1)
         anchor_mode = f"Downtrend (-{leg_adr}x ADR below 20E / {leg_bars}d)"
 
-    has_bear_div = bool(last_row.get("bearish_div_high", 0) > 0.5 or last_row.get("bearish_div_35d", 0) > 0.5)
-    has_bull_div = bool(last_row.get("bullish_div_low_18d", 0) > 0.5 or last_row.get("bullish_div_low_35d", 0) > 0.5)
+    has_bear_div = bool(
+        last_row.get("bearish_div_high", 0) > 0.5
+        or last_row.get("bearish_div_35d", 0) > 0.5
+        or last_row.get("bearish_div_60d", 0) > 0.5
+    )
+    has_bull_div = bool(
+        last_row.get("bullish_div_low_18d", 0) > 0.5
+        or last_row.get("bullish_div_low_35d", 0) > 0.5
+        or last_row.get("bullish_div_low_60d", 0) > 0.5
+    )
 
     ob75_ser = indicators.rsi_trigger_price(df_full["close"], 75.0, 14)
     os25_ser = indicators.rsi_trigger_price(df_full["close"], 25.0, 14)
@@ -967,12 +1045,16 @@ def compute_universal_exhaustion(
             "ut_low": curr_ul,
             "dt_high": curr_dh,
             "dt_low": curr_dl,
+            "maj_ut_top": curr_muh,
+            "maj_dt_low": curr_mdl,
         },
         "pivots_5d_peak": {
             "ut_high": peak5_uh,
             "ut_low": peak5_ul,
             "dt_high": peak5_dh,
             "dt_low": peak5_dl,
+            "maj_ut_top": peak5_muh,
+            "maj_dt_low": peak5_mdl,
         },
         "status": status,
         "action_label": action_label,
@@ -999,6 +1081,8 @@ def compute_universal_exhaustion(
         "ut_low_events": ut_low_events,
         "dt_high_events": dt_high_events,
         "dt_low_events": dt_low_events,
+        "maj_ut_top_events": maj_ut_top_events,
+        "maj_dt_low_events": maj_dt_low_events,
         "series": series_data,
     }
 
@@ -3301,6 +3385,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         <input type="checkbox" id="cfg_pivot_low_markers" checked onchange="renderEPMarkers()">💎 Pivot Lows ≥
         <input type="number" id="cfg_climax_thresh" value="50" min="25" max="85" step="5" class="ma-span-input" onchange="renderEPMarkers()" oninput="renderEPMarkers()" title="Minimum ML Pivot Probability % for chart markers (25-85%)">%
       </span>
+      <span class="cfg-label" title="Toggle Major Trend Reversal markers (👑 Major Top: Uptrend -> Downtrend Breakdown / 🚀 Major Bottom: Downtrend -> Uptrend Turnaround)">
+        <input type="checkbox" id="cfg_major_rev_markers" checked onchange="renderEPMarkers()">👑 Major Reversals
+      </span>
       <span class="cfg-label" title="Display the lowest intrabar price that classifies a Pivot High and the highest intrabar price that classifies a Pivot Low">
         <input type="checkbox" id="cfg_pivot_intrabar_price" checked onchange="renderEPMarkers()">🎯 Intrabar Trigger $
       </span>
@@ -3365,10 +3452,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       <textarea id="info_item_notes" rows="2" placeholder="Add trading notes, trigger levels, or thesis for this symbol..." style="width:100%; background:#0b1019; border:1px solid #1e293b; color:#e2e8f0; padding:6px; border-radius:5px; font-size:11px; resize:vertical;" onchange="saveItemNotes()"></textarea>
     </div>
 
-    <!-- 2. Universal 4-Model Structural Swing-Pivot Suite Card -->
+    <!-- 2. Universal 6-Model Structural & Major Reversal Swing-Pivot Suite Card -->
     <div class="info-card" id="ml_exhaustion_card" style="border-color:rgba(56,189,248,0.3);">
       <div class="card-title">
-        <span>🤖 4-Model Structural Pivot Suite</span>
+        <span>🤖 6-Model Structural & Reversal Suite</span>
         <span class="rs-badge" id="exh_status_badge">--</span>
       </div>
       <div style="display:grid; grid-template-columns:repeat(4, 1fr); gap:5px;">
@@ -3391,6 +3478,18 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           <div class="k" style="color:#4ade80;">🟢 DT LOW</div>
           <div class="v" id="piv_dt_low_val">--</div>
           <div style="font-size:9px; color:#64748b;" id="piv_dt_low_5d">5D: --</div>
+        </div>
+      </div>
+      <div style="display:grid; grid-template-columns:repeat(2, 1fr); gap:5px;">
+        <div class="perf-cell" style="border-color:rgba(251,191,36,0.35);" title="Model 5: Major Uptrend Reversal High (Primary Trend Top -> Breakdown)">
+          <div class="k" style="color:#fbbf24;">👑 MAJOR UT TOP</div>
+          <div class="v" id="piv_maj_ut_top_val">--</div>
+          <div style="font-size:9px; color:#64748b;" id="piv_maj_ut_top_5d">5D: --</div>
+        </div>
+        <div class="perf-cell" style="border-color:rgba(16,185,129,0.35);" title="Model 6: Major Downtrend Reversal Low (Primary Trend Bottom -> Turnaround)">
+          <div class="k" style="color:#10b981;">🚀 MAJOR DT BOTTOM</div>
+          <div class="v" id="piv_maj_dt_low_val">--</div>
+          <div style="font-size:9px; color:#64748b;" id="piv_maj_dt_low_5d">5D: --</div>
         </div>
       </div>
       <div style="display:none;" id="exh_20d_val">--</div>
@@ -4353,14 +4452,23 @@ function updateIntrabarTriggerRow(exh) {
     ...(exh.ut_low_events || []),
     ...(exh.dt_high_events || []),
     ...(exh.dt_low_events || []),
+    ...(exh.maj_ut_top_events || []),
+    ...(exh.maj_dt_low_events || []),
   ].filter(e => e.prob_pct >= thr).sort((a, b) => a.date.localeCompare(b.date));
   if (allEvs.length > 0) {
     const lastEv = allEvs[allEvs.length - 1];
-    const isHi = lastEv.type === 'ut_high' || lastEv.type === 'dt_high';
+    const isHi = lastEv.type === 'ut_high' || lastEv.type === 'dt_high' || lastEv.type === 'maj_ut_top';
     const trigP = resolvePivotTriggerPrice(lastEv, thr);
     const extP = isHi ? lastEv.high : lastEv.low;
     const dec = Math.abs(Number(trigP)) < 10 ? 3 : 2;
-    const lblMap = { ut_high: 'UT High', ut_low: 'UT Low', dt_high: 'DT High', dt_low: 'DT Low' };
+    const lblMap = {
+      ut_high: 'UT High',
+      ut_low: 'UT Low',
+      dt_high: 'DT High',
+      dt_low: 'DT Low',
+      maj_ut_top: '👑 Major Top',
+      maj_dt_low: '🚀 Major Bottom',
+    };
     trigRowEl.textContent = `${lastEv.date} ${lblMap[lastEv.type] || lastEv.type}: @$${Number(trigP).toFixed(dec)} (${isHi ? 'Hi' : 'Lo'} $${Number(extP).toFixed(dec)})`;
   } else {
     trigRowEl.textContent = 'None in view';
@@ -4372,6 +4480,7 @@ function renderEPMarkers() {
   const showEP = document.getElementById('cfg_ep_markers').checked;
   const showPivotHighs = document.getElementById('cfg_climax_markers')?.checked;
   const showPivotLows = document.getElementById('cfg_pivot_low_markers')?.checked;
+  const showMajorRev = document.getElementById('cfg_major_rev_markers')?.checked ?? true;
   const showIntrabarPrice = document.getElementById('cfg_pivot_intrabar_price')?.checked ?? true;
   const threshEl = document.getElementById('cfg_climax_thresh');
   const climaxThresh = threshEl ? Math.max(20, Math.min(90, parseFloat(threshEl.value) || 50)) : 50;
@@ -4387,6 +4496,8 @@ function renderEPMarkers() {
   const utLowEvents = (exh.ut_low_events || []).filter(ce => ce.prob_pct >= climaxThresh);
   const dtHighEvents = (exh.dt_high_events || []).filter(ce => ce.prob_pct >= climaxThresh);
   const dtLowEvents = (exh.dt_low_events || []).filter(ce => ce.prob_pct >= climaxThresh);
+  const majUtTopEvents = (exh.maj_ut_top_events || []).filter(ce => ce.prob_pct >= climaxThresh);
+  const majDtLowEvents = (exh.maj_dt_low_events || []).filter(ce => ce.prob_pct >= climaxThresh);
   const badge = document.getElementById('hdr_ep_count_badge');
 
   if (eps.length > 0) {
@@ -4481,6 +4592,30 @@ function renderEPMarkers() {
     });
   }
 
+  // 5. Major Uptrend Reversal Tops (👑 Major Top) & 6. Major Downtrend Reversal Bottoms (🚀 Major Bottom)
+  if (showMajorRev) {
+    majUtTopEvents.forEach(ce => {
+      const trigSfx = fmtPivotIntrabarSuffix(ce, climaxThresh, showIntrabarPrice);
+      allMarkers.push({
+        time: ce.date,
+        position: 'aboveBar',
+        color: '#fbbf24',
+        shape: 'arrowDown',
+        text: `👑 Major Top ${ce.prob_pct.toFixed(0)}%${trigSfx}`,
+      });
+    });
+    majDtLowEvents.forEach(ce => {
+      const trigSfx = fmtPivotIntrabarSuffix(ce, climaxThresh, showIntrabarPrice);
+      allMarkers.push({
+        time: ce.date,
+        position: 'belowBar',
+        color: '#10b981',
+        shape: 'arrowUp',
+        text: `🚀 Major Bottom ${ce.prob_pct.toFixed(0)}%${trigSfx}`,
+      });
+    });
+  }
+
   allMarkers.sort((a, b) => a.time.localeCompare(b.time));
   candleSeries.setMarkers(allMarkers);
   updateIntrabarTriggerRow(exh);
@@ -4568,7 +4703,7 @@ function renderInfoPanel(data) {
   const pf = data.performance || {};
   const exh = data.exhaustion || {};
 
-  // Render Universal 4-Model Structural Swing-Pivot Card + Header Badge
+  // Render Universal 6-Model Structural & Major Reversal Swing-Pivot Card + Header Badge
   const hdrClimax = document.getElementById('hdr_climax_badge');
   const exhStatusBadge = document.getElementById('exh_status_badge');
   if (exh && exh.current_prob_pct !== undefined) {
@@ -4578,12 +4713,16 @@ function renderInfoPanel(data) {
     const ul = pc.ut_low || 0;
     const dh = pc.dt_high || 0;
     const dl = pc.dt_low || 0;
+    const muh = pc.maj_ut_top || 0;
+    const mdl = pc.maj_dt_low || 0;
 
     const uh5 = p5.ut_high !== undefined ? p5.ut_high : exh.peak_5d_prob_pct;
     const ul5 = p5.ut_low || 0;
     const dh5 = p5.dt_high || 0;
     const dl5 = p5.dt_low || 0;
-    const max5 = Math.max(uh5, ul5, dh5, dl5);
+    const muh5 = p5.maj_ut_top || 0;
+    const mdl5 = p5.maj_dt_low || 0;
+    const max5 = Math.max(uh5, ul5, dh5, dl5, muh5, mdl5);
 
     const reg = exh.regime === 'downtrend' ? 'DOWNTREND' : 'UPTREND';
     const regShort = exh.regime === 'downtrend' ? 'DT' : 'UT';
@@ -4626,6 +4765,16 @@ function renderInfoPanel(data) {
     const dl5El = document.getElementById('piv_dt_low_5d');
     if (dlEl) dlEl.innerHTML = `<span style="color:${dl >= 50 ? '#4ade80' : '#cbd5e1'};">${dl.toFixed(1)}%</span>`;
     if (dl5El) dl5El.textContent = `5D: ${dl5.toFixed(0)}%`;
+
+    const muhEl = document.getElementById('piv_maj_ut_top_val');
+    const muh5El = document.getElementById('piv_maj_ut_top_5d');
+    if (muhEl) muhEl.innerHTML = `<span style="color:${muh >= 50 ? '#fbbf24' : '#cbd5e1'};">${muh.toFixed(1)}%</span>`;
+    if (muh5El) muh5El.textContent = `5D: ${muh5.toFixed(0)}%`;
+
+    const mdlEl = document.getElementById('piv_maj_dt_low_val');
+    const mdl5El = document.getElementById('piv_maj_dt_low_5d');
+    if (mdlEl) mdlEl.innerHTML = `<span style="color:${mdl >= 50 ? '#10b981' : '#cbd5e1'};">${mdl.toFixed(1)}%</span>`;
+    if (mdl5El) mdl5El.textContent = `5D: ${mdl5.toFixed(0)}%`;
 
     const barEl = document.getElementById('exh_progress_bar');
     barEl.style.width = `${Math.min(100, Math.max(4, max5))}%`;

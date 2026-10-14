@@ -61,6 +61,12 @@ PIVOT_MODEL_PATHS = [
     ROOT / "data" / "models" / "uptrend_pivot_low_classifier.pkl",
     ROOT / "data" / "models" / "downtrend_pivot_high_classifier.pkl",
     ROOT / "data" / "models" / "downtrend_pivot_low_classifier.pkl",
+    ROOT / "data" / "models" / "uptrend_pivot_high_classifier_v4.pkl",
+    ROOT / "data" / "models" / "uptrend_pivot_low_classifier_v4.pkl",
+    ROOT / "data" / "models" / "downtrend_pivot_high_classifier_v4.pkl",
+    ROOT / "data" / "models" / "downtrend_pivot_low_classifier_v4.pkl",
+    ROOT / "data" / "models" / "major_uptrend_reversal_high_classifier.pkl",
+    ROOT / "data" / "models" / "major_downtrend_reversal_low_classifier.pkl",
 ]
 MAX_PIVOT_MODEL_AGE_DAYS = 7
 
@@ -116,7 +122,7 @@ def reload_server(port: int, app_name: str) -> Dict[str, Any]:
 
 
 def update_pivot_models_if_needed(force: bool = False) -> Dict[str, Any]:
-    """Checks the 4 structural swing-pivot ML models (UT High, UT Low, DT High, DT Low)
+    """Checks the structural swing-pivot & major reversal ML models (V3, V4, and Major Reversal)
     and retrains them if any model file is missing, older than MAX_PIVOT_MODEL_AGE_DAYS, or forced."""
     now_ts = time.time()
     missing = [p.name for p in PIVOT_MODEL_PATHS if not p.exists()]
@@ -130,11 +136,11 @@ def update_pivot_models_if_needed(force: bool = False) -> Dict[str, Any]:
     if not force and not missing and not stale:
         oldest_mtime = min(p.stat().st_mtime for p in PIVOT_MODEL_PATHS)
         trained_dt = dt.datetime.fromtimestamp(oldest_mtime).strftime("%Y-%m-%d %H:%M")
-        logger.info(f"✅ All 4 structural pivot models are fresh (last updated: {trained_dt}).")
+        logger.info(f"✅ All {len(PIVOT_MODEL_PATHS)} structural & major reversal pivot models are fresh (last updated: {trained_dt}).")
         return {"status": "up_to_date", "last_updated": trained_dt}
 
     reason = "forced" if force else (f"missing={missing}" if missing else f"stale={stale}")
-    logger.info(f"🔄 Retraining 4 structural swing-pivot models ({reason})...")
+    logger.info(f"🔄 Retraining structural & major reversal pivot models ({reason})...")
     import train_uptrend_pivot_model
     import train_all_pivot_models
 

@@ -63,6 +63,9 @@ UT_LOW_V4_PATH = OUT_DIR / "uptrend_pivot_low_classifier_v4.pkl"
 DT_HIGH_V4_PATH = OUT_DIR / "downtrend_pivot_high_classifier_v4.pkl"
 DT_LOW_V4_PATH = OUT_DIR / "downtrend_pivot_low_classifier_v4.pkl"
 
+MAJOR_UT_TOP_PATH = OUT_DIR / "major_uptrend_reversal_high_classifier.pkl"
+MAJOR_DT_BOTTOM_PATH = OUT_DIR / "major_downtrend_reversal_low_classifier.pkl"
+
 _MARKET_SYNC_CACHE: Optional[pd.DataFrame] = None
 _B4_INTRADAY_CACHE: Dict[str, pd.DataFrame] = {}
 
@@ -969,7 +972,223 @@ def compute_all_pivot_features(df: pd.DataFrame, symbol: Optional[str] = None) -
         cols["mtf_ob75_confluence"] = daily_ob_proxy
         cols["mtf_os25_confluence"] = daily_os_proxy
 
+    # =========================================================================
+    # MAJOR TREND REVERSAL MACRO MATURITY, DIVERGENCE & DISTRIBUTION FEATURES
+    # (Strictly causal at bar t — zero lookahead)
+    # =========================================================================
+    low_60d_prev = l.shift(1).rolling(60, min_periods=15).min().bfill()
+    low_120d_prev = l.shift(1).rolling(120, min_periods=25).min().bfill()
+    high_60d_prev = h.shift(1).rolling(60, min_periods=15).max().bfill()
+    high_120d_prev = h.shift(1).rolling(120, min_periods=25).max().bfill()
+
+    run_from_60d_low_adr = ((h - low_60d_prev) / adr20).fillna(0.0)
+    run_from_120d_low_adr = ((h - low_120d_prev) / adr20).fillna(0.0)
+    drop_from_60d_high_adr = ((high_60d_prev - l) / adr20).fillna(0.0)
+    drop_from_120d_high_adr = ((high_120d_prev - l) / adr20).fillna(0.0)
+    dist_from_60d_high_adr = ((high_60d_prev - h) / adr20).clip(-5.0, 15.0).fillna(0.0)
+    dist_from_60d_low_adr = ((l - low_60d_prev) / adr20).clip(-5.0, 15.0).fillna(0.0)
+
+    cols["low_60d_prev"] = low_60d_prev
+    cols["high_60d_prev"] = high_60d_prev
+    cols["run_from_60d_low_adr"] = run_from_60d_low_adr
+    cols["run_from_120d_low_adr"] = run_from_120d_low_adr
+    cols["drop_from_60d_high_adr"] = drop_from_60d_high_adr
+    cols["drop_from_120d_high_adr"] = drop_from_120d_high_adr
+    cols["dist_from_60d_high_adr"] = dist_from_60d_high_adr
+    cols["dist_from_60d_low_adr"] = dist_from_60d_low_adr
+
+    # 60-Day Macro Multi-Wave Divergence (Uptrend Top & Downtrend Bottom)
+    prev_wave_high_60 = h.shift(6).rolling(55, min_periods=12).max().bfill()
+    prev_wave_rsi_60 = b["rsi14_high"].shift(6).rolling(55, min_periods=12).max().fillna(50.0)
+    prev_wave_ext50_60 = b["ext_sma50_adr"].shift(6).rolling(55, min_periods=12).max().fillna(0.0)
+    cols["prev_wave_high_60"] = prev_wave_high_60
+    cols["prev_wave_rsi_60"] = prev_wave_rsi_60
+    cols["prev_wave_ext50_60"] = prev_wave_ext50_60
+    is_nh_60 = h >= prev_wave_high_60 * 0.975
+    cols["bearish_div_60d"] = (is_nh_60 & (b["rsi14_high"] < prev_wave_rsi_60 - 2.0)).astype(float)
+    cols["rsi_div_delta_60d"] = np.where(is_nh_60, (prev_wave_rsi_60 - b["rsi14_high"]).clip(lower=0.0), 0.0)
+    cols["ext50_div_delta_60d"] = np.where(is_nh_60, (prev_wave_ext50_60 - b["ext_sma50_adr"]).clip(lower=0.0), 0.0)
+
+    prev_wave_low_60 = l.shift(6).rolling(55, min_periods=12).min().bfill()
+    prev_wave_rsi_low_60 = rsi14_low.shift(6).rolling(55, min_periods=12).min().fillna(50.0)
+    prev_wave_str50_60 = stretch_below_sma50_adr.shift(6).rolling(55, min_periods=12).max().fillna(0.0)
+    cols["prev_wave_low_60"] = prev_wave_low_60
+    cols["prev_wave_rsi_low_60"] = prev_wave_rsi_low_60
+    cols["prev_wave_str50_60"] = prev_wave_str50_60
+    is_nl_60 = l <= prev_wave_low_60 * 1.025
+    cols["bullish_div_low_60d"] = (is_nl_60 & (rsi14_low > prev_wave_rsi_low_60 + 2.0)).astype(float)
+    cols["rsi_bull_div_delta_60d"] = np.where(is_nl_60, (rsi14_low - prev_wave_rsi_low_60).clip(lower=0.0), 0.0)
+    cols["str50_bull_div_delta_60d"] = np.where(is_nl_60, (prev_wave_str50_60 - stretch_below_sma50_adr).clip(lower=0.0), 0.0)
+
+    # Structural Slope Deceleration & Secular Stretch
+    ema20_slope_accel_adr = (ema20_slope_5d_adr - ema20_slope_5d_adr.shift(10)).fillna(0.0)
+    sma50_slope_accel_adr = (sma50_slope_10d_adr - sma50_slope_10d_adr.shift(10)).fillna(0.0)
+    ema10_vs_ema20_spread_adr = ((ema10_anchor - ema20_anchor) / adr20).fillna(0.0)
+    ema10_20_spread_chg5_adr = (ema10_vs_ema20_spread_adr - ema10_vs_ema20_spread_adr.shift(5)).fillna(0.0)
+    sma50_vs_sma200_adr = ((sma50_anchor - sma200_anchor) / adr20).fillna(0.0)
+
+    cols["ema20_slope_accel_adr"] = ema20_slope_accel_adr
+    cols["sma50_slope_accel_adr"] = sma50_slope_accel_adr
+    cols["ema10_vs_ema20_spread_adr"] = ema10_vs_ema20_spread_adr
+    cols["ema10_20_spread_chg5_adr"] = ema10_20_spread_chg5_adr
+    cols["sma50_vs_sma200_adr"] = sma50_vs_sma200_adr
+
+    # 20-Day Institutional Volume Distribution vs. Accumulation Balance (strictly causal t-1 anchor)
+    c_s1 = c.shift(1)
+    c_s2 = c.shift(2)
+    rvol_s1 = b["rvol"].shift(1).fillna(1.0)
+    v_s1 = v.shift(1).fillna(0.0)
+    dist_days_20d_prev = ((c_s1 < c_s2) & (rvol_s1 >= 1.05)).astype(float).rolling(20, min_periods=5).sum().fillna(0.0)
+    accum_days_20d_prev = ((c_s1 > c_s2) & (rvol_s1 >= 1.05)).astype(float).rolling(20, min_periods=5).sum().fillna(0.0)
+    up_vol_20d = (v_s1 * (c_s1 >= c_s2).astype(float)).rolling(20, min_periods=5).sum()
+    dn_vol_20d = (v_s1 * (c_s1 < c_s2).astype(float)).rolling(20, min_periods=5).sum()
+    up_down_vol_ratio_20d = (up_vol_20d / np.maximum(1.0, dn_vol_20d)).clip(0.1, 10.0).fillna(1.0)
+
+    cols["dist_days_20d_prev"] = dist_days_20d_prev
+    cols["accum_days_20d_prev"] = accum_days_20d_prev
+    cols["up_down_vol_ratio_20d"] = up_down_vol_ratio_20d
+
+    # Full-Bar Climax Distribution Churn & Wyckoff Spring Reversal Features
+    cols["climax_churn_top"] = b["rvol"] * b["fade_from_high_adr"] * (run_from_60d_low_adr / 5.0).clip(0.2, 4.0)
+    cols["failed_60d_breakout"] = (
+        (dist_from_60d_high_adr <= 0.5)
+        & (dist_from_60d_high_adr >= -1.0)
+        & (c < prev_wave_high_60)
+        & (b["fade_from_high_adr"] >= 0.35)
+    ).astype(float)
+    cols["climax_absorption_bottom"] = b["rvol"] * bounce_from_low_adr * (drop_from_60d_high_adr / 5.0).clip(0.2, 4.0)
+    cols["spring_60d_low_reclaim"] = (
+        (dist_from_60d_low_adr <= 0.5)
+        & (dist_from_60d_low_adr >= -1.0)
+        & (c > prev_wave_low_60)
+        & (bounce_from_low_adr >= 0.35)
+    ).astype(float)
+
+    # Candidate Masks for Major Trend Reversal Models (Models 5 & 6)
+    cols["is_near_major_ut_top"] = (
+        b["is_near_local_high"]
+        & ((run_from_60d_low_adr >= 3.5) | (cols["days_above_sma50_60d"] >= 0.30))
+    )
+    cols["is_near_major_dt_bottom"] = (
+        cols["is_near_downtrend_low"]
+        & ((drop_from_60d_high_adr >= 3.5) | (cols["days_below_sma50_60d"] >= 0.30))
+    )
+
     return pd.concat([b, pd.DataFrame(cols, index=b.index)], axis=1)
+
+
+def label_major_uptrend_reversal_highs(b: pd.DataFrame) -> pd.Series:
+    """
+    Ground-Truth Major Uptrend-to-Downtrend Trend Reversal Pivot High (`1` - Model 5):
+    Identifies Uptrend Pivot Highs from where the primary trend itself reverses down
+    (separating true macro cycle tops from intermediate continuation pullbacks):
+    1. Strictly inside `is_primary_uptrend` and not a fresh Day-1 ignition (`~is_fresh_ignition`),
+       preceded by a real multi-week uptrend (`run_from_60d_low_adr >= 3.5` or `days_above_sma50_60d >= 0.30`).
+    2. `High[t]` is within `0.28 ADR` of the trailing 10-bar peak (`max(High[t-10..t])`)
+       AND future 15 sessions (`t+1..t+15`) never exceed `High[t] + 0.30 * ADR20[t]`.
+    3. Immediate rollover (`curr_h - min(Low[t+1..t+5]) >= 1.5 * ADR` and `curr_h - min(Low[t+1..t+10]) >= 2.5 * ADR`).
+    4. True 25-Session Trend Reversal Down (`t+1..t+25`):
+       - Deep structural drawdown: `curr_h - min(Low[t+1..t+25]) >= 4.0 * ADR`
+       - Sustained breakdown (no V-recovery): `curr_h - mean(Close[t+10..t+25]) >= 2.8 * ADR`
+       - Breaks below the 50 SMA: `any(Close[t+5..t+25] < SMA50[t+5..t+25] - 0.10 * ADR)`.
+    """
+    h = b["high"].to_numpy(dtype=np.float64)
+    l = b["low"].to_numpy(dtype=np.float64)
+    c = b["close"].to_numpy(dtype=np.float64)
+    adr = b["adr20"].to_numpy(dtype=np.float64)
+    sma50_cur = b["sma50"].to_numpy(dtype=np.float64)
+    ut_mask = b["is_primary_uptrend"].to_numpy()
+    fresh_ig = b["is_fresh_ignition"].to_numpy()
+    run60 = b["run_from_60d_low_adr"].to_numpy(dtype=np.float64)
+    days_abv50 = b["days_above_sma50_60d"].to_numpy(dtype=np.float64)
+    n = len(b)
+    labels = np.zeros(n, dtype=int)
+
+    for i in range(25, n - 25):
+        if (not ut_mask[i]) or fresh_ig[i] or (run60[i] < 3.5 and days_abv50[i] < 0.30):
+            continue
+        curr_h = h[i]
+        curr_adr = adr[i]
+        if curr_adr <= 0 or np.isnan(curr_h):
+            continue
+        if (np.max(h[max(0, i - 10) : i + 1]) - curr_h) > 0.28 * curr_adr:
+            continue
+        if (np.max(h[i + 1 : i + 16]) - curr_h) > 0.30 * curr_adr:
+            continue
+        fut_l5 = np.min(l[i + 1 : i + 6])
+        fut_l10 = np.min(l[i + 1 : i + 11])
+        fut_l25 = np.min(l[i + 1 : i + 26])
+        fut_c_mean = np.mean(c[i + 10 : i + 26])
+        broke_sma50 = np.any(c[i + 5 : i + 26] < sma50_cur[i + 5 : i + 26] - 0.10 * curr_adr)
+        if (
+            (curr_h - fut_l5) >= 1.5 * curr_adr
+            and (curr_h - fut_l10) >= 2.5 * curr_adr
+            and (curr_h - fut_l25) >= 4.0 * curr_adr
+            and (curr_h - fut_c_mean) >= 2.8 * curr_adr
+            and broke_sma50
+        ):
+            labels[i] = 1
+
+    return pd.Series(labels, index=b.index)
+
+
+def label_major_downtrend_reversal_lows(b: pd.DataFrame) -> pd.Series:
+    """
+    Ground-Truth Major Downtrend-to-Uptrend Trend Reversal Pivot Low (`1` - Model 6):
+    Identifies Downtrend Pivot Lows from where the primary trend itself reverses up
+    (separating true macro cycle bottoms from dead-cat bear-market bounces):
+    1. Strictly inside `is_primary_downtrend` and not a fresh Day-1 breakdown (`~is_fresh_breakdown`),
+       preceded by a real multi-week selloff (`drop_from_60d_high_adr >= 3.5` or `days_below_sma50_60d >= 0.30`).
+    2. `Low[t]` is within `0.28 ADR` of the trailing 10-bar trough (`min(Low[t-10..t])`)
+       AND future 15 sessions (`t+1..t+15`) never undercut `Low[t] - 0.30 * ADR20[t]`.
+    3. Immediate turnaround (`max(High[t+1..t+5]) - curr_l >= 1.5 * ADR` and `max(High[t+1..t+10]) - curr_l >= 2.5 * ADR`).
+    4. True 25-Session Trend Reversal Up (`t+1..t+25`):
+       - Sustained structural rally: `max(High[t+1..t+25]) - curr_l >= 3.6 * ADR`
+       - Holds turnaround gains (no dead-cat rollover): `mean(Close[t+10..t+25]) - curr_l >= 2.5 * ADR`
+       - Reclaims 50 SMA or holds persistently above rising 20 EMA:
+         `any(Close[t+5..t+25] >= SMA50[t+5..t+25] - 0.20 * ADR) or all(Close[t+12..t+25] >= EMA20[t+12..t+25])`.
+    """
+    h = b["high"].to_numpy(dtype=np.float64)
+    l = b["low"].to_numpy(dtype=np.float64)
+    c = b["close"].to_numpy(dtype=np.float64)
+    adr = b["adr20"].to_numpy(dtype=np.float64)
+    sma50_cur = b["sma50"].to_numpy(dtype=np.float64)
+    ema20_cur = b["ema20"].to_numpy(dtype=np.float64)
+    dt_mask = b["is_primary_downtrend"].to_numpy()
+    fresh_bd = b["is_fresh_breakdown"].to_numpy()
+    drop60 = b["drop_from_60d_high_adr"].to_numpy(dtype=np.float64)
+    days_bel50 = b["days_below_sma50_60d"].to_numpy(dtype=np.float64)
+    n = len(b)
+    labels = np.zeros(n, dtype=int)
+
+    for i in range(25, n - 25):
+        if (not dt_mask[i]) or fresh_bd[i] or (drop60[i] < 3.5 and days_bel50[i] < 0.30):
+            continue
+        curr_l = l[i]
+        curr_adr = adr[i]
+        if curr_adr <= 0 or np.isnan(curr_l):
+            continue
+        if (curr_l - np.min(l[max(0, i - 10) : i + 1])) > 0.28 * curr_adr:
+            continue
+        if (curr_l - np.min(l[i + 1 : i + 16])) > 0.30 * curr_adr:
+            continue
+        fut_h5 = np.max(h[i + 1 : i + 6])
+        fut_h10 = np.max(h[i + 1 : i + 11])
+        fut_h25 = np.max(h[i + 1 : i + 26])
+        fut_c_mean = np.mean(c[i + 10 : i + 26])
+        reclaimed_ma = np.any(c[i + 5 : i + 26] >= sma50_cur[i + 5 : i + 26] - 0.20 * curr_adr) or np.all(
+            c[i + 12 : i + 26] >= ema20_cur[i + 12 : i + 26]
+        )
+        if (
+            (fut_h5 - curr_l) >= 1.5 * curr_adr
+            and (fut_h10 - curr_l) >= 2.5 * curr_adr
+            and (fut_h25 - curr_l) >= 3.6 * curr_adr
+            and (fut_c_mean - curr_l) >= 2.5 * curr_adr
+            and reclaimed_ma
+        ):
+            labels[i] = 1
+
+    return pd.Series(labels, index=b.index)
 
 
 def label_uptrend_pivot_lows(b: pd.DataFrame) -> pd.Series:
@@ -1381,6 +1600,76 @@ DT_LOW_V4_AT_LOW_FEATURES = DT_LOW_AT_LOW_FEATURES + B1_LOW_FEATURES + B2_SYNC_F
 DT_LOW_V4_A_PLUS_FEATURES = DT_LOW_V4_AT_LOW_FEATURES + ["micro_bounce_adr", "pace_rvol", "micro_lower_wick_pct"]
 DT_LOW_V4_FULL_BAR_FEATURES = DT_LOW_FULL_BAR_FEATURES + B1_LOW_FEATURES + B2_SYNC_FEATURES + B3_WEEKLY_FEATURES + B4_LOW_A_PLUS_ADDONS
 
+# Macro Reversal Feature Families for Model 5 (Major Uptrend Reversal High) & Model 6 (Major Downtrend Reversal Low)
+MAJOR_MACRO_HIGH_AT_FEATURES = [
+    "run_from_60d_low_adr",
+    "run_from_120d_low_adr",
+    "dist_from_60d_high_adr",
+    "bearish_div_60d",
+    "rsi_div_delta_60d",
+    "ext50_div_delta_60d",
+    "ema20_slope_accel_adr",
+    "sma50_slope_accel_adr",
+    "ema10_vs_ema20_spread_adr",
+    "ema10_20_spread_chg5_adr",
+    "sma50_vs_sma200_adr",
+    "dist_days_20d_prev",
+    "up_down_vol_ratio_20d",
+]
+MAJOR_MACRO_HIGH_FB_ADDONS = [
+    "climax_churn_top",
+    "failed_60d_breakout",
+]
+
+MAJOR_MACRO_LOW_AT_FEATURES = [
+    "drop_from_60d_high_adr",
+    "drop_from_120d_high_adr",
+    "dist_from_60d_low_adr",
+    "bullish_div_low_60d",
+    "rsi_bull_div_delta_60d",
+    "str50_bull_div_delta_60d",
+    "ema20_slope_accel_adr",
+    "sma50_slope_accel_adr",
+    "ema10_vs_ema20_spread_adr",
+    "ema10_20_spread_chg5_adr",
+    "sma50_vs_sma200_adr",
+    "accum_days_20d_prev",
+    "up_down_vol_ratio_20d",
+]
+MAJOR_MACRO_LOW_FB_ADDONS = [
+    "climax_absorption_bottom",
+    "spring_60d_low_reclaim",
+]
+
+_DATE_CONSTANT_MKT_COLS = {
+    "spy_rsi14_high",
+    "spy_rsi14_low",
+    "spy_ext_ema20_adr",
+    "qqq_rsi14_high",
+    "qqq_rsi14_low",
+}
+
+MAJOR_UT_TOP_AT_HIGH_FEATURES = [
+    c for c in UT_HIGH_V4_AT_HIGH_FEATURES if c not in _DATE_CONSTANT_MKT_COLS
+] + MAJOR_MACRO_HIGH_AT_FEATURES
+MAJOR_UT_TOP_A_PLUS_FEATURES = [
+    c for c in UT_HIGH_V4_A_PLUS_FEATURES if c not in _DATE_CONSTANT_MKT_COLS
+] + MAJOR_MACRO_HIGH_AT_FEATURES
+MAJOR_UT_TOP_FULL_BAR_FEATURES = [
+    c for c in UT_HIGH_V4_FULL_BAR_FEATURES if c not in _DATE_CONSTANT_MKT_COLS
+] + MAJOR_MACRO_HIGH_AT_FEATURES + MAJOR_MACRO_HIGH_FB_ADDONS
+
+MAJOR_DT_BOTTOM_AT_LOW_FEATURES = [
+    c for c in DT_LOW_V4_AT_LOW_FEATURES if c not in _DATE_CONSTANT_MKT_COLS
+] + MAJOR_MACRO_LOW_AT_FEATURES
+MAJOR_DT_BOTTOM_A_PLUS_FEATURES = [
+    c for c in DT_LOW_V4_A_PLUS_FEATURES if c not in _DATE_CONSTANT_MKT_COLS
+] + MAJOR_MACRO_LOW_AT_FEATURES
+MAJOR_DT_BOTTOM_FULL_BAR_FEATURES = [
+    c for c in DT_LOW_V4_FULL_BAR_FEATURES if c not in _DATE_CONSTANT_MKT_COLS
+] + MAJOR_MACRO_LOW_AT_FEATURES + MAJOR_MACRO_LOW_FB_ADDONS
+
+
 
 def _fit_lgb_xgb_pair(
     X_tr: pd.DataFrame, y_tr: np.ndarray, spw: float, n_est: int = 280
@@ -1459,7 +1748,7 @@ def train_and_evaluate_v4_model(
         pd_comb = 0.25 * np.minimum(pe, pf) + 0.75 * np.maximum(pe, pf)
         return np.where(mask_te, pe, 0.0), np.where(mask_te, pf, 0.0), np.where(mask_te, pd_comb, 0.0)
 
-    is_hi = "high" in target_col or "high" in mask_col
+    is_hi = "high" in target_col or "high" in mask_col or "top" in target_col or "top" in mask_col
     b1_cols = B1_HIGH_FEATURES if is_hi else B1_LOW_FEATURES
 
     # 1. V3 Baseline
@@ -1529,7 +1818,7 @@ def train_and_evaluate_v4_model(
         ("2. + B1 (Swings, 60D AVWAP, Vol Density, Inv-RSI)", p_b1_ex, p_b1_dual),
         ("3. + B2 (SPY/QQQ Synchrony & RS Divergence)", p_b2_ex, p_b2_dual),
         ("4. + B3 (Developing Weekly W-FRI Confluence)", p_b3_ex, p_b3_dual),
-        ("5. + B4 Sub-Model A+ (Intrabar Micro-Rej + MTF)", p_v4_ap, p_v4_dual),
+        ("5. + B4/Macro (Full Feature Suite + Sub-Model A+)", p_v4_ap, p_v4_dual),
     ]:
         auc_du = roc_auc_score(y_te, pr_du)
         ap_du = average_precision_score(y_te, pr_du)
@@ -1720,8 +2009,7 @@ def score_calibrated_probability(
     return out
 
 
-def main() -> None:
-    t0 = time.time()
+def _get_default_training_symbols() -> List[str]:
     rs_df = pd.read_parquet("data/simulations/rs_universe_scores.parquet")
     sort_col = "rs_score" if "rs_score" in rs_df.columns else rs_df.columns[0]
     top_rs = rs_df.sort_values(sort_col, ascending=False)["symbol"].head(400).tolist()
@@ -1734,13 +2022,110 @@ def main() -> None:
         "WK", "CCJ", "GRAL", "TEAM", "SBS", "AMZN", "NVDA", "SMH",
         "XBI", "QQQ", "SPY", "XLK", "XLE", "RSP", "IWM", "DIA", "MDY",
     ]
-    symbols = list(dict.fromkeys(must_include + etf_syms + top_rs + bot_rs + ep_syms))[:850]
-    print(f"Extracting V4 unified 4-regime pivot features (including B1–B4 + Inverse-RSI) across {len(symbols)} symbols...")
+    return list(dict.fromkeys(must_include + etf_syms + top_rs + bot_rs + ep_syms))[:850]
+
+
+def train_major_reversal_models(symbols: Optional[List[str]] = None) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """
+    Trains & validates Model 5 (Major Uptrend Reversal High) and Model 6 (Major Downtrend Reversal Low)
+    using strict chronological split (< 2025-01-01 Train vs >= 2025-01-01 OOS Test) and saves them to:
+      - `data/models/major_uptrend_reversal_high_classifier.pkl`
+      - `data/models/major_downtrend_reversal_low_classifier.pkl`
+    """
+    t0 = time.time()
+    if symbols is None:
+        symbols = _get_default_training_symbols()
+    print(f"Extracting Major Trend Reversal features across {len(symbols)} symbols...")
+
+    ut_top_frames = []
+    dt_bot_frames = []
+
+    for idx_s, sym in enumerate(symbols):
+        df = datastore.load_bars(sym)
+        if df is None or len(df) < 120:
+            continue
+        b = compute_all_pivot_features(df, symbol=sym)
+        meta = pd.DataFrame(
+            {
+                "is_major_ut_top": label_major_uptrend_reversal_highs(b),
+                "is_major_dt_bottom": label_major_downtrend_reversal_lows(b),
+                "symbol": sym,
+                "date": b.index,
+            },
+            index=b.index,
+        )
+        b = pd.concat([b, meta], axis=1)
+        valid = b.iloc[60:-25]
+
+        c_ut = valid[valid["is_uptrend_bar"]].copy()
+        if not c_ut.empty:
+            ut_top_frames.append(c_ut)
+
+        c_dt = valid[valid["is_downtrend_regime"]].copy()
+        if not c_dt.empty:
+            dt_bot_frames.append(c_dt)
+
+        if (idx_s + 1) % 200 == 0:
+            print(f"  Processed {idx_s + 1}/{len(symbols)} symbols ({time.time() - t0:.1f}s)...")
+
+    df_ut_top = pd.concat(ut_top_frames, ignore_index=True)
+    df_ut_top["date_dt"] = pd.to_datetime(df_ut_top["date"])
+
+    df_dt_bot = pd.concat(dt_bot_frames, ignore_index=True)
+    df_dt_bot["date_dt"] = pd.to_datetime(df_dt_bot["date"])
+
+    m_major_ut_top = train_and_evaluate_v4_model(
+        "Model 5: Major Uptrend Reversal High (Primary Trend Top -> Downtrend Breakdown)",
+        df_ut_top,
+        "is_major_ut_top",
+        "is_near_major_ut_top",
+        tup.AT_HIGH_FEATURES,
+        tup.FULL_BAR_FEATURES,
+        MAJOR_UT_TOP_AT_HIGH_FEATURES,
+        MAJOR_UT_TOP_A_PLUS_FEATURES,
+        MAJOR_UT_TOP_FULL_BAR_FEATURES,
+        spw_extreme=5.8,
+        spw_a_plus=5.4,
+        spw_full=5.0,
+    )
+    m_major_dt_bot = train_and_evaluate_v4_model(
+        "Model 6: Major Downtrend Reversal Low (Primary Trend Bottom -> Uptrend Reversal)",
+        df_dt_bot,
+        "is_major_dt_bottom",
+        "is_near_major_dt_bottom",
+        DT_LOW_AT_LOW_FEATURES,
+        DT_LOW_FULL_BAR_FEATURES,
+        MAJOR_DT_BOTTOM_AT_LOW_FEATURES,
+        MAJOR_DT_BOTTOM_A_PLUS_FEATURES,
+        MAJOR_DT_BOTTOM_FULL_BAR_FEATURES,
+        spw_extreme=5.8,
+        spw_a_plus=5.4,
+        spw_full=5.0,
+    )
+
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    joblib.dump(m_major_ut_top, MAJOR_UT_TOP_PATH)
+    joblib.dump(m_major_dt_bot, MAJOR_DT_BOTTOM_PATH)
+    print(f"\n✅ Saved Major Trend Reversal models ({MAJOR_UT_TOP_PATH.name}, {MAJOR_DT_BOTTOM_PATH.name}) in {time.time() - t0:.1f}s")
+    return m_major_ut_top, m_major_dt_bot
+
+
+def main() -> None:
+    import sys
+    if "--major-only" in sys.argv:
+        train_major_reversal_models()
+        return
+
+    t0 = time.time()
+    symbols = _get_default_training_symbols()
+    print(f"Extracting V4 unified 6-model pivot features (including B1–B4 + Inverse-RSI + Macro Reversal) across {len(symbols)} symbols...")
 
     ut_high_frames = []
     ut_low_frames = []
     dt_high_frames = []
     dt_low_frames = []
+    ut_top_frames = []
+    dt_bot_frames = []
 
     for idx_s, sym in enumerate(symbols):
         df = datastore.load_bars(sym)
@@ -1753,6 +2138,8 @@ def main() -> None:
                 "is_ut_low": label_uptrend_pivot_lows(b),
                 "is_dt_high": label_downtrend_pivot_highs(b),
                 "is_dt_low": label_downtrend_pivot_lows(b),
+                "is_major_ut_top": label_major_uptrend_reversal_highs(b),
+                "is_major_dt_bottom": label_major_downtrend_reversal_lows(b),
                 "symbol": sym,
                 "date": b.index,
             },
@@ -1760,6 +2147,7 @@ def main() -> None:
         )
         b = pd.concat([b, meta], axis=1)
         valid = b.iloc[60:-10]
+        valid_maj = b.iloc[60:-25]
 
         c_ut_high = valid[valid["is_uptrend_bar"]].copy()
         if not c_ut_high.empty:
@@ -1773,6 +2161,14 @@ def main() -> None:
         if not c_dt.empty:
             dt_high_frames.append(c_dt)
             dt_low_frames.append(c_dt)
+
+        c_ut_top = valid_maj[valid_maj["is_uptrend_bar"]].copy()
+        if not c_ut_top.empty:
+            ut_top_frames.append(c_ut_top)
+
+        c_dt_bot = valid_maj[valid_maj["is_downtrend_regime"]].copy()
+        if not c_dt_bot.empty:
+            dt_bot_frames.append(c_dt_bot)
 
         if (idx_s + 1) % 200 == 0:
             print(f"  Processed {idx_s + 1}/{len(symbols)} symbols ({time.time() - t0:.1f}s)...")
@@ -1788,6 +2184,12 @@ def main() -> None:
 
     df_dt_low = pd.concat(dt_low_frames, ignore_index=True)
     df_dt_low["date_dt"] = pd.to_datetime(df_dt_low["date"])
+
+    df_ut_top = pd.concat(ut_top_frames, ignore_index=True)
+    df_ut_top["date_dt"] = pd.to_datetime(df_ut_top["date"])
+
+    df_dt_bot = pd.concat(dt_bot_frames, ignore_index=True)
+    df_dt_bot["date_dt"] = pd.to_datetime(df_dt_bot["date"])
 
     # Train & Evaluate all 4 V4 models (saving to *_v4.pkl, preserving existing V3 *.pkl models!)
     m_ut_high_v4 = train_and_evaluate_v4_model(
@@ -1846,15 +2248,46 @@ def main() -> None:
         spw_a_plus=3.2,
         spw_full=3.0,
     )
+    m_major_ut_top = train_and_evaluate_v4_model(
+        "Model 5: Major Uptrend Reversal High (Primary Trend Top -> Downtrend Breakdown)",
+        df_ut_top,
+        "is_major_ut_top",
+        "is_near_major_ut_top",
+        tup.AT_HIGH_FEATURES,
+        tup.FULL_BAR_FEATURES,
+        MAJOR_UT_TOP_AT_HIGH_FEATURES,
+        MAJOR_UT_TOP_A_PLUS_FEATURES,
+        MAJOR_UT_TOP_FULL_BAR_FEATURES,
+        spw_extreme=5.8,
+        spw_a_plus=5.4,
+        spw_full=5.0,
+    )
+    m_major_dt_bot = train_and_evaluate_v4_model(
+        "Model 6: Major Downtrend Reversal Low (Primary Trend Bottom -> Uptrend Reversal)",
+        df_dt_bot,
+        "is_major_dt_bottom",
+        "is_near_major_dt_bottom",
+        DT_LOW_AT_LOW_FEATURES,
+        DT_LOW_FULL_BAR_FEATURES,
+        MAJOR_DT_BOTTOM_AT_LOW_FEATURES,
+        MAJOR_DT_BOTTOM_A_PLUS_FEATURES,
+        MAJOR_DT_BOTTOM_FULL_BAR_FEATURES,
+        spw_extreme=5.8,
+        spw_a_plus=5.4,
+        spw_full=5.0,
+    )
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     joblib.dump(m_ut_high_v4, UT_HIGH_V4_PATH)
     joblib.dump(m_ut_low_v4, UT_LOW_V4_PATH)
     joblib.dump(m_dt_high_v4, DT_HIGH_V4_PATH)
     joblib.dump(m_dt_low_v4, DT_LOW_V4_PATH)
-    print(f"\n✅ Saved all 4 V4 strict-OOS models (*_v4.pkl, preserving V3 *.pkl models) in {time.time() - t0:.1f}s")
+    joblib.dump(m_major_ut_top, MAJOR_UT_TOP_PATH)
+    joblib.dump(m_major_dt_bot, MAJOR_DT_BOTTOM_PATH)
+    print(f"\n✅ Saved all 4 V4 strict-OOS models + 2 Major Reversal models in {time.time() - t0:.1f}s")
 
 
 if __name__ == "__main__":
     main()
+
 

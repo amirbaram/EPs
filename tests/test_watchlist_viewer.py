@@ -228,17 +228,17 @@ class TestWatchlistViewer(unittest.TestCase):
         for sym in ("SPY", "QQQ", "RSP", "IWM", "XBI", "SMH", "XLK", "XLE"):
             self.assertIn(sym, crit)
 
-        # 2. Verify daily_update covers port 8789 and all 4 pivot models
+        # 2. Verify daily_update covers port 8789 and all 10 pivot models (4 V3 + 4 V4 + 2 Major Reversal)
         ports = [p for p, _ in daily_update.TARGET_SERVERS]
         self.assertIn(8789, ports)
-        self.assertEqual(len(daily_update.PIVOT_MODEL_PATHS), 4)
+        self.assertEqual(len(daily_update.PIVOT_MODEL_PATHS), 10)
 
         # 3. Verify /api/reload_dataset endpoint works
         r_rel = self.client.post("/api/reload_dataset")
         self.assertEqual(r_rel.status_code, 200)
         rel_json = r_rel.get_json()
         self.assertEqual(rel_json["status"], "reloaded")
-        self.assertEqual(len(rel_json["pivot_models_loaded"]), 4)
+        self.assertEqual(len(rel_json["pivot_models_loaded"]), 6)
 
         # 4. Verify _extract_snapped_pivot_events is strictly causal (future bars cannot suppress bar t)
         dates = pd.date_range("2026-01-01", periods=10, freq="B")
@@ -418,9 +418,14 @@ class TestWatchlistViewer(unittest.TestCase):
 
         m_v3 = serve_watchlist.get_all_pivot_models("v3")
         m_v4 = serve_watchlist.get_all_pivot_models("v4")
-        self.assertEqual(set(m_v3.keys()), {"ut_high", "ut_low", "dt_high", "dt_low"})
-        self.assertEqual(set(m_v4.keys()), {"ut_high", "ut_low", "dt_high", "dt_low"})
-        for k in ("ut_high", "ut_low", "dt_high", "dt_low"):
+        self.assertEqual(set(m_v3.keys()), {"ut_high", "ut_low", "dt_high", "dt_low", "maj_ut_top", "maj_dt_low"})
+        self.assertEqual(set(m_v4.keys()), {"ut_high", "ut_low", "dt_high", "dt_low", "maj_ut_top", "maj_dt_low"})
+        self.assertTrue(serve_watchlist.MAJOR_UT_TOP_MODEL_PATH.exists())
+        self.assertTrue(serve_watchlist.MAJOR_DT_BOTTOM_MODEL_PATH.exists())
+        self.assertIn("cfg_major_rev_markers", html)
+        self.assertIn("piv_maj_ut_top_val", html)
+        self.assertIn("piv_maj_dt_low_val", html)
+        for k in ("ut_high", "ut_low", "dt_high", "dt_low", "maj_ut_top", "maj_dt_low"):
             self.assertEqual(m_v4[k].get("version"), "4.0")
             self.assertIn("lgb_a_plus", m_v4[k])
             self.assertIn("xgb_a_plus", m_v4[k])
@@ -435,6 +440,11 @@ class TestWatchlistViewer(unittest.TestCase):
         ex_v4 = r_v4.get_json()["exhaustion"]
         self.assertEqual(ex_v3["model_ver"], "v3")
         self.assertEqual(ex_v4["model_ver"], "v4")
+        self.assertIn("maj_ut_top_events", ex_v4)
+        self.assertIn("maj_dt_low_events", ex_v4)
+        self.assertIn("maj_ut_top", ex_v4["pivots_current"])
+        self.assertIn("maj_dt_low", ex_v4["pivots_current"])
+        self.assertGreaterEqual(len(ex_v4["maj_ut_top_events"]) + len(ex_v4["maj_dt_low_events"]), 1)
 
         # V3 and V4 must produce distinct probability series on TWLO
         s_v3 = [pt["ut_high"] for pt in ex_v3["series"]]
@@ -446,12 +456,12 @@ class TestWatchlistViewer(unittest.TestCase):
         for ex in (ex_v3, ex_v4):
             hi_evs_65 = [
                 e
-                for e in (ex["ut_high_events"] + ex["dt_high_events"])
+                for e in (ex["ut_high_events"] + ex["dt_high_events"] + ex.get("maj_ut_top_events", []))
                 if e["prob_pct"] >= 65.0 and (e["high"] - e["low"]) >= 0.50
             ]
             lo_evs_65 = [
                 e
-                for e in (ex["ut_low_events"] + ex["dt_low_events"])
+                for e in (ex["ut_low_events"] + ex["dt_low_events"] + ex.get("maj_dt_low_events", []))
                 if e["prob_pct"] >= 65.0 and (e["high"] - e["low"]) >= 0.50
             ]
             self.assertGreaterEqual(len(hi_evs_65), 1)
@@ -480,5 +490,6 @@ class TestWatchlistViewer(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
 
 
