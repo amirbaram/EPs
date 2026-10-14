@@ -96,27 +96,38 @@ def state(d: pd.DataFrame) -> dict | None:
 
 
 def os_trigger_price(close: pd.Series, level: pd.Series | float, length: int | None = None) -> pd.Series:
-    """Price a bar must trade DOWN to for RSI to print `level` (Series-level variant of
-    indicators.rsi_trigger_price — the extreme zone edge moves with history)."""
+    """Price a bar must trade to for Wilder RSI to print `level` (exact two-branch piecewise
+    closed-form inversion of Wilder's RMA using only t-1 state)."""
     length = length or config.RSIX_LEN
-    chg = close.astype(float).diff()
-    u = chg.clip(lower=0).ewm(alpha=1 / length, adjust=False, min_periods=length).mean()
-    dn = (-chg).clip(lower=0).ewm(alpha=1 / length, adjust=False, min_periods=length).mean()
-    lvl = level if isinstance(level, pd.Series) else pd.Series(level, index=close.index)
-    x = (100.0 - lvl) / lvl
-    return (close.shift(1) - (length - 1) * (u.shift(1) * x - dn.shift(1))).astype(float)
+    c = close.astype(float)
+    chg = c.diff()
+    u = chg.clip(lower=0.0).ewm(alpha=1 / length, adjust=False, min_periods=length).mean()
+    dn = (-chg).clip(lower=0.0).ewm(alpha=1 / length, adjust=False, min_periods=length).mean()
+    c_prev = c.shift(1)
+    u_prev = u.shift(1)
+    d_prev = dn.shift(1)
+    if isinstance(level, pd.Series):
+        lvl = (
+            level.astype(float)
+            if level.index.equals(close.index)
+            else pd.Series(level.to_numpy(dtype=float), index=close.index, dtype=float)
+        )
+    elif isinstance(level, (np.ndarray, list, tuple)):
+        lvl = pd.Series(np.asarray(level, dtype=float), index=close.index, dtype=float)
+    else:
+        lvl = pd.Series(float(level), index=close.index, dtype=float)
+    lvl = lvl.where((lvl > 0.0) & (lvl < 100.0))
+    rs_target = lvl / (100.0 - lvl)
+    p_up = c_prev + (length - 1) * (rs_target * d_prev - u_prev)
+    p_dn = c_prev - (length - 1) * (u_prev / rs_target - d_prev)
+    return pd.Series(np.where(u_prev <= rs_target * d_prev, p_up, p_dn), index=close.index, dtype=float)
 
 
 def ob_trigger_price(close: pd.Series, level: pd.Series | float, length: int | None = None) -> pd.Series:
-    """Price a bar must trade UP to for RSI to print `level` — the overbought mirror:
-    g = (len-1)*(rmaD[1]*lvl/(100-lvl) - rmaU[1]); pOB = close[1] + g."""
-    length = length or config.RSIX_LEN
-    chg = close.astype(float).diff()
-    u = chg.clip(lower=0).ewm(alpha=1 / length, adjust=False, min_periods=length).mean()
-    dn = (-chg).clip(lower=0).ewm(alpha=1 / length, adjust=False, min_periods=length).mean()
-    lvl = level if isinstance(level, pd.Series) else pd.Series(level, index=close.index)
-    x = lvl / (100.0 - lvl)
-    return (close.shift(1) + (length - 1) * (dn.shift(1) * x - u.shift(1))).astype(float)
+    """Price a bar must trade to for Wilder RSI to print `level` (exact two-branch piecewise
+    closed-form inversion of Wilder's RMA using only t-1 state)."""
+    return os_trigger_price(close, level, length=length)
+
 
 
 def fires(d: pd.DataFrame, side: str, collect: list | None = None):

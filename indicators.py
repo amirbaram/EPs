@@ -72,13 +72,34 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return d
 
 
-def rsi_trigger_price(close: pd.Series, level: float, length: int = 14) -> pd.Series:
-    """The price a bar must trade DOWN TO for its Wilder RSI to print `level` — Amir's Pine
-    BB-Targets inversion: pOS = close[1] - (len-1)*(rmaU[1]*(100-level)/level - rmaD[1]).
-    A LOW <= pOS is an intrabar oversold WICK even when the close's RSI never gets there —
-    that's the backburner fire."""
-    chg = close.astype(float).diff()
-    rma_u = chg.clip(lower=0).ewm(alpha=1 / length, adjust=False, min_periods=length).mean()
-    rma_d = (-chg).clip(lower=0).ewm(alpha=1 / length, adjust=False, min_periods=length).mean()
-    x = (100.0 - level) / level
-    return (close.shift(1) - (length - 1) * (rma_u.shift(1) * x - rma_d.shift(1))).astype(float)
+def rsi_trigger_price(close: pd.Series, level: pd.Series | float, length: int = 14) -> pd.Series:
+    """The price a bar must trade to for its Wilder RSI to print `level` — exact two-branch
+    piecewise closed-form inversion of Wilder's RMA(length) using only prior bar state (t-1):
+    - When rmaU[1] <= gamma * rmaD[1] (RSI[1] <= level):
+      p = close[1] + (length - 1) * (gamma * rmaD[1] - rmaU[1])
+    - When rmaU[1] > gamma * rmaD[1] (RSI[1] > level):
+      p = close[1] - (length - 1) * (rmaU[1] / gamma - rmaD[1])
+    where gamma = level / (100 - level)."""
+    c = close.astype(float)
+    chg = c.diff()
+    rma_u = chg.clip(lower=0.0).ewm(alpha=1 / length, adjust=False, min_periods=length).mean()
+    rma_d = (-chg).clip(lower=0.0).ewm(alpha=1 / length, adjust=False, min_periods=length).mean()
+    c_prev = c.shift(1)
+    u_prev = rma_u.shift(1)
+    d_prev = rma_d.shift(1)
+    if isinstance(level, pd.Series):
+        lvl = (
+            level.astype(float)
+            if level.index.equals(close.index)
+            else pd.Series(level.to_numpy(dtype=float), index=close.index, dtype=float)
+        )
+    elif isinstance(level, (np.ndarray, list, tuple)):
+        lvl = pd.Series(np.asarray(level, dtype=float), index=close.index, dtype=float)
+    else:
+        lvl = pd.Series(float(level), index=close.index, dtype=float)
+    lvl = lvl.where((lvl > 0.0) & (lvl < 100.0))
+    rs_target = lvl / (100.0 - lvl)
+    p_up = c_prev + (length - 1) * (rs_target * d_prev - u_prev)
+    p_dn = c_prev - (length - 1) * (u_prev / rs_target - d_prev)
+    return pd.Series(np.where(u_prev <= rs_target * d_prev, p_up, p_dn), index=close.index, dtype=float)
+

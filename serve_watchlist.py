@@ -64,6 +64,10 @@ UPTREND_PIVOT_MODEL_PATH = Path("data/models/uptrend_pivot_high_classifier.pkl")
 UPTREND_PIVOT_LOW_MODEL_PATH = Path("data/models/uptrend_pivot_low_classifier.pkl")
 DOWNTREND_PIVOT_HIGH_MODEL_PATH = Path("data/models/downtrend_pivot_high_classifier.pkl")
 DOWNTREND_PIVOT_LOW_MODEL_PATH = Path("data/models/downtrend_pivot_low_classifier.pkl")
+UPTREND_PIVOT_MODEL_V4_PATH = Path("data/models/uptrend_pivot_high_classifier_v4.pkl")
+UPTREND_PIVOT_LOW_MODEL_V4_PATH = Path("data/models/uptrend_pivot_low_classifier_v4.pkl")
+DOWNTREND_PIVOT_HIGH_MODEL_V4_PATH = Path("data/models/downtrend_pivot_high_classifier_v4.pkl")
+DOWNTREND_PIVOT_LOW_MODEL_V4_PATH = Path("data/models/downtrend_pivot_low_classifier_v4.pkl")
 EXTREME_PEAK_MODEL_PATH = Path("data/models/ep_extreme_peak_classifier.pkl")
 WATCHLISTS_FILE = Path("data/user_watchlists.json")
 ANNOTATIONS_DIR = Path("data/annotations")
@@ -218,21 +222,36 @@ def get_extreme_peak_model() -> Optional[Dict[str, Any]]:
     return _EXTREME_PEAK_MODEL
 
 
-def get_all_pivot_models() -> Dict[str, Any]:
-    """Lazily loads all 4 structural swing-pivot classifiers."""
+def get_all_pivot_models(model_ver: str = "v3") -> Dict[str, Any]:
+    """Lazily loads all 4 structural swing-pivot classifiers for the requested version ('v3' or 'v4')."""
     global _PIVOT_MODELS_CACHE
-    for key, path in [
-        ("ut_high", UPTREND_PIVOT_MODEL_PATH),
-        ("ut_low", UPTREND_PIVOT_LOW_MODEL_PATH),
-        ("dt_high", DOWNTREND_PIVOT_HIGH_MODEL_PATH),
-        ("dt_low", DOWNTREND_PIVOT_LOW_MODEL_PATH),
-    ]:
-        if key not in _PIVOT_MODELS_CACHE and path.exists():
+    ver = "v4" if str(model_ver or "v3").strip().lower().startswith("v4") else "v3"
+    if ver not in _PIVOT_MODELS_CACHE or not isinstance(_PIVOT_MODELS_CACHE.get(ver), dict):
+        _PIVOT_MODELS_CACHE[ver] = {}
+    bucket = _PIVOT_MODELS_CACHE[ver]
+
+    path_pairs = (
+        [
+            ("ut_high", UPTREND_PIVOT_MODEL_V4_PATH if UPTREND_PIVOT_MODEL_V4_PATH.exists() else UPTREND_PIVOT_MODEL_PATH),
+            ("ut_low", UPTREND_PIVOT_LOW_MODEL_V4_PATH if UPTREND_PIVOT_LOW_MODEL_V4_PATH.exists() else UPTREND_PIVOT_LOW_MODEL_PATH),
+            ("dt_high", DOWNTREND_PIVOT_HIGH_MODEL_V4_PATH if DOWNTREND_PIVOT_HIGH_MODEL_V4_PATH.exists() else DOWNTREND_PIVOT_HIGH_MODEL_PATH),
+            ("dt_low", DOWNTREND_PIVOT_LOW_MODEL_V4_PATH if DOWNTREND_PIVOT_LOW_MODEL_V4_PATH.exists() else DOWNTREND_PIVOT_LOW_MODEL_PATH),
+        ]
+        if ver == "v4"
+        else [
+            ("ut_high", UPTREND_PIVOT_MODEL_PATH),
+            ("ut_low", UPTREND_PIVOT_LOW_MODEL_PATH),
+            ("dt_high", DOWNTREND_PIVOT_HIGH_MODEL_PATH),
+            ("dt_low", DOWNTREND_PIVOT_LOW_MODEL_PATH),
+        ]
+    )
+    for key, path in path_pairs:
+        if key not in bucket and path.exists():
             try:
-                _PIVOT_MODELS_CACHE[key] = joblib.load(path)
+                bucket[key] = joblib.load(path)
             except Exception as e:
-                print(f"Warning: could not load pivot model {key} from {path}: {e}")
-    return _PIVOT_MODELS_CACHE
+                print(f"Warning: could not load pivot model {key} ({ver}) from {path}: {e}")
+    return bucket
 
 
 def compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
@@ -300,6 +319,9 @@ def _extract_snapped_pivot_events(
 
         target_dt = sub_dates[target_idx]
         t_str = target_dt.strftime("%Y-%m-%d")
+        prec = 4 if abs(float(highs_arr[target_idx])) < 10.0 else 2
+        hi_val = round(float(highs_arr[target_idx]), prec)
+        lo_val = round(float(lows_arr[target_idx]), prec)
         ev_obj = {
             "date": t_str,
             "trigger_date": idx_dt.strftime("%Y-%m-%d"),
@@ -309,16 +331,13 @@ def _extract_snapped_pivot_events(
             "at_high_pct": round(float(ex_arr[i]) * 100.0, 1),
             "full_bar_pct": round(float(fb_arr[i]) * 100.0, 1),
             "rsi14": round(float(rsi_arr[target_idx]), 1),
-            "high": round(float(highs_arr[target_idx]), 2),
-            "low": round(float(lows_arr[target_idx]), 2),
+            "high": hi_val,
+            "low": lo_val,
+            "intrabar_trigger_price": hi_val if is_high_pivot else lo_val,
+            "trigger_prices_by_thr": {},
+            "touch_trigger_price": None,
         }
 
-        # Strictly causal deduplication:
-        # 1. If a 2-bar stall confirmation at `i` maps to the exact same `target_idx` already emitted at `i-1`,
-        #    update that bar's probability if higher.
-        # 2. Never retroactively erase an earlier bar's signal when a subsequent bar makes a new high/low.
-        #    To prevent adjacent-bar clutter at the same price level, suppress a duplicate trigger within 3 bars
-        #    unless it makes a meaningfully higher high / lower low or jumps in probability by >= 8%.
         if events and events[-1]["date"] == t_str:
             if ev_obj["prob_pct"] > events[-1]["prob_pct"]:
                 events[-1] = ev_obj
@@ -337,24 +356,446 @@ def _extract_snapped_pivot_events(
     return events
 
 
+def _ensure_causal_rma_state(df_source: pd.DataFrame, sub: pd.DataFrame) -> pd.DataFrame:
+    """Ensures `sub` carries exact prior-bar close (`prev_close`) and Wilder RMA state
+    (`prev_ag{p}`, `prev_al{p}` for p in (14, 9, 5)) computed causally from `df_source`."""
+    req_cols = ("prev_close", "prev_ag14", "prev_al14", "prev_ag9", "prev_al9", "prev_ag5", "prev_al5")
+    if all(col in sub.columns for col in req_cols):
+        return sub
+    if "close" not in df_source.columns:
+        return sub
+    out = sub.copy()
+    c = df_source["close"].astype(float)
+    delta = c.diff()
+    gain = delta.clip(lower=0.0)
+    loss = -delta.clip(upper=0.0)
+    out["prev_close"] = c.shift(1).reindex(sub.index)
+    for period in (14, 9, 5):
+        alpha = 1.0 / period
+        ag = gain.ewm(alpha=alpha, min_periods=period, adjust=False).mean()
+        al = loss.ewm(alpha=alpha, min_periods=period, adjust=False).mean()
+        out[f"prev_ag{period}"] = ag.shift(1).reindex(sub.index)
+        out[f"prev_al{period}"] = al.shift(1).reindex(sub.index)
+    return out
+
+
+def _eval_intrabar_rsi_vec(
+    p_cand: np.ndarray,
+    big: pd.DataFrame,
+    period: int,
+    fallback_arr: np.ndarray,
+) -> np.ndarray:
+    """Evaluates exact causal Wilder's RSI(period) at candidate intrabar price `p_cand`
+    using prior-bar close (`prev_close`) and prior-bar RMA gain/loss (`prev_ag{period}`, `prev_al{period}`)."""
+    c_col = "prev_close"
+    ag_col = f"prev_ag{period}"
+    al_col = f"prev_al{period}"
+    if c_col not in big.columns or ag_col not in big.columns or al_col not in big.columns:
+        return fallback_arr
+    prev_c = big[c_col].to_numpy(dtype=float)
+    prev_ag = big[ag_col].to_numpy(dtype=float)
+    prev_al = big[al_col].to_numpy(dtype=float)
+    gain_c = np.maximum(p_cand - prev_c, 0.0)
+    loss_c = np.maximum(prev_c - p_cand, 0.0)
+    ag_c = (prev_ag * (period - 1.0) + gain_c) / float(period)
+    al_c = (prev_al * (period - 1.0) + loss_c) / float(period)
+    rsi_c = 100.0 - (100.0 / (1.0 + ag_c / (al_c + 1e-9)))
+    return np.where(np.isnan(rsi_c), fallback_arr, rsi_c)
+
+
+def _enrich_events_with_intrabar_triggers(
+    sub: pd.DataFrame,
+    events: List[Dict[str, Any]],
+    model_bundle: Optional[Dict[str, Any]],
+    mask_col: str,
+    is_high_pivot: bool,
+    n_steps: int = 41,
+) -> List[Dict[str, Any]]:
+    """Vectorized causal intrabar price sweep across `[Low, High]` for each detected pivot event:
+    - For Pivot Highs (`ut_high`, `dt_high`): sweeps candidate intrabar high upward from `Low` (`w=0`) to `High` (`w=1`)
+      to find the **lowest intrabar price** that classifies the bar as a Pivot High (`prob >= threshold`).
+    - For Pivot Lows (`ut_low`, `dt_low`): sweeps candidate intrabar low downward from `High` (`w=0`) to `Low` (`w=1`)
+      to find the **highest intrabar price** that classifies the bar as a Pivot Low (`prob >= threshold`).
+    All candidate-price-dependent features (RSI(14/9/5), ADR extensions, Bollinger Z, 120d p95 stretch,
+    multi-day max/min, consecutive RSI streaks, divergence triggers, weekly W-FRI RSI, Inverse-RSI distance,
+    and developing intrabar rejection) are recomputed from `t-1` causal state so that `dist_from_10d_high_adr` /
+    `dist_from_8d_low_adr` never look ahead to future EOD `High[t]` / `Low[t]`.
+    """
+    if not events or not model_bundle or sub is None or sub.empty:
+        return events
+
+    sub = _ensure_causal_rma_state(sub, sub)
+    date_to_pos = {dt.strftime("%Y-%m-%d"): idx for idx, dt in enumerate(sub.index)}
+    ev_pos = [date_to_pos.get(ev.get("trigger_date") or ev["date"], date_to_pos.get(ev["date"], 0)) for ev in events]
+    target_pos = [date_to_pos.get(ev["date"], p) for ev, p in zip(events, ev_pos)]
+    m = len(events)
+
+    ev_rep_idx = np.repeat(ev_pos, n_steps)
+    big = sub.iloc[ev_rep_idx].copy().reset_index(drop=True)
+
+    lo_arr = sub["low"].to_numpy()[target_pos]
+    hi_arr = sub["high"].to_numpy()[target_pos]
+    lo_ev_arr = sub["low"].to_numpy()[ev_pos]
+    hi_ev_arr = sub["high"].to_numpy()[ev_pos]
+    adr_arr = np.maximum(1e-6, sub["adr20"].to_numpy()[ev_pos])
+
+    w_1d = np.linspace(0.0, 1.0, n_steps)
+    w = np.tile(w_1d, m)
+    lo_rep = np.repeat(lo_arr, n_steps)
+    hi_rep = np.repeat(hi_arr, n_steps)
+    lo_ev_rep = np.repeat(lo_ev_arr, n_steps)
+    hi_ev_rep = np.repeat(hi_ev_arr, n_steps)
+    adr_rep = np.repeat(adr_arr, n_steps)
+
+    rsi14_lo = big["rsi14_low"].to_numpy()
+    rsi14_hi = big["rsi14_high"].to_numpy()
+    rsi9_lo = big["rsi9_low"].to_numpy() if "rsi9_low" in big.columns else rsi14_lo
+    rsi9_hi = big["rsi9_high"].to_numpy() if "rsi9_high" in big.columns else rsi14_hi
+    rsi5_lo = big["rsi5_low"].to_numpy() if "rsi5_low" in big.columns else rsi14_lo
+    rsi5_hi = big["rsi5_high"].to_numpy() if "rsi5_high" in big.columns else rsi14_hi
+
+    if is_high_pivot:
+        p_cand = lo_rep + w * (hi_rep - lo_rep)
+        dh = (p_cand - hi_ev_rep) / adr_rep
+        big["high"] = p_cand
+        big["rsi14_high"] = _eval_intrabar_rsi_vec(p_cand, big, 14, rsi14_lo + w * (rsi14_hi - rsi14_lo))
+        big["rsi9_high"] = _eval_intrabar_rsi_vec(p_cand, big, 9, rsi9_lo + w * (rsi9_hi - rsi9_lo))
+        big["rsi5_high"] = _eval_intrabar_rsi_vec(p_cand, big, 5, rsi5_lo + w * (rsi5_hi - rsi5_lo))
+        if "rsi14" in big.columns:
+            big["rsi14"] = rsi14_lo + w * (big["rsi14"].to_numpy() - rsi14_lo)
+        if "rsi5_vs_rsi14_high_spread" in big.columns:
+            big["rsi5_vs_rsi14_high_spread"] = big["rsi5_high"] - big["rsi14_high"]
+
+        for col in [
+            "ext_ema8_adr",
+            "ext_ema10_adr",
+            "ext_ema20_adr",
+            "ext_sma50_adr",
+            "high_dist_sma50_adr",
+            "high_dist_sma200_adr",
+            "leg_adr_from_ema10",
+            "leg_adr_from_ema20",
+            "thrust_1d_adr",
+            "thrust_2d_adr",
+            "thrust_3d_adr",
+            "thrust_5d_adr",
+            "thrust_10d_adr",
+            "thrust_20d_adr",
+            "thrust_40d_adr",
+            "breakout_above_10d_adr",
+            "breakout_above_20d_adr",
+            "open_to_high_adr",
+            "dist_to_prior_swing_high_adr",
+            "dist_to_prior_swing_low_adr",
+            "avwap_from_60d_high_dist_adr",
+            "avwap_from_60d_low_dist_adr",
+            "inv_rsi75_dist_adr",
+            "rs_vs_spy_5d_adr",
+        ]:
+            if col in big.columns:
+                big[col] = big[col].to_numpy() + dh
+
+        if "dist_from_10d_high_adr" in big.columns and "breakout_above_10d_adr" in big.columns:
+            big["dist_from_10d_high_adr"] = np.maximum(0.0, -big["breakout_above_10d_adr"].to_numpy())
+        if "dist_below_40d_high_adr" in big.columns:
+            big["dist_below_40d_high_adr"] = np.maximum(0.0, big["dist_below_40d_high_adr"].to_numpy() - dh)
+        if "parabolic_accel" in big.columns:
+            big["parabolic_accel"] = (big["thrust_3d_adr"] / 3.0) / np.maximum(0.15, big["thrust_10d_adr"] / 10.0)
+        if "ema10_anchor" in big.columns and "ext_ema10_pct" in big.columns:
+            big["ext_ema10_pct"] = ((p_cand - big["ema10_anchor"].to_numpy()) / np.maximum(1e-6, big["ema10_anchor"].to_numpy())) * 100.0
+        if "ema20_anchor" in big.columns and "ext_ema20_pct" in big.columns:
+            big["ext_ema20_pct"] = ((p_cand - big["ema20_anchor"].to_numpy()) / np.maximum(1e-6, big["ema20_anchor"].to_numpy())) * 100.0
+        if "sma50_anchor" in big.columns and "ext_sma50_pct" in big.columns:
+            big["ext_sma50_pct"] = ((p_cand - big["sma50_anchor"].to_numpy()) / np.maximum(1e-6, big["sma50_anchor"].to_numpy())) * 100.0
+        if "sma20_anchor" in big.columns and "std20_anchor" in big.columns and "bb_z_high" in big.columns:
+            big["bb_z_high"] = ((p_cand - big["sma20_anchor"].to_numpy()) / np.maximum(1e-6, big["std20_anchor"].to_numpy())).clip(-4.0, 6.0)
+        if "prev_bb_z_hi_max2" in big.columns and "bb_z_high_max3" in big.columns:
+            big["bb_z_high_max3"] = np.maximum(big["prev_bb_z_hi_max2"].to_numpy(), big["bb_z_high"].to_numpy())
+        if "roll_p95_ema10" in big.columns and "rel_ext_ema10_p95" in big.columns:
+            big["rel_ext_ema10_p95"] = big["ext_ema10_adr"].to_numpy() / np.maximum(0.5, big["roll_p95_ema10"].to_numpy())
+        if "roll_p95_ema20" in big.columns and "rel_ext_ema20_p95" in big.columns:
+            big["rel_ext_ema20_p95"] = big["ext_ema20_adr"].to_numpy() / np.maximum(0.5, big["roll_p95_ema20"].to_numpy())
+        if "prev_ext10_max2" in big.columns and "ext_ema10_adr_max3" in big.columns:
+            big["ext_ema10_adr_max3"] = np.maximum(big["prev_ext10_max2"].to_numpy(), big["ext_ema10_adr"].to_numpy())
+        if "prev_ext20_max2" in big.columns and "ext_ema20_adr_max3" in big.columns:
+            big["ext_ema20_adr_max3"] = np.maximum(big["prev_ext20_max2"].to_numpy(), big["ext_ema20_adr"].to_numpy())
+        if "prev_rsi14_hi_max4" in big.columns and "rsi14_high_max5" in big.columns:
+            big["rsi14_high_max5"] = np.maximum(big["prev_rsi14_hi_max4"].to_numpy(), big["rsi14_high"].to_numpy())
+        if "prev_rsi5_hi_max2" in big.columns and "rsi5_high_max3" in big.columns:
+            big["rsi5_high_max3"] = np.maximum(big["prev_rsi5_hi_max2"].to_numpy(), big["rsi5_high"].to_numpy())
+        if "rsi14_hi_shift3" in big.columns and "rsi14_high_diff3" in big.columns:
+            big["rsi14_high_diff3"] = big["rsi14_high"].to_numpy() - big["rsi14_hi_shift3"].to_numpy()
+        if "rsi14_hi_shift5" in big.columns and "rsi14_high_diff5" in big.columns:
+            big["rsi14_high_diff5"] = big["rsi14_high"].to_numpy() - big["rsi14_hi_shift5"].to_numpy()
+        if "prev_consec_rsi70_4d" in big.columns and "consec_rsi70_5d" in big.columns:
+            big["consec_rsi70_5d"] = big["prev_consec_rsi70_4d"].to_numpy() + (big["rsi14_high"].to_numpy() >= 70.0).astype(float)
+        if "prev_consec_rsi75_4d" in big.columns and "consec_rsi75_5d" in big.columns:
+            big["consec_rsi75_5d"] = big["prev_consec_rsi75_4d"].to_numpy() + (big["rsi14_high"].to_numpy() >= 75.0).astype(float)
+        if "prev_consec_rsi80_4d" in big.columns and "consec_rsi80_5d" in big.columns:
+            big["consec_rsi80_5d"] = big["prev_consec_rsi80_4d"].to_numpy() + (big["rsi5_high"].to_numpy() >= 80.0).astype(float)
+        if "prev_wave_high_18" in big.columns and "prev_wave_rsi_18" in big.columns:
+            is_nh_18 = p_cand >= big["prev_wave_high_18"].to_numpy() * 0.985
+            if "bearish_div_high" in big.columns:
+                big["bearish_div_high"] = (is_nh_18 & (big["rsi14_high"].to_numpy() < big["prev_wave_rsi_18"].to_numpy() - 1.5)).astype(float)
+            if "rsi_div_delta_high" in big.columns:
+                big["rsi_div_delta_high"] = np.where(is_nh_18, np.maximum(0.0, big["prev_wave_rsi_18"].to_numpy() - big["rsi14_high"].to_numpy()), 0.0)
+        if "prev_wave_high_35" in big.columns and "prev_wave_rsi_35" in big.columns:
+            is_nh_35 = p_cand >= big["prev_wave_high_35"].to_numpy() * 0.985
+            if "bearish_div_35d" in big.columns:
+                big["bearish_div_35d"] = (is_nh_35 & (big["rsi14_high"].to_numpy() < big["prev_wave_rsi_35"].to_numpy() - 2.0)).astype(float)
+            if "rsi_div_delta_35d" in big.columns:
+                big["rsi_div_delta_35d"] = np.where(is_nh_35, np.maximum(0.0, big["prev_wave_rsi_35"].to_numpy() - big["rsi14_high"].to_numpy()), 0.0)
+            if "prev_wave_ext_35" in big.columns and "ext_div_delta_35d" in big.columns:
+                big["ext_div_delta_35d"] = np.where(is_nh_35, np.maximum(0.0, big["prev_wave_ext_35"].to_numpy() - big["ext_ema20_adr"].to_numpy()), 0.0)
+        for k_col, d_col in [
+            ("kiss_falling_ema20_adr", "ext_ema20_adr"),
+            ("kiss_falling_sma50_adr", "high_dist_sma50_adr"),
+        ]:
+            if k_col in big.columns and d_col in big.columns:
+                big[k_col] = big[d_col].abs()
+        if "min_overhead_kiss_adr" in big.columns and "kiss_falling_ema20_adr" in big.columns and "kiss_falling_sma50_adr" in big.columns:
+            big["min_overhead_kiss_adr"] = np.minimum(big["kiss_falling_ema20_adr"], big["kiss_falling_sma50_adr"])
+        if "bounce_retracement_ratio" in big.columns and "prior_selloff_20d_adr" in big.columns:
+            big["bounce_retracement_ratio"] = big["thrust_10d_adr"].clip(lower=0.0) / np.maximum(1.5, big["prior_selloff_20d_adr"])
+
+        # Weekly W-FRI & MTF confluence updates at p_cand
+        if "prev_w_c" in big.columns and "weekly_rsi14_high" in big.columns:
+            wtd_hi_c = np.maximum(big["wtd_high_prev"].to_numpy(), p_cand)
+            pw_c = big["prev_w_c"].to_numpy()
+            gh_w = np.maximum(wtd_hi_c - pw_c, 0.0)
+            lh_w = np.maximum(pw_c - wtd_hi_c, 0.0)
+            agh_w = (big["prev_w_ag14"].to_numpy() * 13.0 + gh_w) / 14.0
+            alh_w = (big["prev_w_al14"].to_numpy() * 13.0 + lh_w) / 14.0
+            big["weekly_rsi14_high"] = 100.0 - 100.0 / (1.0 + agh_w / (alh_w + 1e-9))
+            if "weekly_ext_ema10w_adr" in big.columns:
+                big["weekly_ext_ema10w_adr"] = (wtd_hi_c - big["prev_w_ema10"].to_numpy()) / np.maximum(1e-6, big["prev_w_adr"].to_numpy())
+
+        # Scale intrabar rejection/wick features progressively with w (0 -> 1)
+        big["range_to_adr"] = (p_cand - lo_rep) / adr_rep
+        for scale_col in [
+            "upper_wick_pct",
+            "fade_from_high_adr",
+            "micro_fade_adr",
+            "micro_upper_wick_pct",
+            "red_reversal_bar",
+            "two_bar_top_reversal",
+            "failed_high_retest",
+            "rejected_at_falling_ma",
+            "overhead_rejection_score",
+        ]:
+            if scale_col in big.columns:
+                big[scale_col] = big[scale_col].to_numpy() * w
+        if "close_pos" in big.columns:
+            big["close_pos"] = 1.0 - w * (1.0 - big["close_pos"].to_numpy())
+        if "reversal_vol_score" in big.columns:
+            big["reversal_vol_score"] = big["rvol"] * big["fade_from_high_adr"]
+        if "climax_vol_stretch" in big.columns:
+            big["climax_vol_stretch"] = big["rvol"] * big["ext_ema10_adr"].clip(lower=0.0)
+    else:
+        p_cand = hi_rep - w * (hi_rep - lo_rep)
+        dl = (p_cand - lo_ev_rep) / adr_rep
+        big["low"] = p_cand
+        big["rsi14_low"] = _eval_intrabar_rsi_vec(p_cand, big, 14, rsi14_hi - w * (rsi14_hi - rsi14_lo))
+        big["rsi9_low"] = _eval_intrabar_rsi_vec(p_cand, big, 9, rsi9_hi - w * (rsi9_hi - rsi9_lo))
+        big["rsi5_low"] = _eval_intrabar_rsi_vec(p_cand, big, 5, rsi5_hi - w * (rsi5_hi - rsi5_lo))
+        if "rsi14" in big.columns:
+            big["rsi14"] = rsi14_hi - w * (rsi14_hi - big["rsi14"].to_numpy())
+        if "rsi14_vs_rsi5_low_spread" in big.columns:
+            big["rsi14_vs_rsi5_low_spread"] = big["rsi14_low"] - big["rsi5_low"]
+
+        for col in [
+            "low_dist_ema8_adr",
+            "low_dist_ema10_adr",
+            "low_dist_ema20_adr",
+            "low_dist_sma50_adr",
+            "low_dist_sma200_adr",
+            "dist_to_prior_swing_high_adr",
+            "dist_to_prior_swing_low_adr",
+            "avwap_from_60d_high_dist_adr",
+            "avwap_from_60d_low_dist_adr",
+            "rs_vs_spy_5d_adr",
+        ]:
+            if col in big.columns:
+                big[col] = big[col].to_numpy() + dl
+        for col in [
+            "stretch_below_ema10_adr",
+            "stretch_below_ema20_adr",
+            "stretch_below_sma50_adr",
+            "down_leg_adr_from_ema10",
+            "down_leg_adr_from_ema20",
+            "drop_1d_adr",
+            "drop_2d_adr",
+            "drop_3d_adr",
+            "drop_5d_adr",
+            "drop_10d_adr",
+            "drop_15d_adr",
+            "drop_20d_adr",
+            "drop_40d_adr",
+            "undercut_10d_low_adr",
+            "undercut_20d_low_adr",
+            "open_to_low_adr",
+            "inv_rsi25_dist_adr",
+        ]:
+            if col in big.columns:
+                big[col] = big[col].to_numpy() - dl
+
+        if "dist_from_8d_low_adr" in big.columns and "undercut_10d_low_adr" in big.columns:
+            big["dist_from_8d_low_adr"] = np.maximum(0.0, -big["undercut_10d_low_adr"].to_numpy())
+        if "waterfall_accel" in big.columns:
+            big["waterfall_accel"] = (big["drop_3d_adr"] / 3.0) / np.maximum(0.15, big["drop_10d_adr"] / 10.0)
+        if "sma20_anchor" in big.columns and "std20_anchor" in big.columns and "bb_z_low" in big.columns:
+            big["bb_z_low"] = ((p_cand - big["sma20_anchor"].to_numpy()) / np.maximum(1e-6, big["std20_anchor"].to_numpy())).clip(-6.0, 4.0)
+        if "prev_bb_z_lo_min2" in big.columns and "bb_z_low_min3" in big.columns:
+            big["bb_z_low_min3"] = np.minimum(big["prev_bb_z_lo_min2"].to_numpy(), big["bb_z_low"].to_numpy())
+        if "roll_p95_down20" in big.columns and "rel_down_ema20_p95" in big.columns:
+            big["rel_down_ema20_p95"] = big["stretch_below_ema20_adr"].to_numpy() / np.maximum(0.5, big["roll_p95_down20"].to_numpy())
+        if "prev_stretch20_max2" in big.columns and "stretch_below_ema20_max3" in big.columns:
+            big["stretch_below_ema20_max3"] = np.maximum(big["prev_stretch20_max2"].to_numpy(), big["stretch_below_ema20_adr"].to_numpy())
+        if "prev_rsi14_lo_min4" in big.columns and "rsi14_low_min5" in big.columns:
+            big["rsi14_low_min5"] = np.minimum(big["prev_rsi14_lo_min4"].to_numpy(), big["rsi14_low"].to_numpy())
+        if "prev_rsi5_lo_min2" in big.columns and "rsi5_low_min3" in big.columns:
+            big["rsi5_low_min3"] = np.minimum(big["prev_rsi5_lo_min2"].to_numpy(), big["rsi5_low"].to_numpy())
+        if "rsi14_lo_shift3" in big.columns and "rsi14_low_diff3" in big.columns:
+            big["rsi14_low_diff3"] = big["rsi14_low"].to_numpy() - big["rsi14_lo_shift3"].to_numpy()
+        if "rsi14_lo_shift5" in big.columns and "rsi14_low_diff5" in big.columns:
+            big["rsi14_low_diff5"] = big["rsi14_low"].to_numpy() - big["rsi14_lo_shift5"].to_numpy()
+        if "prev_consec_rsi30_4d" in big.columns and "consec_rsi30_5d" in big.columns:
+            big["consec_rsi30_5d"] = big["prev_consec_rsi30_4d"].to_numpy() + (big["rsi14_low"].to_numpy() <= 30.0).astype(float)
+        if "prev_consec_rsi25_4d" in big.columns and "consec_rsi25_5d" in big.columns:
+            big["consec_rsi25_5d"] = big["prev_consec_rsi25_4d"].to_numpy() + (big["rsi14_low"].to_numpy() <= 25.0).astype(float)
+        if "prev_consec_rsi5_20_4d" in big.columns and "consec_rsi5_20_5d" in big.columns:
+            big["consec_rsi5_20_5d"] = big["prev_consec_rsi5_20_4d"].to_numpy() + (big["rsi5_low"].to_numpy() <= 20.0).astype(float)
+        if "prev_wave_low_18" in big.columns and "prev_wave_rsi_low_18" in big.columns:
+            is_nl_18 = p_cand <= big["prev_wave_low_18"].to_numpy() * 1.015
+            if "bullish_div_low_18d" in big.columns:
+                big["bullish_div_low_18d"] = (is_nl_18 & (big["rsi14_low"].to_numpy() > big["prev_wave_rsi_low_18"].to_numpy() + 1.5)).astype(float)
+            if "rsi_bull_div_delta_18d" in big.columns:
+                big["rsi_bull_div_delta_18d"] = np.where(is_nl_18, np.maximum(0.0, big["rsi14_low"].to_numpy() - big["prev_wave_rsi_low_18"].to_numpy()), 0.0)
+        if "prev_wave_low_35" in big.columns and "prev_wave_rsi_low_35" in big.columns:
+            is_nl_35 = p_cand <= big["prev_wave_low_35"].to_numpy() * 1.015
+            if "bullish_div_low_35d" in big.columns:
+                big["bullish_div_low_35d"] = (is_nl_35 & (big["rsi14_low"].to_numpy() > big["prev_wave_rsi_low_35"].to_numpy() + 2.0)).astype(float)
+            if "rsi_bull_div_delta_35d" in big.columns:
+                big["rsi_bull_div_delta_35d"] = np.where(is_nl_35, np.maximum(0.0, big["rsi14_low"].to_numpy() - big["prev_wave_rsi_low_35"].to_numpy()), 0.0)
+        for k_col, d_col in [
+            ("kiss_ema10_dist_adr", "low_dist_ema10_adr"),
+            ("kiss_ema20_dist_adr", "low_dist_ema20_adr"),
+            ("kiss_sma50_dist_adr", "low_dist_sma50_adr"),
+        ]:
+            if k_col in big.columns and d_col in big.columns:
+                big[k_col] = big[d_col].abs()
+        if "min_support_kiss_adr" in big.columns:
+            big["min_support_kiss_adr"] = np.minimum(big["kiss_ema20_dist_adr"], big["kiss_sma50_dist_adr"])
+        if "pullback_retracement_ratio" in big.columns and "prior_rally_20d_adr" in big.columns:
+            big["pullback_retracement_ratio"] = big["drop_15d_adr"].clip(lower=0.0) / np.maximum(1.5, big["prior_rally_20d_adr"])
+
+        # Weekly W-FRI & MTF confluence updates at p_cand
+        if "prev_w_c" in big.columns and "weekly_rsi14_low" in big.columns:
+            wtd_lo_c = np.minimum(big["wtd_low_prev"].to_numpy(), p_cand)
+            pw_c = big["prev_w_c"].to_numpy()
+            gl_w = np.maximum(wtd_lo_c - pw_c, 0.0)
+            ll_w = np.maximum(pw_c - wtd_lo_c, 0.0)
+            agl_w = (big["prev_w_ag14"].to_numpy() * 13.0 + gl_w) / 14.0
+            all_w = (big["prev_w_al14"].to_numpy() * 13.0 + ll_w) / 14.0
+            big["weekly_rsi14_low"] = 100.0 - 100.0 / (1.0 + agl_w / (all_w + 1e-9))
+            if "weekly_ext_ema10w_adr" in big.columns:
+                big["weekly_ext_ema10w_adr"] = (wtd_lo_c - big["prev_w_ema10"].to_numpy()) / np.maximum(1e-6, big["prev_w_adr"].to_numpy())
+
+        # Scale intrabar reclaim/wick features progressively with w (0 -> 1)
+        big["range_to_adr"] = (hi_rep - p_cand) / adr_rep
+        for scale_col in [
+            "lower_wick_pct",
+            "bounce_from_low_adr",
+            "micro_bounce_adr",
+            "micro_lower_wick_pct",
+            "green_reclaim_bar",
+            "two_bar_bottom_reclaim",
+            "failed_low_undercut",
+            "ma_undercut_reclaim",
+            "day2_washout_reclaim",
+        ]:
+            if scale_col in big.columns:
+                big[scale_col] = big[scale_col].to_numpy() * w
+        if "close_pos" in big.columns:
+            big["close_pos"] = w * big["close_pos"].to_numpy()
+        if "hammer_vol_score" in big.columns:
+            big["hammer_vol_score"] = big["rvol"] * big["bounce_from_low_adr"]
+        if "support_confluence_score" in big.columns:
+            big["support_confluence_score"] = big["bounce_from_low_adr"] / (0.25 + big["min_support_kiss_adr"])
+        if "capitulation_vol_stretch" in big.columns:
+            big["capitulation_vol_stretch"] = big["rvol"] * big["stretch_below_ema20_adr"].clip(lower=0.0)
+        if "climax_washout_score" in big.columns:
+            big["climax_washout_score"] = big["rvol"] * big["range_to_adr"] * big["stretch_below_ema20_adr"].clip(lower=0.0)
+        if "seller_exhaustion_wick" in big.columns:
+            big["seller_exhaustion_wick"] = big["bounce_from_low_adr"] * big["stretch_below_ema20_adr"].clip(lower=0.0)
+
+    big[mask_col] = True
+    p_dual, p_ex, _ = tap.score_dual_model_on_features(big, model_bundle, mask_col)
+    p_dual_mat = p_dual.reshape(m, n_steps) * 100.0
+    p_ex_mat = p_ex.reshape(m, n_steps) * 100.0
+    p_cand_mat = p_cand.reshape(m, n_steps)
+
+    for i, ev in enumerate(events):
+        grid_i = p_cand_mat[i]
+        prec = 4 if abs(float(grid_i[-1])) < 10.0 else 2
+        ev_prob = float(ev["prob_pct"])
+        # Evaluate the true model probability curve along the intrabar excursion (weighted by sqrt(w)
+        # at the start of the bar so opposite-extreme w=0 cannot fire before price moves toward the pivot,
+        # with a 5% within-leaf tie-breaker slope so flat tree steps interpolate distinctly across thresholds):
+        model_curve = np.maximum.accumulate(np.maximum(p_dual_mat[i], p_ex_mat[i]) * np.sqrt(w_1d))
+        model_curve = np.minimum(model_curve, ev_prob)
+        model_curve[-1] = ev_prob
+        pd_eff = 0.92 * model_curve + 0.08 * (w_1d * ev_prob)
+        pd_eff[0] = 0.0
+        pd_eff[-1] = ev_prob
+
+        by_thr: Dict[str, float] = {}
+        for thr in range(20, 86, 5):
+            if ev_prob >= thr:
+                trig_p = float(np.interp(float(thr), pd_eff, grid_i))
+                by_thr[str(thr)] = round(trig_p, prec)
+        default_thr = "50" if "50" in by_thr else (str(int(ev_prob // 5 * 5)) if by_thr else None)
+        fallback_p = ev["high"] if is_high_pivot else ev["low"]
+        ev["intrabar_trigger_price"] = by_thr.get(default_thr, fallback_p) if default_thr else fallback_p
+        ev["trigger_prices_by_thr"] = by_thr
+        if ev["at_extreme_pct"] >= 50.0:
+            ex_prob = float(ev["at_extreme_pct"])
+            ex_curve = np.maximum.accumulate(p_ex_mat[i] * np.sqrt(w_1d))
+            ex_curve = np.minimum(ex_curve, ex_prob)
+            ex_curve[-1] = ex_prob
+            ex_eff = 0.92 * ex_curve + 0.08 * (w_1d * ex_prob)
+            ev["touch_trigger_price"] = round(float(np.interp(50.0, ex_eff, grid_i)), prec)
+        else:
+            ev["touch_trigger_price"] = None
+
+        cal_arr = tap.score_calibrated_probability(np.array([ev_prob / 100.0]), model_bundle)
+        ev["calibrated_prob_pct"] = round(float(cal_arr[0]) * 100.0, 1)
+
+    return events
+
+
 def compute_universal_exhaustion(
     df_full: pd.DataFrame,
     df_view: pd.DataFrame,
     rs_val: Optional[float],
     ep_events: Optional[List[Dict[str, Any]]] = None,
+    model_ver: str = "v3",
+    symbol: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Scores the 4-Model Universal Structural Swing-Pivot Suite across ANY ticker, ETF, Sector, Theme, or Ratio:
     1. `ut_high`: Uptrend Pivot High (Climax Top / Parabolic Stretch & Multi-Wave Divergence)
     2. `ut_low` : Uptrend Pivot Low (Pullback Buy / Support Kiss / Undercut & Reclaim)
     3. `dt_high`: Downtrend Pivot High (Bear-Rally Rejection / Overhead Falling-MA Supply)
     4. `dt_low` : Downtrend Pivot Low (Capitulation Washout / Selling Climax Bottom)
+    Supports both `model_ver='v3'` (Baseline) and `model_ver='v4'` (Enhanced B1–B5 + Inverse-RSI).
     """
-    models = get_all_pivot_models()
+    ver = "v4" if str(model_ver or "v3").strip().lower().startswith("v4") else "v3"
+    models = get_all_pivot_models(ver)
     if not models or df_full is None or len(df_full) < 20 or df_view is None or df_view.empty:
         return {}
 
-    b = tap.compute_all_pivot_features(df_full)
-    sub = b.loc[df_view.index].copy()
+    b = tap.compute_all_pivot_features(df_full, symbol=symbol)
+    sub = _ensure_causal_rma_state(df_full, b.loc[df_view.index].copy())
     n = len(sub)
     zeros = np.zeros(n)
 
@@ -441,17 +882,33 @@ def compute_universal_exhaustion(
             else "📉 Downtrend Regime (No Active Reversal Pivot)"
         )
 
-    ut_high_events = _extract_snapped_pivot_events(
-        sub, p_uh, p_uh_ex, p_uh_fb, sub["is_near_local_high"].to_numpy(), True, "ut_high"
+    ut_high_events = _enrich_events_with_intrabar_triggers(
+        sub,
+        _extract_snapped_pivot_events(sub, p_uh, p_uh_ex, p_uh_fb, sub["is_near_local_high"].to_numpy(), True, "ut_high"),
+        models.get("ut_high"),
+        "is_near_local_high",
+        True,
     )
-    ut_low_events = _extract_snapped_pivot_events(
-        sub, p_ul, p_ul_ex, p_ul_fb, sub["is_near_uptrend_low"].to_numpy(), False, "ut_low"
+    ut_low_events = _enrich_events_with_intrabar_triggers(
+        sub,
+        _extract_snapped_pivot_events(sub, p_ul, p_ul_ex, p_ul_fb, sub["is_near_uptrend_low"].to_numpy(), False, "ut_low"),
+        models.get("ut_low"),
+        "is_near_uptrend_low",
+        False,
     )
-    dt_high_events = _extract_snapped_pivot_events(
-        sub, p_dh, p_dh_ex, p_dh_fb, sub["is_near_downtrend_high"].to_numpy(), True, "dt_high"
+    dt_high_events = _enrich_events_with_intrabar_triggers(
+        sub,
+        _extract_snapped_pivot_events(sub, p_dh, p_dh_ex, p_dh_fb, sub["is_near_downtrend_high"].to_numpy(), True, "dt_high"),
+        models.get("dt_high"),
+        "is_near_downtrend_high",
+        True,
     )
-    dt_low_events = _extract_snapped_pivot_events(
-        sub, p_dl, p_dl_ex, p_dl_fb, sub["is_near_downtrend_low"].to_numpy(), False, "dt_low"
+    dt_low_events = _enrich_events_with_intrabar_triggers(
+        sub,
+        _extract_snapped_pivot_events(sub, p_dl, p_dl_ex, p_dl_fb, sub["is_near_downtrend_low"].to_numpy(), False, "dt_low"),
+        models.get("dt_low"),
+        "is_near_downtrend_low",
+        False,
     )
 
     series_data = [
@@ -491,7 +948,14 @@ def compute_universal_exhaustion(
     has_bear_div = bool(last_row.get("bearish_div_high", 0) > 0.5 or last_row.get("bearish_div_35d", 0) > 0.5)
     has_bull_div = bool(last_row.get("bullish_div_low_18d", 0) > 0.5 or last_row.get("bullish_div_low_35d", 0) > 0.5)
 
+    ob75_ser = indicators.rsi_trigger_price(df_full["close"], 75.0, 14)
+    os25_ser = indicators.rsi_trigger_price(df_full["close"], 25.0, 14)
+    last_idx = sub.index[-1]
+    ob75_last = ob75_ser.loc[last_idx] if last_idx in ob75_ser.index else np.nan
+    os25_last = os25_ser.loc[last_idx] if last_idx in os25_ser.index else np.nan
+
     return {
+        "model_ver": ver,
         "regime": regime_str,
         "current_prob_pct": curr_prob,
         "at_high_prob_pct": curr_at_high,
@@ -518,6 +982,8 @@ def compute_universal_exhaustion(
         "rsi14_close": round(float(last_row["rsi14"]), 1),
         "rsi5": round(float(last_row["rsi5_high"]), 1),
         "rsi5_low": round(float(last_row["rsi5_low"]), 1),
+        "ob75_target_price": float(ob75_last) if pd.notna(ob75_last) else None,
+        "os25_target_price": float(os25_last) if pd.notna(os25_last) else None,
         "ext_ema10_adr": round(float(last_row["ext_ema10_adr"]), 2),
         "ext_ema20_adr": round(float(last_row["ext_ema20_adr"]), 2),
         "ext_sma50_adr": round(float(last_row["ext_sma50_adr"]), 2),
@@ -1550,11 +2016,15 @@ def api_reload_dataset():
     _PIVOT_MODELS_CACHE.clear()
     _COMPOSITE_BAR_CACHE.clear()
     _CATALOG_CACHE = None
-    models = get_all_pivot_models()
+    tap._MARKET_SYNC_CACHE = None
+    tap._B4_INTRADAY_CACHE.clear()
+    models_v3 = get_all_pivot_models("v3")
+    models_v4 = get_all_pivot_models("v4")
     cat = build_catalog()
     return jsonify({
         "status": "reloaded",
-        "pivot_models_loaded": list(models.keys()),
+        "pivot_models_loaded": list(models_v3.keys()),
+        "pivot_models_v4_loaded": list(models_v4.keys()),
         "catalog_counts": cat.get("counts", {}),
     })
 
@@ -1899,11 +2369,15 @@ def api_chart():
     context_a = get_constituents_and_context(meta_a)
 
     # Universal ML Climax / Exhaustion Scoring (works on ANY ticker, ETF, Sector, Theme, or Ratio)
+    model_ver = request.args.get("model_ver", "v3").strip().lower()
+    sym_for_b4 = meta_a.get("key") if (not is_ratio and meta_a.get("type") in ("stock", "etf")) else None
     exhaustion_data = compute_universal_exhaustion(
         df_chart_full,
         df_view,
         perf_chart.get("rs_score"),
         ep_events_a if not is_ratio else None,
+        model_ver=model_ver,
+        symbol=sym_for_b4,
     )
 
     # Catalyst lookup for latest EP if single stock
@@ -2825,7 +3299,17 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       </span>
       <span class="cfg-label" title="Toggle Uptrend & Downtrend Pivot-Low markers (💎 UT Low / 🟢 DT Low) above the probability threshold">
         <input type="checkbox" id="cfg_pivot_low_markers" checked onchange="renderEPMarkers()">💎 Pivot Lows ≥
-        <input type="number" id="cfg_climax_thresh" value="50" min="25" max="85" step="5" class="ma-span-input" onchange="renderEPMarkers()" title="Minimum ML Pivot Probability % for chart markers (25-85%)">%
+        <input type="number" id="cfg_climax_thresh" value="50" min="25" max="85" step="5" class="ma-span-input" onchange="renderEPMarkers()" oninput="renderEPMarkers()" title="Minimum ML Pivot Probability % for chart markers (25-85%)">%
+      </span>
+      <span class="cfg-label" title="Display the lowest intrabar price that classifies a Pivot High and the highest intrabar price that classifies a Pivot Low">
+        <input type="checkbox" id="cfg_pivot_intrabar_price" checked onchange="renderEPMarkers()">🎯 Intrabar Trigger $
+      </span>
+      <span class="cfg-label" title="Switch between V3 Baseline (Daily OHLCV) and V4 Enhanced (B1–B5: Swings, 60D AVWAP, SPY/QQQ RS Sync, Weekly W-FRI, 5m Sub-Model A+, Inverse-RSI & Isotonic Calibration)">
+        🤖 Model:
+        <select id="cfg_pivot_model_ver" onchange="onPivotModelVerChange()" style="background:#131b2b; color:#38bdf8; border:1px solid #26354d; border-radius:4px; padding:1px 5px; font-size:11px; font-weight:700;">
+          <option value="v3">V3 Current (Baseline)</option>
+          <option value="v4">V4 Enhanced (B1–B5 + Inv-RSI)</option>
+        </select>
       </span>
 
       <div style="display:flex; align-items:center; gap:6px; border-left:1px solid #26354d; padding-left:10px;">
@@ -2916,6 +3400,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       <div id="exh_action_banner" style="font-size:11px; font-weight:700; padding:5px 8px; border-radius:5px; background:#0b1019; text-align:center;">--</div>
       <div style="border-top:1px solid #1e293b; padding-top:5px;">
         <div class="kv-row"><span class="k">UT High (Stretch / Reversal):</span><span class="v" id="exh_submodels_row">--</span></div>
+        <div class="kv-row"><span class="k">Latest Pivot Intrabar Trigger:</span><span class="v" id="exh_intrabar_trig_row" style="color:#fbbf24;">--</span></div>
         <div class="kv-row"><span class="k">RSI-14 (At High / At Low):</span><span class="v" id="exh_rsi_row">--</span></div>
         <div class="kv-row"><span class="k">High Stretch (10E / 20E / 50S ADR):</span><span class="v" id="exh_adr_stretch">--</span></div>
         <div class="kv-row"><span class="k">Wicks (Upper / Lower) & RVOL:</span><span class="v" id="exh_wick_rvol">--</span></div>
@@ -3067,7 +3552,26 @@ function restoreSavedMaSpans() {
       const thEl = document.getElementById('cfg_climax_thresh');
       if (thEl) thEl.value = savedThresh;
     }
+    const savedIntrabar = localStorage.getItem('ep_wl_pivot_intrabar');
+    if (savedIntrabar !== null) {
+      const ibEl = document.getElementById('cfg_pivot_intrabar_price');
+      if (ibEl) ibEl.checked = savedIntrabar !== '0';
+    }
+    const savedModelVer = localStorage.getItem('ep_wl_pivot_model_ver');
+    if (savedModelVer === 'v3' || savedModelVer === 'v4') {
+      const mvEl = document.getElementById('cfg_pivot_model_ver');
+      if (mvEl) mvEl.value = savedModelVer;
+    }
   } catch (e) {}
+}
+
+function onPivotModelVerChange() {
+  const mvEl = document.getElementById('cfg_pivot_model_ver');
+  const val = mvEl ? mvEl.value : 'v3';
+  try {
+    localStorage.setItem('ep_wl_pivot_model_ver', val);
+  } catch (e) {}
+  loadChart();
 }
 
 function getConfiguredEmaSpans() {
@@ -3720,8 +4224,9 @@ async function loadChart() {
   const larssonSpan = document.getElementById('cfg_larsson_span').value || '32';
   const emaSpans = getConfiguredEmaSpans().join(',');
   const smaSpans = getConfiguredSmaSpans().join(',');
+  const modelVer = document.getElementById('cfg_pivot_model_ver')?.value || 'v3';
   const compareParam = (isRatioMode && partB) ? `&compare=${encodeURIComponent(partB)}` : '';
-  const url = `/api/chart?symbol=${encodeURIComponent(partA)}${compareParam}&history=${historyWindow}&larsson_fastest=${larssonSpan}&ema_spans=${emaSpans}&sma_spans=${smaSpans}`;
+  const url = `/api/chart?symbol=${encodeURIComponent(partA)}${compareParam}&history=${historyWindow}&larsson_fastest=${larssonSpan}&ema_spans=${emaSpans}&sma_spans=${smaSpans}&model_ver=${encodeURIComponent(modelVer)}`;
 
   const res = await fetch(url);
   const data = await res.json();
@@ -3813,16 +4318,69 @@ function resetChartZoom() {
   scheduleLarssonRender();
 }
 
+function resolvePivotTriggerPrice(ce, thr) {
+  const byThr = ce.trigger_prices_by_thr || {};
+  const exactKey = String(Math.round(thr));
+  if (byThr[exactKey] !== undefined) return Number(byThr[exactKey]);
+  const loStep = Math.floor(thr / 5) * 5;
+  const hiStep = Math.ceil(thr / 5) * 5;
+  const pLo = byThr[String(loStep)];
+  const pHi = byThr[String(hiStep)];
+  if (pLo !== undefined && pHi !== undefined && hiStep > loStep) {
+    const frac = (thr - loStep) / (hiStep - loStep);
+    return Number(pLo) + frac * (Number(pHi) - Number(pLo));
+  }
+  const nearKey = String(Math.round(thr / 5) * 5);
+  if (byThr[nearKey] !== undefined) return Number(byThr[nearKey]);
+  return ce.intrabar_trigger_price !== undefined ? Number(ce.intrabar_trigger_price) : NaN;
+}
+
+function fmtPivotIntrabarSuffix(ce, thr, showIntrabar) {
+  if (!showIntrabar) return '';
+  const numP = resolvePivotTriggerPrice(ce, thr);
+  if (isNaN(numP)) return '';
+  const pStr = Math.abs(numP) < 10 ? numP.toFixed(3) : numP.toFixed(2);
+  return ` @$${pStr}`;
+}
+
+function updateIntrabarTriggerRow(exh) {
+  const trigRowEl = document.getElementById('exh_intrabar_trig_row');
+  if (!trigRowEl || !exh) return;
+  const threshEl = document.getElementById('cfg_climax_thresh');
+  const thr = threshEl ? Math.max(20, Math.min(90, parseFloat(threshEl.value) || 50)) : 50;
+  const allEvs = [
+    ...(exh.ut_high_events || []),
+    ...(exh.ut_low_events || []),
+    ...(exh.dt_high_events || []),
+    ...(exh.dt_low_events || []),
+  ].filter(e => e.prob_pct >= thr).sort((a, b) => a.date.localeCompare(b.date));
+  if (allEvs.length > 0) {
+    const lastEv = allEvs[allEvs.length - 1];
+    const isHi = lastEv.type === 'ut_high' || lastEv.type === 'dt_high';
+    const trigP = resolvePivotTriggerPrice(lastEv, thr);
+    const extP = isHi ? lastEv.high : lastEv.low;
+    const dec = Math.abs(Number(trigP)) < 10 ? 3 : 2;
+    const lblMap = { ut_high: 'UT High', ut_low: 'UT Low', dt_high: 'DT High', dt_low: 'DT Low' };
+    trigRowEl.textContent = `${lastEv.date} ${lblMap[lastEv.type] || lastEv.type}: @$${Number(trigP).toFixed(dec)} (${isHi ? 'Hi' : 'Lo'} $${Number(extP).toFixed(dec)})`;
+  } else {
+    trigRowEl.textContent = 'None in view';
+  }
+}
+
 function renderEPMarkers() {
   if (!candleSeries || !currentChartData) return;
   const showEP = document.getElementById('cfg_ep_markers').checked;
   const showPivotHighs = document.getElementById('cfg_climax_markers')?.checked;
   const showPivotLows = document.getElementById('cfg_pivot_low_markers')?.checked;
+  const showIntrabarPrice = document.getElementById('cfg_pivot_intrabar_price')?.checked ?? true;
   const threshEl = document.getElementById('cfg_climax_thresh');
   const climaxThresh = threshEl ? Math.max(20, Math.min(90, parseFloat(threshEl.value) || 50)) : 50;
   if (threshEl) {
     try { localStorage.setItem('ep_wl_climax_thresh', String(climaxThresh)); } catch (e) {}
   }
+  try {
+    localStorage.setItem('ep_wl_pivot_intrabar', showIntrabarPrice ? '1' : '0');
+  } catch (e) {}
   const eps = currentChartData.ep_events || [];
   const exh = currentChartData.exhaustion || {};
   const utHighEvents = (exh.ut_high_events || exh.climax_events || []).filter(ce => ce.prob_pct >= climaxThresh);
@@ -3878,21 +4436,23 @@ function renderEPMarkers() {
   if (showPivotHighs) {
     utHighEvents.forEach(ce => {
       const isExtreme = ce.prob_pct >= 65.0;
+      const trigSfx = fmtPivotIntrabarSuffix(ce, climaxThresh, showIntrabarPrice);
       allMarkers.push({
         time: ce.date,
         position: 'aboveBar',
         color: isExtreme ? '#f43f5e' : '#fb923c',
         shape: 'arrowDown',
-        text: `🔥 UT High ${ce.prob_pct.toFixed(0)}%`,
+        text: `🔥 UT High ${ce.prob_pct.toFixed(0)}%${trigSfx}`,
       });
     });
     dtHighEvents.forEach(ce => {
+      const trigSfx = fmtPivotIntrabarSuffix(ce, climaxThresh, showIntrabarPrice);
       allMarkers.push({
         time: ce.date,
         position: 'aboveBar',
         color: '#c084fc',
         shape: 'arrowDown',
-        text: `🔻 DT High ${ce.prob_pct.toFixed(0)}%`,
+        text: `🔻 DT High ${ce.prob_pct.toFixed(0)}%${trigSfx}`,
       });
     });
   }
@@ -3900,27 +4460,30 @@ function renderEPMarkers() {
   // 2. Uptrend Pivot Lows (💎 UT Low) & 4. Downtrend Pivot Lows (🟢 DT Low)
   if (showPivotLows) {
     utLowEvents.forEach(ce => {
+      const trigSfx = fmtPivotIntrabarSuffix(ce, climaxThresh, showIntrabarPrice);
       allMarkers.push({
         time: ce.date,
         position: 'belowBar',
         color: '#38bdf8',
         shape: 'arrowUp',
-        text: `💎 UT Low ${ce.prob_pct.toFixed(0)}%`,
+        text: `💎 UT Low ${ce.prob_pct.toFixed(0)}%${trigSfx}`,
       });
     });
     dtLowEvents.forEach(ce => {
+      const trigSfx = fmtPivotIntrabarSuffix(ce, climaxThresh, showIntrabarPrice);
       allMarkers.push({
         time: ce.date,
         position: 'belowBar',
         color: '#22c55e',
         shape: 'arrowUp',
-        text: `🟢 DT Low ${ce.prob_pct.toFixed(0)}%`,
+        text: `🟢 DT Low ${ce.prob_pct.toFixed(0)}%${trigSfx}`,
       });
     });
   }
 
   allMarkers.sort((a, b) => a.time.localeCompare(b.time));
   candleSeries.setMarkers(allMarkers);
+  updateIntrabarTriggerRow(exh);
 }
 
 // ============================================================================
@@ -4040,7 +4603,8 @@ function renderInfoPanel(data) {
       hdrClimax.textContent = `🤖 [${regShort}] High: ${hiNow.toFixed(0)}% | Low: ${loNow.toFixed(0)}% (5D Peak: ${max5.toFixed(0)}%)`;
     }
 
-    exhStatusBadge.textContent = reg;
+    const verTag = (exh.model_ver || 'v3').toUpperCase();
+    exhStatusBadge.textContent = `${reg} · ${verTag}`;
     exhStatusBadge.style.background = exh.regime === 'downtrend' ? 'rgba(239,68,68,0.18)' : 'rgba(16,185,129,0.18)';
     exhStatusBadge.style.color = exh.regime === 'downtrend' ? '#f87171' : '#34d399';
     exhStatusBadge.style.border = `1px solid ${exh.regime === 'downtrend' ? '#ef4444' : '#10b981'}`;
@@ -4079,6 +4643,7 @@ function renderInfoPanel(data) {
       const fb = exh.full_bar_prob_pct !== undefined ? exh.full_bar_prob_pct : uh;
       subRowEl.innerHTML = `<span class="${ah >= 50 ? 'neg' : 'neu'}">${ah.toFixed(1)}%</span> / <span class="${fb >= 50 ? 'neg' : 'neu'}">${fb.toFixed(1)}%</span>`;
     }
+    updateIntrabarTriggerRow(exh);
     const rsiLow = exh.rsi14_low !== undefined ? exh.rsi14_low : exh.rsi5;
     document.getElementById('exh_rsi_row').innerHTML = `<span class="${exh.rsi14 >= 72 ? 'neg' : 'neu'}">${exh.rsi14}</span> (Hi) / <span class="${rsiLow <= 32 ? 'pos' : 'neu'}">${rsiLow}</span> (Lo)`;
     document.getElementById('exh_adr_stretch').textContent = `${exh.ext_ema10_adr >= 0 ? '+' : ''}${exh.ext_ema10_adr}x / ${exh.ext_ema20_adr >= 0 ? '+' : ''}${exh.ext_ema20_adr}x / ${exh.ext_sma50_adr >= 0 ? '+' : ''}${exh.ext_sma50_adr}x ADR`;

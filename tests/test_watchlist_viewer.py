@@ -29,6 +29,9 @@ class TestWatchlistViewer(unittest.TestCase):
         self.assertIn("cfg_climax_markers", html)
         self.assertIn("cfg_pivot_low_markers", html)
         self.assertIn("cfg_climax_thresh", html)
+        self.assertIn("cfg_pivot_intrabar_price", html)
+        self.assertIn("fmtPivotIntrabarSuffix", html)
+        self.assertIn("exh_intrabar_trig_row", html)
         self.assertIn("cfg_ema_span_0", html)
         self.assertIn("crosshairMarkerVisible: false", html)
         self.assertIn("ml_exhaustion_card", html)
@@ -161,7 +164,7 @@ class TestWatchlistViewer(unittest.TestCase):
         self.assertGreater(len(d_rat["bars"]), 50)
         self.assertIn("current_prob_pct", d_rat["exhaustion"])
 
-        # 6. 4-Model Structural Pivot Suite Detection on TWLO & MRNA
+        # 6. 4-Model Structural Pivot Suite Detection + Intrabar Trigger Prices on TWLO & MRNA
         r_twlo = self.client.get("/api/chart?symbol=TWLO&history=1y")
         self.assertEqual(r_twlo.status_code, 200)
         ex_twlo = r_twlo.get_json()["exhaustion"]
@@ -177,6 +180,23 @@ class TestWatchlistViewer(unittest.TestCase):
         self.assertGreaterEqual(len(ut_hi_50), 4)
         self.assertGreaterEqual(len(ut_lo_50), 2)
         self.assertGreaterEqual(len(dt_lo_50), 1)
+
+        # Verify intrabar trigger price bounds:
+        # - For Pivot Highs: low <= intrabar_trigger_price <= high (and triggers before high on wide bars)
+        # - For Pivot Lows : low <= intrabar_trigger_price <= high (and triggers above low on wide bars)
+        for e in ut_hi_50:
+            self.assertIn("intrabar_trigger_price", e)
+            self.assertIn("trigger_prices_by_thr", e)
+            self.assertGreaterEqual(e["intrabar_trigger_price"], e["low"] - 0.01)
+            self.assertLessEqual(e["intrabar_trigger_price"], e["high"] + 0.01)
+        self.assertTrue(any(e["intrabar_trigger_price"] < e["high"] for e in ut_hi_50))
+
+        for e in ut_lo_50:
+            self.assertIn("intrabar_trigger_price", e)
+            self.assertIn("trigger_prices_by_thr", e)
+            self.assertGreaterEqual(e["intrabar_trigger_price"], e["low"] - 0.01)
+            self.assertLessEqual(e["intrabar_trigger_price"], e["high"] + 0.01)
+        self.assertTrue(any(e["intrabar_trigger_price"] > e["low"] for e in ut_lo_50))
 
         r_mrna = self.client.get("/api/chart?symbol=MRNA&history=1y")
         self.assertEqual(r_mrna.status_code, 200)
@@ -241,7 +261,224 @@ class TestWatchlistViewer(unittest.TestCase):
         self.assertEqual(ev_live[0]["date"], ev_full[0]["date"])
         self.assertEqual(ev_live[0]["prob_pct"], ev_full[0]["prob_pct"])
 
+    def test_piecewise_inverse_wilder_rsi_and_intrabar_evaluation(self):
+        import numpy as np
+        import pandas as pd
+        import datastore
+        import indicators
+        import rsi_extremes
+        import train_all_pivot_models as tap
+
+        def exact_wilder_rsi(series_c: pd.Series, length: int) -> pd.Series:
+            chg = series_c.astype(float).diff()
+            u = chg.clip(lower=0.0).ewm(alpha=1.0 / length, adjust=False, min_periods=length).mean()
+            d = (-chg).clip(lower=0.0).ewm(alpha=1.0 / length, adjust=False, min_periods=length).mean()
+            return 100.0 - 100.0 / (1.0 + u / d)
+
+        # Build a price series that crosses deep oversold (< 15) and deep overbought (> 85)
+        # so both RSI[t-1] <= R and RSI[t-1] > R regimes are exercised for every target R.
+        idx = pd.date_range("2025-01-01", periods=80, freq="B")
+        vals = [100.0]
+        for i in range(1, 80):
+            if i < 20:
+                vals.append(vals[-1] * (1.035 if i % 4 != 0 else 0.992))  # surge to RSI > 85
+            elif i < 45:
+                vals.append(vals[-1] * (0.962 if i % 5 != 0 else 1.008))  # plunge to RSI < 15
+            elif i < 65:
+                vals.append(vals[-1] * (1.032 if i % 4 != 0 else 0.990))  # second surge > 80
+            else:
+                vals.append(vals[-1] * (0.968 if i % 4 != 0 else 1.005))  # second plunge < 20
+        close_s = pd.Series(vals, index=idx, dtype=float)
+
+        for length in (14, 9, 5):
+            base_rsi = exact_wilder_rsi(close_s, length)
+            prev_rsi = base_rsi.shift(1)
+            for target_lvl in (20.0, 25.0, 30.0, 50.0, 70.0, 75.0, 80.0):
+                p_ind = indicators.rsi_trigger_price(close_s, target_lvl, length=length)
+                p_os = rsi_extremes.os_trigger_price(close_s, target_lvl, length=length)
+                p_ob = rsi_extremes.ob_trigger_price(close_s, target_lvl, length=length)
+
+                # Warmup bars must be NaN
+                self.assertTrue(p_ind.iloc[:length].isna().all())
+                np.testing.assert_allclose(p_ind.iloc[length:].to_numpy(), p_os.iloc[length:].to_numpy(), rtol=0, atol=1e-12)
+                np.testing.assert_allclose(p_ind.iloc[length:].to_numpy(), p_ob.iloc[length:].to_numpy(), rtol=0, atol=1e-12)
+
+                # Ensure both regimes (RSI[t-1] <= R and RSI[t-1] > R) are present
+                valid_prev = prev_rsi.iloc[length + 1 :]
+                self.assertTrue((valid_prev <= target_lvl).any(), f"Missing RSI[t-1] <= {target_lvl} regime for len={length}")
+                self.assertTrue((valid_prev > target_lvl).any(), f"Missing RSI[t-1] > {target_lvl} regime for len={length}")
+
+                # Round-trip check at every bar t >= length + 1:
+                for t in range(length + 1, len(close_s)):
+                    c_mod = close_s.iloc[: t + 1].copy()
+                    c_mod.iloc[t] = p_ind.iloc[t]
+                    rsi_at_target = float(exact_wilder_rsi(c_mod, length).iloc[t])
+                    self.assertLess(
+                        abs(rsi_at_target - target_lvl),
+                        1e-9,
+                        f"Round-trip failed at t={t}, len={length}, target={target_lvl}: got {rsi_at_target}",
+                    )
+
+            # Causality check: truncating future bars never alters trigger price at bar t
+            p_full = indicators.rsi_trigger_price(close_s, 75.0, length=length)
+            p_trunc = indicators.rsi_trigger_price(close_s.iloc[:40], 75.0, length=length)
+            np.testing.assert_allclose(
+                p_full.iloc[length:40].to_numpy(),
+                p_trunc.iloc[length:40].to_numpy(),
+                rtol=0,
+                atol=1e-12,
+            )
+
+        # Verify exact intrabar Wilder RSI evaluation on straddling bars vs linear interpolation
+        df_twlo = datastore.load_bars("TWLO")
+        self.assertIsNotNone(df_twlo)
+        df_sub = df_twlo.tail(160).copy()
+        b_feat = tap.compute_all_pivot_features(df_sub)
+        sub_rma = serve_watchlist._ensure_causal_rma_state(df_sub, b_feat.tail(60).copy())
+
+        # Pick a bar that straddles prev_close (low < prev_close < high)
+        straddle_mask = (sub_rma["low"] < sub_rma["prev_close"]) & (sub_rma["high"] > sub_rma["prev_close"])
+        self.assertTrue(straddle_mask.any())
+        pos_idx = int(np.flatnonzero(straddle_mask.to_numpy())[-1])
+        bar_dt = sub_rma.index[pos_idx]
+        full_loc = df_sub.index.get_loc(bar_dt)
+
+        lo_v = float(sub_rma["low"].iloc[pos_idx])
+        hi_v = float(sub_rma["high"].iloc[pos_idx])
+        grid_p = np.linspace(lo_v, hi_v, 21)
+        big_test = pd.concat([sub_rma.iloc[[pos_idx]]] * 21, ignore_index=True)
+
+        for period in (14, 9, 5):
+            rsi_vec = serve_watchlist._eval_intrabar_rsi_vec(grid_p, big_test, period, np.zeros(21))
+            # Compare against exact bar-by-bar Wilder RSI when close[t] is set to each candidate price
+            for k, p_cand in enumerate(grid_p):
+                c_copy = df_sub["close"].iloc[: full_loc + 1].astype(float).copy()
+                c_copy.iloc[-1] = float(p_cand)
+                chg = c_copy.diff()
+                ag = float(chg.clip(lower=0.0).ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean().iloc[-1])
+                al = float((-chg.clip(upper=0.0)).ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean().iloc[-1])
+                expected_rsi = 100.0 - (100.0 / (1.0 + ag / (al + 1e-9)))
+                self.assertLess(abs(float(rsi_vec[k]) - expected_rsi), 1e-9)
+
+        # Verify compute_universal_exhaustion includes exact ob75_target_price and os25_target_price
+        ex_out = serve_watchlist.compute_universal_exhaustion(df_sub, df_sub.tail(60), 80.0)
+        self.assertIn("ob75_target_price", ex_out)
+        self.assertIn("os25_target_price", ex_out)
+        self.assertIsNotNone(ex_out["ob75_target_price"])
+        self.assertIsNotNone(ex_out["os25_target_price"])
+        self.assertGreater(ex_out["ob75_target_price"], ex_out["os25_target_price"])
+        for tgt_lvl, tgt_key in ((75.0, "ob75_target_price"), (25.0, "os25_target_price")):
+            c_last = df_sub["close"].astype(float).copy()
+            c_last.iloc[-1] = float(ex_out[tgt_key])
+            rsi_last = float(exact_wilder_rsi(c_last, 14).iloc[-1])
+            self.assertLess(abs(rsi_last - tgt_lvl), 1e-9)
+
+        # Edge cases: Series with RangeIndex, ndarray levels, out-of-domain levels (<=0 or >=100), and rsi_extremes.fires
+        p_scalar = indicators.rsi_trigger_price(close_s, 75.0, length=14)
+        p_range_ser = indicators.rsi_trigger_price(close_s, pd.Series([75.0] * len(close_s)), length=14)
+        p_ndarray = indicators.rsi_trigger_price(close_s, np.full(len(close_s), 75.0), length=14)
+        np.testing.assert_allclose(p_scalar.iloc[14:].to_numpy(), p_range_ser.iloc[14:].to_numpy(), rtol=0, atol=1e-12)
+        np.testing.assert_allclose(p_scalar.iloc[14:].to_numpy(), p_ndarray.iloc[14:].to_numpy(), rtol=0, atol=1e-12)
+        self.assertTrue(indicators.rsi_trigger_price(close_s, 0.0, length=14).isna().all())
+        self.assertTrue(indicators.rsi_trigger_price(close_s, 100.0, length=14).isna().all())
+        self.assertTrue(rsi_extremes.os_trigger_price(close_s, 0.0, length=14).isna().all())
+        self.assertTrue(rsi_extremes.ob_trigger_price(close_s, 100.0, length=14).isna().all())
+        _, p_fire_long, _ = rsi_extremes.fires(df_twlo.tail(250), "long")
+        _, p_fire_short, _ = rsi_extremes.fires(df_twlo.tail(250), "short")
+        self.assertTrue(p_fire_long.notna().any())
+        self.assertTrue(p_fire_short.notna().any())
+
+        # Verify 2-bar snapped stall events (date != trigger_date) align causal t-1 RMA state to target_pos (date)
+        ex_252 = serve_watchlist.compute_universal_exhaustion(df_twlo, df_twlo.tail(252), 80.0)
+        snapped_evs = [e for e in ex_252["ut_high_events"] if e.get("trigger_date") and e["date"] != e["trigger_date"]]
+        self.assertGreaterEqual(len(snapped_evs), 1)
+        for sev in snapped_evs:
+            self.assertGreaterEqual(sev["intrabar_trigger_price"], sev["low"] - 0.01)
+            self.assertLessEqual(sev["intrabar_trigger_price"], sev["high"] + 0.01)
+
+    def test_v3_vs_v4_model_selector_and_threshold_intrabar_trigger_monotonicity(self):
+        # 1. Verify UI selector and interpolation helpers exist in HTML
+        resp_html = self.client.get("/")
+        self.assertEqual(resp_html.status_code, 200)
+        html = resp_html.get_data(as_text=True)
+        self.assertIn("cfg_pivot_model_ver", html)
+        self.assertIn("onPivotModelVerChange()", html)
+        self.assertIn("resolvePivotTriggerPrice", html)
+        self.assertIn("updateIntrabarTriggerRow", html)
+
+        # 2. Verify both V3 and V4 model files exist on disk (V3 preserved untouched, V4 added alongside)
+        for p_v3, p_v4 in [
+            (serve_watchlist.UPTREND_PIVOT_MODEL_PATH, serve_watchlist.UPTREND_PIVOT_MODEL_V4_PATH),
+            (serve_watchlist.UPTREND_PIVOT_LOW_MODEL_PATH, serve_watchlist.UPTREND_PIVOT_LOW_MODEL_V4_PATH),
+            (serve_watchlist.DOWNTREND_PIVOT_HIGH_MODEL_PATH, serve_watchlist.DOWNTREND_PIVOT_HIGH_MODEL_V4_PATH),
+            (serve_watchlist.DOWNTREND_PIVOT_LOW_MODEL_PATH, serve_watchlist.DOWNTREND_PIVOT_LOW_MODEL_V4_PATH),
+        ]:
+            self.assertTrue(p_v3.exists(), f"Missing preserved V3 model {p_v3}")
+            self.assertTrue(p_v4.exists(), f"Missing V4 model {p_v4}")
+
+        m_v3 = serve_watchlist.get_all_pivot_models("v3")
+        m_v4 = serve_watchlist.get_all_pivot_models("v4")
+        self.assertEqual(set(m_v3.keys()), {"ut_high", "ut_low", "dt_high", "dt_low"})
+        self.assertEqual(set(m_v4.keys()), {"ut_high", "ut_low", "dt_high", "dt_low"})
+        for k in ("ut_high", "ut_low", "dt_high", "dt_low"):
+            self.assertEqual(m_v4[k].get("version"), "4.0")
+            self.assertIn("lgb_a_plus", m_v4[k])
+            self.assertIn("xgb_a_plus", m_v4[k])
+            self.assertIn("iso_calibrator", m_v4[k])
+
+        # 3. Query /api/chart on TWLO with model_ver=v3 vs model_ver=v4
+        r_v3 = self.client.get("/api/chart?symbol=TWLO&history=2y&model_ver=v3")
+        r_v4 = self.client.get("/api/chart?symbol=TWLO&history=2y&model_ver=v4")
+        self.assertEqual(r_v3.status_code, 200)
+        self.assertEqual(r_v4.status_code, 200)
+        ex_v3 = r_v3.get_json()["exhaustion"]
+        ex_v4 = r_v4.get_json()["exhaustion"]
+        self.assertEqual(ex_v3["model_ver"], "v3")
+        self.assertEqual(ex_v4["model_ver"], "v4")
+
+        # V3 and V4 must produce distinct probability series on TWLO
+        s_v3 = [pt["ut_high"] for pt in ex_v3["series"]]
+        s_v4 = [pt["ut_high"] for pt in ex_v4["series"]]
+        self.assertEqual(len(s_v3), len(s_v4))
+        self.assertNotEqual(s_v3, s_v4)
+
+        # 4. Verify strict intrabar trigger price monotonicity across thresholds (35% vs 50% vs 65%)
+        for ex in (ex_v3, ex_v4):
+            hi_evs_65 = [
+                e
+                for e in (ex["ut_high_events"] + ex["dt_high_events"])
+                if e["prob_pct"] >= 65.0 and (e["high"] - e["low"]) >= 0.50
+            ]
+            lo_evs_65 = [
+                e
+                for e in (ex["ut_low_events"] + ex["dt_low_events"])
+                if e["prob_pct"] >= 65.0 and (e["high"] - e["low"]) >= 0.50
+            ]
+            self.assertGreaterEqual(len(hi_evs_65), 1)
+            self.assertGreaterEqual(len(lo_evs_65), 1)
+
+            for e in hi_evs_65:
+                by_t = e["trigger_prices_by_thr"]
+                self.assertIn("35", by_t)
+                self.assertIn("50", by_t)
+                self.assertIn("65", by_t)
+                self.assertLess(by_t["35"], by_t["50"], f"High pivot {e['date']} 35% must trigger below 50%: {by_t}")
+                self.assertLess(by_t["50"], by_t["65"], f"High pivot {e['date']} 50% must trigger below 65%: {by_t}")
+                self.assertLessEqual(by_t["65"], e["high"] + 1e-6)
+                self.assertGreaterEqual(by_t["35"], e["low"] - 1e-6)
+
+            for e in lo_evs_65:
+                by_t = e["trigger_prices_by_thr"]
+                self.assertIn("35", by_t)
+                self.assertIn("50", by_t)
+                self.assertIn("65", by_t)
+                self.assertGreater(by_t["35"], by_t["50"], f"Low pivot {e['date']} 35% must trigger above 50%: {by_t}")
+                self.assertGreater(by_t["50"], by_t["65"], f"Low pivot {e['date']} 50% must trigger above 65%: {by_t}")
+                self.assertGreaterEqual(by_t["65"], e["low"] - 1e-6)
+                self.assertLessEqual(by_t["35"], e["high"] + 1e-6)
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
