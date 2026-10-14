@@ -487,9 +487,129 @@ class TestWatchlistViewer(unittest.TestCase):
                 self.assertGreaterEqual(by_t["65"], e["low"] - 1e-6)
                 self.assertLessEqual(by_t["35"], e["high"] + 1e-6)
 
+    def test_tws_developing_daily_bar_poller_and_realtime_pivot_alerts(self):
+        # 1. Verify UI toggle and alert banner elements exist in HTML
+        resp_html = self.client.get("/")
+        self.assertEqual(resp_html.status_code, 200)
+        html = resp_html.get_data(as_text=True)
+        self.assertIn("cfg_tws_live_poll", html)
+        self.assertIn("tws_poll_status_badge", html)
+        self.assertIn("tws_pivot_alert_bar", html)
+        self.assertIn("toggleTwsLivePolling", html)
+        self.assertIn("triggerTwsPollNow", html)
+        self.assertIn("toggleHideTwsAlerts", html)
+        self.assertIn("btn_toggle_tws_alerts", html)
+        self.assertIn("fitYAxisToVisibleBars", html)
+        self.assertIn("autoscaleInfoProvider", html)
+
+        # 2. Verify TWS pacing interval calculation and failure backoff
+        iv_10 = serve_watchlist.compute_tws_poll_interval(10, 0)
+        iv_28 = serve_watchlist.compute_tws_poll_interval(28, 0)
+        iv_80 = serve_watchlist.compute_tws_poll_interval(80, 0)
+        iv_backoff = serve_watchlist.compute_tws_poll_interval(28, 2)
+        self.assertGreaterEqual(iv_10, 10.0)
+        self.assertGreater(iv_28, iv_10)
+        self.assertGreater(iv_80, iv_28)
+        self.assertGreater(iv_backoff, iv_28)
+        self.assertLessEqual(iv_backoff, 60.0)
+
+        # 3. Simulate a developing daily bar poll cycle with a strong climax spike on TWLO
+        import datastore
+        import pandas as pd
+
+        df_twlo = datastore.load_bars("TWLO")
+        self.assertIsNotNone(df_twlo)
+        last_close = float(df_twlo["close"].iloc[-1])
+        next_date = (df_twlo.index[-1] + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+
+        try:
+            with serve_watchlist._TWS_LOCK:
+                serve_watchlist._TWS_POLLING_ENABLED = True
+                serve_watchlist._TWS_PORTFOLIO_DEV_BARS.clear()
+                serve_watchlist._TWS_PIVOT_SCORES.clear()
+                serve_watchlist._TWS_ALERTS.clear()
+                serve_watchlist._TWS_ALERTED_KEYS.clear()
+
+            sim_bars_1 = {
+                "TWLO": {
+                    "symbol": "TWLO",
+                    "date": next_date,
+                    "open": round(last_close * 1.03, 4),
+                    "high": round(last_close * 1.24, 4),
+                    "low": round(last_close * 1.02, 4),
+                    "close": round(last_close * 1.11, 4),
+                    "volume": 12_500_000.0,
+                    "prev_close": last_close,
+                    "source": "tws_sim",
+                }
+            }
+            payload_1 = serve_watchlist.execute_portfolio_tws_poll_cycle(
+                threshold=35.0,
+                model_ver="v3",
+                simulate_tws_bars=sim_bars_1,
+            )
+            self.assertIn("TWLO", payload_1["developing_bars"])
+            self.assertIn("TWLO", payload_1["pivot_scores"])
+            piv_twlo = payload_1["pivot_scores"]["TWLO"]
+            self.assertIn("scores", piv_twlo)
+            self.assertEqual(
+                set(piv_twlo["scores"].keys()),
+                {"ut_high", "ut_low", "dt_high", "dt_low", "maj_ut_top", "maj_dt_low"},
+            )
+            self.assertGreaterEqual(len(payload_1["alerts"]), 1)
+
+            # 4. Verify monotonic intraday High/Low/Volume preservation across subsequent ticks
+            sim_bars_2 = {
+                "TWLO": {
+                    "symbol": "TWLO",
+                    "date": next_date,
+                    "open": round(last_close * 1.03, 4),
+                    "high": round(last_close * 1.15, 4),  # lower than prior high 1.24x -> must keep 1.24x
+                    "low": round(last_close * 1.01, 4),   # new intraday low -> must update to 1.01x
+                    "close": round(last_close * 1.14, 4),
+                    "volume": 14_000_000.0,
+                    "prev_close": last_close,
+                    "source": "tws_sim",
+                }
+            }
+            payload_2 = serve_watchlist.execute_portfolio_tws_poll_cycle(
+                threshold=35.0,
+                model_ver="v3",
+                simulate_tws_bars=sim_bars_2,
+            )
+            dev_twlo = payload_2["developing_bars"]["TWLO"]
+            self.assertAlmostEqual(dev_twlo["high"], round(last_close * 1.24, 4), places=3)
+            self.assertAlmostEqual(dev_twlo["low"], round(last_close * 1.01, 4), places=3)
+            self.assertEqual(dev_twlo["volume"], 14_000_000.0)
+
+            # 5. Verify /api/chart fuses the developing daily bar onto TWLO when polling is enabled
+            r_chart = self.client.get("/api/chart?symbol=TWLO&history=3m&model_ver=v3")
+            self.assertEqual(r_chart.status_code, 200)
+            chart_bars = r_chart.get_json()["bars"]
+            self.assertEqual(chart_bars[-1]["time"], next_date)
+            self.assertAlmostEqual(chart_bars[-1]["high"], round(last_close * 1.24, 4), places=2)
+
+            # 6. Verify /api/tws_live_poll GET and POST clear_alerts / toggle off
+            r_get = self.client.get("/api/tws_live_poll")
+            self.assertEqual(r_get.status_code, 200)
+            self.assertTrue(r_get.get_json()["enabled"])
+
+            r_clr = self.client.post("/api/tws_live_poll", json={"action": "clear_alerts"})
+            self.assertEqual(r_clr.status_code, 200)
+            self.assertEqual(len(r_clr.get_json()["alerts"]), 0)
+        finally:
+            self.client.post("/api/tws_live_poll", json={"action": "toggle", "enabled": False})
+            with serve_watchlist._TWS_LOCK:
+                serve_watchlist._TWS_POLLING_ENABLED = False
+                serve_watchlist._TWS_PORTFOLIO_DEV_BARS.clear()
+                serve_watchlist._TWS_PIVOT_SCORES.clear()
+                serve_watchlist._TWS_ALERTS.clear()
+                serve_watchlist._TWS_ALERTED_KEYS.clear()
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
 
 

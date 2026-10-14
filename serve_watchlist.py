@@ -32,13 +32,17 @@ watchlists and viewing interactive charts across all asset classes in the EP uni
 from __future__ import annotations
 
 import argparse
+import asyncio
+import datetime as dt
 import json
 import math
 import pickle
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 import joblib
 import numpy as np
@@ -54,6 +58,11 @@ import scanner_core
 import thematic_engine
 import train_all_pivot_models as tap
 import train_uptrend_pivot_model as tup
+
+try:
+    import yfinance as yf
+except ImportError:
+    yf = None
 
 app = Flask(__name__)
 
@@ -136,6 +145,34 @@ _NAMES_MAP: Dict[str, str] = {}
 _ETF_SET: set[str] = set()
 _COMPOSITE_BAR_CACHE: Dict[str, Tuple[float, pd.DataFrame, List[str]]] = {}
 _CATALOG_CACHE: Optional[Tuple[float, Dict[str, Any]]] = None
+
+# Real-Time TWS Developing Daily Bar & ML Pivot Alert Engine State
+_TWS_LOCK = threading.Lock()
+_TWS_POLLING_ENABLED: bool = False
+_TWS_PORTFOLIO_DEV_BARS: Dict[str, Dict[str, Any]] = {}
+_TWS_PIVOT_SCORES: Dict[str, Dict[str, Any]] = {}
+_TWS_ALERTS: List[Dict[str, Any]] = []
+_TWS_ALERTED_KEYS: set[Tuple[str, str, str]] = set()
+_TWS_QUALIFIED_CONTRACTS: Dict[str, Any] = {}
+_TWS_STATUS: Dict[str, Any] = {
+    "enabled": False,
+    "connected": False,
+    "source": "off",
+    "host": "127.0.0.1",
+    "port": 7497,
+    "watchlist_name": "Portfolio",
+    "watchlist_size": 0,
+    "poll_interval_sec": 12.0,
+    "last_poll_ts": None,
+    "last_poll_time_et": None,
+    "last_duration_s": 0.0,
+    "consecutive_failures": 0,
+    "last_error": None,
+    "trading_date": None,
+}
+_TWS_THREAD: Optional[threading.Thread] = None
+_TWS_WAKE_EVENT = threading.Event()
+
 
 
 def _clean_val(v: Any, default: Any = None) -> Any:
@@ -1296,7 +1333,9 @@ def build_composite_bars(group_type: str, group_name: str, top_k: int = 25) -> T
 
 
 def resolve_asset_bars(asset_id: str) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-    """Loads OHLCV bars for any Stock, SPDR/Sector ETF, Sector composite, or Theme composite."""
+    """Loads OHLCV bars for any Stock, SPDR/Sector ETF, Sector composite, or Theme composite.
+    When Portfolio Live TWS Developing Bar polling is active and a developing bar exists for this symbol,
+    fuses the live developing daily bar [Open, High, Low, Current, Volume] at the tail of the DataFrame."""
     meta = parse_asset_id(asset_id)
     a_type = meta["type"]
 
@@ -1305,7 +1344,26 @@ def resolve_asset_bars(asset_id: str) -> Tuple[pd.DataFrame, Dict[str, Any]]:
         raw_df = datastore.load_bars(sym)
         if raw_df is None or raw_df.empty:
             return pd.DataFrame(), meta
-        return raw_df.copy(), meta
+        out_df = raw_df.copy()
+        with _TWS_LOCK:
+            dev_bar = dict(_TWS_PORTFOLIO_DEV_BARS[sym]) if (_TWS_POLLING_ENABLED and sym in _TWS_PORTFOLIO_DEV_BARS) else None
+        if dev_bar and dev_bar.get("date") and dev_bar.get("close", 0.0) > 0:
+            dev_ts = pd.Timestamp(dev_bar["date"])
+            live_row = pd.DataFrame(
+                [
+                    {
+                        "open": float(dev_bar["open"]),
+                        "high": float(dev_bar["high"]),
+                        "low": float(dev_bar["low"]),
+                        "close": float(dev_bar["close"]),
+                        "volume": float(dev_bar.get("volume", 0.0)),
+                    }
+                ],
+                index=[dev_ts],
+            )
+            out_df = pd.concat([out_df[~out_df.index.isin([dev_ts])], live_row]).sort_index()
+            meta["developing_bar"] = dev_bar
+        return out_df, meta
 
     if a_type in ("sector", "theme"):
         comp_df, members = build_composite_bars(a_type, meta["key"])
@@ -1900,6 +1958,16 @@ def enrich_watchlist_items(groups: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                         item_copy["close"] = round(float(c[-1]), 2)
                         item_copy["ret_1d"] = round(float((c[-1] / c[-2] - 1.0) * 100.0), 2)
                         item_copy["ret_1m"] = round(float((c[-1] / c[-min(len(c), 22)] - 1.0) * 100.0), 2)
+                with _TWS_LOCK:
+                    dev_b = dict(_TWS_PORTFOLIO_DEV_BARS[sym]) if (_TWS_POLLING_ENABLED and sym in _TWS_PORTFOLIO_DEV_BARS) else None
+                    piv_s = dict(_TWS_PIVOT_SCORES[sym]) if (_TWS_POLLING_ENABLED and sym in _TWS_PIVOT_SCORES) else None
+                if dev_b and dev_b.get("close", 0.0) > 0:
+                    item_copy["close"] = round(float(dev_b["close"]), 2)
+                    if dev_b.get("ret_1d") is not None:
+                        item_copy["ret_1d"] = round(float(dev_b["ret_1d"]), 2)
+                    item_copy["live_bar"] = dev_b
+                if piv_s:
+                    item_copy["live_pivot"] = piv_s
             elif parsed["type"] == "sector" and parsed["key"] in sec_scores:
                 sr = sec_scores[parsed["key"]]
                 item_copy["ret_1d"] = round(float(_clean_val(sr.get("w1_ret"), 0.0)) / 5.0, 2)
@@ -2532,6 +2600,692 @@ def api_annotations():
     with open(fpath, "w", encoding="utf-8") as f:
         json.dump({"symbol": sym, "drawings": data.get("drawings", [])}, f, indent=2)
     return jsonify({"status": "ok"})
+
+
+# ==============================================================================
+# Real-Time TWS Developing Daily Bar Poller & ML Pivot Alert Engine
+# ==============================================================================
+
+_PIVOT_MODEL_META = [
+    ("maj_ut_top", "is_near_major_ut_top", "👑 Major Top", "#fbbf24", True),
+    ("maj_dt_low", "is_near_major_dt_bottom", "🚀 Major Bottom", "#10b981", False),
+    ("ut_high", "is_near_local_high", "🔥 UT High", "#fb923c", True),
+    ("ut_low", "is_near_uptrend_low", "💎 UT Low", "#38bdf8", False),
+    ("dt_high", "is_near_downtrend_high", "🔻 DT High", "#c084fc", True),
+    ("dt_low", "is_near_downtrend_low", "🟢 DT Low", "#4ade80", False),
+]
+
+
+def compute_tws_poll_interval(num_symbols: int, consecutive_failures: int = 0) -> float:
+    """Computes safe polling cadence (in seconds) respecting Interactive Brokers TWS API pacing rules:
+    - TWS enforces a 50 messages/sec ceiling and a 100 simultaneous market data lines default limit.
+    - Chunking subscriptions in batches of <=45 symbols and spacing cycles by max(10s, 6s + 0.22s * N)
+      guarantees we stay well under TWS pacing limits while keeping developing daily bars responsive."""
+    n = max(1, int(num_symbols))
+    base = max(10.0, min(60.0, 6.0 + 0.22 * n))
+    if consecutive_failures > 0:
+        base = min(60.0, base * (1.35 ** min(int(consecutive_failures), 4)))
+    return round(float(base), 1)
+
+
+def get_portfolio_watchlist_group(group_id: Optional[str] = None) -> Tuple[str, str, List[str]]:
+    """Resolves the target watchlist (defaults to 'Portfolio' group, or active group) and extracts ticker symbols."""
+    wl_data = load_watchlists()
+    groups = wl_data.get("groups", [])
+    target_grp = None
+    if group_id:
+        target_grp = next((g for g in groups if g.get("id") == group_id), None)
+    if target_grp is None:
+        target_grp = next(
+            (g for g in groups if "portfolio" in str(g.get("name", "")).lower()),
+            None,
+        )
+    if target_grp is None and groups:
+        active_id = wl_data.get("active_group_id")
+        target_grp = next((g for g in groups if g.get("id") == active_id), groups[0])
+    if target_grp is None:
+        return "", "Portfolio", []
+
+    syms: List[str] = []
+    seen: set[str] = set()
+    for it in target_grp.get("items", []):
+        parsed = parse_asset_id(it.get("id", ""))
+        if parsed["type"] in ("stock", "etf"):
+            s = parsed["key"]
+            if s and s not in seen:
+                seen.add(s)
+                syms.append(s)
+        elif parsed["type"] == "ratio":
+            for leg_key in ("num", "den"):
+                p_leg = parse_asset_id(parsed.get(leg_key, ""))
+                if p_leg["type"] in ("stock", "etf") and p_leg["key"] not in seen:
+                    seen.add(p_leg["key"])
+                    syms.append(p_leg["key"])
+    return str(target_grp.get("id", "")), str(target_grp.get("name", "Portfolio")), syms
+
+
+def _get_current_us_trading_date_str() -> str:
+    """Returns the current US/Eastern trading session date string (YYYY-MM-DD)."""
+    now_et = dt.datetime.now(ZoneInfo("America/New_York"))
+    d = now_et.date()
+    while d.weekday() >= 5:
+        d -= dt.timedelta(days=1)
+    return d.strftime("%Y-%m-%d")
+
+
+def _valid_pos_price(val: Any) -> Optional[float]:
+    if val is None:
+        return None
+    try:
+        f = float(val)
+        if math.isnan(f) or math.isinf(f) or f <= 0.0:
+            return None
+        return f
+    except (ValueError, TypeError):
+        return None
+
+
+def _poll_tws_developing_bars(
+    symbols: List[str],
+    ports: Tuple[int, ...] = (7497, 7496, 4002, 4001),
+) -> Tuple[Dict[str, Dict[str, Any]], str, Optional[int], Optional[str]]:
+    """Polls Interactive Brokers TWS / IB Gateway for real-time daily OHLCV developing bars.
+    Respects TWS pacing rules (<=45 symbols per chunk, <=25 req/sec) and handles connection drops cleanly."""
+    if not symbols:
+        return {}, "tws", None, None
+
+    try:
+        from ib_async import IB, Stock
+    except Exception as e:
+        return {}, "tws_unavailable", None, f"ib_async import error: {e}"
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    ib = IB()
+    connected_port = None
+    last_err = None
+
+    try:
+        for p in ports:
+            try:
+                cid = 89 + (int(time.time() * 10) % 7)
+                ib.connect("127.0.0.1", p, clientId=cid, timeout=2.8, readonly=True)
+                if ib.isConnected():
+                    connected_port = p
+                    break
+            except Exception as ce:
+                last_err = f"Port {p}: {ce}"
+
+        if not connected_port or not ib.isConnected():
+            return {}, "tws_failed", None, last_err or "Could not connect to TWS (ports 7497/7496/4002/4001)"
+
+        trading_date = _get_current_us_trading_date_str()
+        out_bars: Dict[str, Dict[str, Any]] = {}
+
+        # Qualify any contracts not yet cached (chunked at 40 symbols to respect TWS 50 msg/s pacing)
+        with _TWS_LOCK:
+            cached_contracts = dict(_TWS_QUALIFIED_CONTRACTS)
+
+        unqualified = [s for s in symbols if s not in cached_contracts]
+        for i in range(0, len(unqualified), 40):
+            batch_syms = unqualified[i : i + 40]
+            batch_contracts = [Stock(s, "SMART", "USD") for s in batch_syms]
+            try:
+                ib.qualifyContracts(*batch_contracts)
+                for s, c in zip(batch_syms, batch_contracts):
+                    if getattr(c, "conId", 0):
+                        cached_contracts[s] = c
+            except Exception:
+                pass
+            if i + 40 < len(unqualified):
+                ib.sleep(0.35)
+
+        with _TWS_LOCK:
+            _TWS_QUALIFIED_CONTRACTS.update(cached_contracts)
+
+        # Request market data in chunks of <=45 symbols (staying well below TWS 100-line & 50 msg/s limits)
+        try:
+            ib.reqMarketDataType(3)  # Enable delayed fallback if any exchange lacks live subscription
+            ib.reqMarketDataType(1)  # Prefer real-time Level 1 stream
+        except Exception:
+            pass
+
+        chunk_size = 45
+        for i in range(0, len(symbols), chunk_size):
+            chunk_syms = symbols[i : i + chunk_size]
+            active_Pairs: List[Tuple[str, Any, Any]] = []
+            for s in chunk_syms:
+                c = cached_contracts.get(s)
+                if not c:
+                    continue
+                try:
+                    t = ib.reqMktData(c, "", snapshot=False, regulatorySnapshot=False)
+                    active_Pairs.append((s, c, t))
+                except Exception:
+                    pass
+
+            # Allow 1.35s for TWS to populate Open, High, Low, Last, Bid/Ask, Close, Volume
+            ib.sleep(1.35)
+
+            for s, c, t in active_Pairs:
+                p_last = _valid_pos_price(getattr(t, "last", None))
+                p_bid = _valid_pos_price(getattr(t, "bid", None))
+                p_ask = _valid_pos_price(getattr(t, "ask", None))
+                p_close_prev = _valid_pos_price(getattr(t, "close", None))
+                p_open = _valid_pos_price(getattr(t, "open", None))
+                p_high = _valid_pos_price(getattr(t, "high", None))
+                p_low = _valid_pos_price(getattr(t, "low", None))
+
+                mid = round(0.5 * (p_bid + p_ask), 4) if (p_bid and p_ask) else (p_bid or p_ask)
+                cur_px = p_last or mid or p_close_prev
+                if not cur_px:
+                    continue
+
+                o_px = p_open or p_close_prev or cur_px
+                h_px = max( [x for x in (p_high, o_px, cur_px) if x is not None] )
+                l_px = min( [x for x in (p_low, o_px, cur_px) if x is not None] )
+
+                raw_vol = getattr(t, "volume", None)
+                vol_sh = 0.0
+                if raw_vol is not None and not (isinstance(raw_vol, float) and (math.isnan(raw_vol) or math.isinf(raw_vol))) and raw_vol > 0:
+                    # TWS US stock volume tick is reported in round lots (100 shares)
+                    vol_sh = float(raw_vol) * 100.0
+
+                out_bars[s] = {
+                    "symbol": s,
+                    "date": trading_date,
+                    "open": round(float(o_px), 4),
+                    "high": round(float(h_px), 4),
+                    "low": round(float(l_px), 4),
+                    "close": round(float(cur_px), 4),
+                    "prev_close": round(float(p_close_prev), 4) if p_close_prev else None,
+                    "volume": round(float(vol_sh), 0),
+                    "source": f"TWS:{connected_port}",
+                    "updated_at": dt.datetime.now(ZoneInfo("America/New_York")).strftime("%H:%M:%S ET"),
+                }
+
+            for _, c, _ in active_Pairs:
+                try:
+                    ib.cancelMktData(c)
+                except Exception:
+                    pass
+
+            if i + chunk_size < len(symbols):
+                ib.sleep(0.35)
+
+        return out_bars, f"TWS:{connected_port}", connected_port, None
+    except Exception as e:
+        return {}, "tws_error", connected_port, str(e)
+    finally:
+        try:
+            if ib.isConnected():
+                ib.disconnect()
+        except Exception:
+            pass
+        try:
+            loop.close()
+        except Exception:
+            pass
+
+
+def _poll_yfinance_fallback_bars(symbols: List[str]) -> Dict[str, Dict[str, Any]]:
+    """Resilient fallback when TWS is offline/unreachable or missing quotes for specific tickers."""
+    if not symbols or yf is None:
+        return {}
+    out: Dict[str, Dict[str, Any]] = {}
+    trading_date = _get_current_us_trading_date_str()
+    now_str = dt.datetime.now(ZoneInfo("America/New_York")).strftime("%H:%M:%S ET")
+    try:
+        data = yf.download(
+            tickers=symbols,
+            period="2d",
+            interval="5m",
+            group_by="ticker",
+            auto_adjust=True,
+            progress=False,
+            threads=True,
+        )
+        if data is not None and not data.empty:
+            for sym in symbols:
+                try:
+                    sub = data if len(symbols) == 1 else (data[sym] if sym in data.columns.levels[0] else pd.DataFrame())
+                    if sub is None or sub.empty:
+                        continue
+                    sub = sub.dropna(subset=["Close"]).copy()
+                    if sub.empty:
+                        continue
+                    last_day = sub.index[-1].strftime("%Y-%m-%d")
+                    day_slice = sub[sub.index.strftime("%Y-%m-%d") == last_day]
+                    if day_slice.empty:
+                        day_slice = sub.tail(1)
+                    o_px = float(day_slice["Open"].iloc[0])
+                    h_px = float(day_slice["High"].max())
+                    l_px = float(day_slice["Low"].min())
+                    c_px = float(day_slice["Close"].iloc[-1])
+                    v_sh = float(day_slice["Volume"].sum())
+                    out[sym] = {
+                        "symbol": sym,
+                        "date": last_day or trading_date,
+                        "open": round(o_px, 4),
+                        "high": round(max(h_px, o_px, c_px), 4),
+                        "low": round(min(l_px, o_px, c_px), 4),
+                        "close": round(c_px, 4),
+                        "prev_close": None,
+                        "volume": round(v_sh, 0),
+                        "source": "YF-Fallback",
+                        "updated_at": now_str,
+                    }
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return out
+
+
+def execute_portfolio_tws_poll_cycle(
+    group_id: Optional[str] = None,
+    threshold_pct: float = 50.0,
+    model_ver: str = "v4",
+    simulate_tws_bars: Optional[Dict[str, Dict[str, Any]]] = None,
+    threshold: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Executes one complete polling cycle for the Portfolio (or specified) watchlist:
+    1. Loads historical daily candles from local datastore for all watchlist symbols.
+    2. Polls TWS API for real-time developing daily bars (with monotonic high/low/volume fusion
+       and automatic fallback to cached/yfinance data if TWS fails).
+    3. Evaluates all 6 ML Structural & Major Reversal Pivot models on the developing daily bars.
+    4. Emits real-time alerts whenever any ticker crosses the ML pivot probability threshold."""
+    if threshold is not None:
+        threshold_pct = float(threshold)
+    t0 = time.time()
+    gid, gname, symbols = get_portfolio_watchlist_group(group_id)
+    if simulate_tws_bars is not None:
+        symbols = list(simulate_tws_bars.keys())
+    interval_sec = compute_tws_poll_interval(len(symbols))
+    now_et_str = dt.datetime.now(ZoneInfo("America/New_York")).strftime("%H:%M:%S ET")
+    trading_date = _get_current_us_trading_date_str()
+
+    if simulate_tws_bars is not None:
+        polled_bars = dict(simulate_tws_bars)
+        source_str = "TWS:Simulated"
+        conn_port = 7497
+        tws_err = None
+    else:
+        polled_bars, source_str, conn_port, tws_err = _poll_tws_developing_bars(symbols)
+        # If TWS failed completely or missed symbols, try yfinance fallback for missing symbols
+        missing_syms = [s for s in symbols if s not in polled_bars]
+        if missing_syms:
+            yf_bars = _poll_yfinance_fallback_bars(missing_syms)
+            for s, yb in yf_bars.items():
+                polled_bars[s] = yb
+            if not conn_port and yf_bars:
+                source_str = "YF-Fallback (TWS Offline)"
+
+    with _TWS_LOCK:
+        prev_dev_bars = dict(_TWS_PORTFOLIO_DEV_BARS)
+
+    # Fuse historical daily candles + monotonic developing daily bar for each symbol
+    feature_rows: List[pd.DataFrame] = []
+    row_symbols: List[str] = []
+    updated_dev_bars: Dict[str, Dict[str, Any]] = {}
+
+    for sym in symbols:
+        hist_df = datastore.load_bars(sym)
+        if hist_df is None or hist_df.empty or len(hist_df) < 60:
+            continue
+
+        last_hist_date = hist_df.index[-1].strftime("%Y-%m-%d")
+        prev_bar_close = float(hist_df["close"].iloc[-1])
+        fresh = polled_bars.get(sym)
+        prior_dev = prev_dev_bars.get(sym)
+
+        if fresh and fresh.get("close", 0.0) > 0:
+            b_date = str(fresh.get("date") or trading_date)
+            # If b_date matches last_hist_date, prior close is hist_df.iloc[-2]
+            if b_date == last_hist_date and len(hist_df) >= 2:
+                prev_bar_close = float(hist_df["close"].iloc[-2])
+            elif fresh.get("prev_close") and float(fresh["prev_close"]) > 0:
+                prev_bar_close = float(fresh["prev_close"])
+
+            o_px = float(fresh["open"])
+            h_px = float(fresh["high"])
+            l_px = float(fresh["low"])
+            c_px = float(fresh["close"])
+            v_sh = float(fresh.get("volume", 0.0))
+
+            # Monotonic high/low/volume preservation across same trading session
+            if prior_dev and prior_dev.get("date") == b_date:
+                h_px = max(h_px, float(prior_dev.get("high", h_px)), c_px, o_px)
+                l_px = min(l_px, float(prior_dev.get("low", l_px)), c_px, o_px)
+                v_sh = max(v_sh, float(prior_dev.get("volume", 0.0)))
+            if v_sh <= 0.0:
+                # Estimate volume from recent 20d median if TWS tick volume is still warming up
+                v_sh = float(hist_df["volume"].tail(20).median()) * 0.5
+
+            ret_1d = round(((c_px / prev_bar_close) - 1.0) * 100.0, 2) if prev_bar_close > 0 else 0.0
+            dev_entry = {
+                "symbol": sym,
+                "date": b_date,
+                "open": round(o_px, 4),
+                "high": round(h_px, 4),
+                "low": round(l_px, 4),
+                "close": round(c_px, 4),
+                "prev_close": round(prev_bar_close, 4),
+                "ret_1d": ret_1d,
+                "ret_1d_pct": ret_1d,
+                "volume": round(v_sh, 0),
+                "source": fresh.get("source", source_str),
+                "updated_at": fresh.get("updated_at", now_et_str),
+                "stale": False,
+            }
+        elif prior_dev and prior_dev.get("close", 0.0) > 0:
+            # Keep prior developing bar if single poll missed this symbol
+            dev_entry = dict(prior_dev)
+            dev_entry["stale"] = True
+        else:
+            # Fallback to latest datastore daily candle so Portfolio table is always populated
+            last_r = hist_df.iloc[-1]
+            prev_c = float(hist_df["close"].iloc[-2]) if len(hist_df) >= 2 else float(last_r["open"])
+            c_px = float(last_r["close"])
+            ret_1d = round(((c_px / prev_c) - 1.0) * 100.0, 2) if prev_c > 0 else 0.0
+            dev_entry = {
+                "symbol": sym,
+                "date": last_hist_date,
+                "open": round(float(last_r["open"]), 4),
+                "high": round(float(last_r["high"]), 4),
+                "low": round(float(last_r["low"]), 4),
+                "close": round(c_px, 4),
+                "prev_close": round(prev_c, 4),
+                "ret_1d": ret_1d,
+                "ret_1d_pct": ret_1d,
+                "volume": round(float(last_r["volume"]), 0),
+                "source": "Datastore-EOD",
+                "updated_at": now_et_str,
+                "stale": True,
+            }
+
+        updated_dev_bars[sym] = dev_entry
+
+        # Construct 260-bar tail + developing bar for fast causal 6-model feature extraction
+        dev_ts = pd.Timestamp(dev_entry["date"])
+        live_row = pd.DataFrame(
+            [
+                {
+                    "open": float(dev_entry["open"]),
+                    "high": float(dev_entry["high"]),
+                    "low": float(dev_entry["low"]),
+                    "close": float(dev_entry["close"]),
+                    "volume": float(dev_entry["volume"]),
+                }
+            ],
+            index=[dev_ts],
+        )
+        base_slice = hist_df[~hist_df.index.isin([dev_ts])].tail(260)
+        df_fused = pd.concat([base_slice, live_row]).sort_index()
+        try:
+            b_feat = tap.compute_all_pivot_features(df_fused, symbol=None)
+            last_feat = b_feat.iloc[[-1]].copy()
+            feature_rows.append(last_feat)
+            row_symbols.append(sym)
+        except Exception:
+            pass
+
+    # Batch-score all 6 ML Pivot models across all developing bars in ~0.12s
+    models = get_all_pivot_models(model_ver)
+    new_pivot_scores: Dict[str, Dict[str, Any]] = {}
+    new_alerts_this_cycle: List[Dict[str, Any]] = []
+
+    if feature_rows and models:
+        batch_df = pd.concat(feature_rows, ignore_index=True)
+        score_arrays: Dict[str, Tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+        for m_key, mask_col, _, _, _ in _PIVOT_MODEL_META:
+            if m_key in models:
+                p_dual, p_ex, p_fb = tap.score_dual_model_on_features(batch_df, models[m_key], mask_col)
+                score_arrays[m_key] = (p_dual * 100.0, p_ex * 100.0, p_fb * 100.0)
+            else:
+                z = np.zeros(len(batch_df))
+                score_arrays[m_key] = (z, z, z)
+
+        for idx_r, sym in enumerate(row_symbols):
+            dev_b = updated_dev_bars[sym]
+            is_ut = bool(batch_df["is_primary_uptrend"].iloc[idx_r])
+            scores_sym: Dict[str, float] = {}
+            best_prob = 0.0
+            best_meta = _PIVOT_MODEL_META[2]
+
+            for meta_entry in _PIVOT_MODEL_META:
+                m_key, _, m_label, m_color, is_hi = meta_entry
+                val_pct = round(float(score_arrays[m_key][0][idx_r]), 1)
+                scores_sym[m_key] = val_pct
+                if val_pct > best_prob:
+                    best_prob = val_pct
+                    best_meta = meta_entry
+
+            m_key, _, m_label, m_color, is_hi = best_meta
+            at_ex_pct = round(float(score_arrays[m_key][1][idx_r]), 1)
+            fb_pct = round(float(score_arrays[m_key][2][idx_r]), 1)
+
+            piv_info = {
+                "symbol": sym,
+                "date": dev_b["date"],
+                "regime": "UT" if is_ut else "DT",
+                "scores": scores_sym,
+                "top_model": m_key,
+                "top_pivot_type": m_key,
+                "top_label": m_label,
+                "top_pivot_label": m_label,
+                "top_color": m_color,
+                "top_prob_pct": best_prob,
+                "at_extreme_pct": at_ex_pct,
+                "full_bar_pct": fb_pct,
+                "is_high_pivot": is_hi,
+                "Triggered": bool(best_prob >= threshold_pct),
+                "has_pivot": bool(best_prob >= threshold_pct),
+            }
+            new_pivot_scores[sym] = piv_info
+
+            # Check for any model crossing threshold_pct on today's developing bar
+            for meta_entry in _PIVOT_MODEL_META:
+                mk, _, mlbl, mcol, m_is_hi = meta_entry
+                p_val = scores_sym.get(mk, 0.0)
+                if p_val >= threshold_pct:
+                    alert_key = (sym, dev_b["date"], mk)
+                    with _TWS_LOCK:
+                        already_fired = alert_key in _TWS_ALERTED_KEYS
+                        if not already_fired:
+                            _TWS_ALERTED_KEYS.add(alert_key)
+                    if not already_fired:
+                        extreme_px = dev_b["high"] if m_is_hi else dev_b["low"]
+                        alert_obj = {
+                            "id": f"{sym}_{dev_b['date']}_{mk}_{int(time.time()*1000)}",
+                            "symbol": sym,
+                            "date": dev_b["date"],
+                            "time_et": now_et_str,
+                            "model_key": mk,
+                            "pivot_type": mk,
+                            "model_label": mlbl,
+                            "pivot_label": mlbl,
+                            "color": mcol,
+                            "is_high_pivot": m_is_hi,
+                            "prob_pct": p_val,
+                            "current_price": dev_b["close"],
+                            "extreme_price": extreme_px,
+                            "bar_price": extreme_px,
+                            "open": dev_b["open"],
+                            "high": dev_b["high"],
+                            "low": dev_b["low"],
+                            "ret_1d": dev_b["ret_1d"],
+                            "source": dev_b["source"],
+                            "message": (
+                                f"🚨 {sym} Real-Time {mlbl} Detected ({p_val:.1f}% ≥ {threshold_pct:.0f}%) "
+                                f"| Developing {'High' if m_is_hi else 'Low'}: ${extreme_px:.2f} | Last: ${dev_b['close']:.2f} ({dev_b['ret_1d']:+.1f}%)"
+                            ),
+                        }
+                        new_alerts_this_cycle.append(alert_obj)
+
+    duration_s = round(time.time() - t0, 2)
+    with _TWS_LOCK:
+        _TWS_PORTFOLIO_DEV_BARS.update(updated_dev_bars)
+        _TWS_PIVOT_SCORES.update(new_pivot_scores)
+        if new_alerts_this_cycle:
+            _TWS_ALERTS.extend(new_alerts_this_cycle)
+            if len(_TWS_ALERTS) > 100:
+                del _TWS_ALERTS[:-100]
+
+        is_conn = conn_port is not None
+        if is_conn:
+            _TWS_STATUS["consecutive_failures"] = 0
+            _TWS_STATUS["last_error"] = None
+        else:
+            _TWS_STATUS["consecutive_failures"] = int(_TWS_STATUS.get("consecutive_failures", 0)) + 1
+            _TWS_STATUS["last_error"] = tws_err
+
+        _TWS_STATUS.update(
+            {
+                "connected": is_conn,
+                "tws_connected": is_conn,
+                "source": source_str,
+                "port": conn_port or _TWS_STATUS.get("port", 7497),
+                "tws_port": conn_port or _TWS_STATUS.get("port", 7497),
+                "watchlist_id": gid,
+                "watchlist_name": gname,
+                "watchlist_size": len(symbols),
+                "symbols_polled": len(updated_dev_bars),
+                "poll_interval_sec": interval_sec,
+                "last_poll_ts": time.time(),
+                "last_poll_time_et": now_et_str,
+                "last_poll_iso": now_et_str,
+                "last_duration_s": duration_s,
+                "trading_date": trading_date,
+            }
+        )
+        enabled_now = bool(_TWS_POLLING_ENABLED)
+
+    return {
+        "enabled": enabled_now,
+        "status": dict(_TWS_STATUS),
+        "developing_bars": updated_dev_bars,
+        "pivot_scores": new_pivot_scores,
+        "new_alerts": new_alerts_this_cycle,
+        "alerts": list(_TWS_ALERTS[-30:]),
+    }
+
+
+def _tws_background_poller_loop() -> None:
+    """Background daemon thread that polls TWS at the adaptive interval whenever _TWS_POLLING_ENABLED is True."""
+    while True:
+        with _TWS_LOCK:
+            enabled = _TWS_POLLING_ENABLED
+            gid = _TWS_STATUS.get("watchlist_id")
+            thr = float(_TWS_STATUS.get("threshold_pct", 50.0))
+            mver = str(_TWS_STATUS.get("model_ver", "v4"))
+        if not enabled:
+            _TWS_WAKE_EVENT.wait(timeout=2.0)
+            _TWS_WAKE_EVENT.clear()
+            continue
+
+        try:
+            res = execute_portfolio_tws_poll_cycle(group_id=gid, threshold_pct=thr, model_ver=mver)
+            wait_s = compute_tws_poll_interval(
+                int(res["status"].get("watchlist_size", 28)),
+                int(res["status"].get("consecutive_failures", 0)),
+            )
+        except Exception as e:
+            with _TWS_LOCK:
+                _TWS_STATUS["last_error"] = str(e)
+            wait_s = 15.0
+
+        _TWS_WAKE_EVENT.wait(timeout=wait_s)
+        _TWS_WAKE_EVENT.clear()
+
+
+def _ensure_tws_thread_started() -> None:
+    global _TWS_THREAD
+    if _TWS_THREAD is None or not _TWS_THREAD.is_alive():
+        _TWS_THREAD = threading.Thread(target=_tws_background_poller_loop, name="tws_portfolio_poller", daemon=True)
+        _TWS_THREAD.start()
+
+
+@app.route("/api/tws_live_poll", methods=["GET", "POST"])
+def api_tws_live_poll():
+    """GET returns current live TWS developing bars, 6-model ML pivot scores, and active alerts.
+    POST toggles polling on/off, triggers an immediate poll cycle, or clears alerts."""
+    global _TWS_POLLING_ENABLED
+    if request.method == "POST":
+        body = request.get_json(force=True) or {}
+        action = body.get("action", "toggle")
+        group_id = body.get("group_id")
+        thr = float(body.get("threshold", body.get("threshold_pct", 50.0)))
+        model_ver = str(body.get("model_ver", "v4")).lower()
+
+        if action == "clear_alerts":
+            with _TWS_LOCK:
+                _TWS_ALERTS.clear()
+                if body.get("reset_keys"):
+                    _TWS_ALERTED_KEYS.clear()
+                en_flag = bool(_TWS_POLLING_ENABLED)
+                st_copy = dict(_TWS_STATUS)
+                b_copy = dict(_TWS_PORTFOLIO_DEV_BARS)
+                s_copy = dict(_TWS_PIVOT_SCORES)
+            return jsonify(
+                {
+                    "enabled": en_flag,
+                    "status": st_copy,
+                    "developing_bars": b_copy,
+                    "pivot_scores": s_copy,
+                    "alerts": [],
+                }
+            )
+
+        if action in ("toggle", "set"):
+            enabled = bool(body.get("enabled", not _TWS_POLLING_ENABLED))
+            with _TWS_LOCK:
+                _TWS_POLLING_ENABLED = enabled
+                _TWS_STATUS["enabled"] = enabled
+                _TWS_STATUS["threshold_pct"] = thr
+                _TWS_STATUS["model_ver"] = model_ver
+                if group_id:
+                    _TWS_STATUS["watchlist_id"] = group_id
+                if not enabled:
+                    _TWS_STATUS["source"] = "off"
+                    _TWS_STATUS["connected"] = False
+                    _TWS_STATUS["tws_connected"] = False
+
+            if enabled:
+                _ensure_tws_thread_started()
+                # Run an immediate synchronous poll cycle so the chart & watchlist update right away
+                cycle_res = execute_portfolio_tws_poll_cycle(group_id=group_id, threshold_pct=thr, model_ver=model_ver)
+                _TWS_WAKE_EVENT.set()
+                return jsonify(cycle_res)
+            else:
+                _TWS_WAKE_EVENT.set()
+
+        elif action == "poll_now":
+            with _TWS_LOCK:
+                _TWS_STATUS["threshold_pct"] = thr
+                _TWS_STATUS["model_ver"] = model_ver
+                if group_id:
+                    _TWS_STATUS["watchlist_id"] = group_id
+            cycle_res = execute_portfolio_tws_poll_cycle(group_id=group_id, threshold_pct=thr, model_ver=model_ver)
+            return jsonify(cycle_res)
+
+    with _TWS_LOCK:
+        enabled_copy = bool(_TWS_POLLING_ENABLED)
+        status_copy = dict(_TWS_STATUS)
+        bars_copy = dict(_TWS_PORTFOLIO_DEV_BARS)
+        scores_copy = dict(_TWS_PIVOT_SCORES)
+        alerts_copy = list(_TWS_ALERTS[-30:])
+
+    return jsonify(
+        {
+            "enabled": enabled_copy,
+            "status": status_copy,
+            "developing_bars": bars_copy,
+            "pivot_scores": scores_copy,
+            "alerts": alerts_copy,
+        }
+    )
+
 
 
 # ==============================================================================
@@ -3284,6 +4038,20 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           <button class="icon-btn" onclick="deleteCurrentWatchlistGroup()" title="Delete Watchlist Folder">🗑️</button>
           <button class="icon-btn" onclick="exportWatchlistTradingView()" title="Export Watchlist to TradingView">📤</button>
         </div>
+
+        <!-- TWS Live Developing Daily Bar Polling Control Bar -->
+        <div id="tws_poll_control_bar" style="display:flex; align-items:center; justify-content:space-between; gap:6px; padding:5px 7px; border-radius:6px; background:#0b111e; border:1px solid #1e2d45;">
+          <label class="cfg-label" style="font-size:11px; font-weight:700; color:#e2e8f0; gap:5px;" title="Poll Interactive Brokers TWS API (with automatic yfinance/datastore fallback & TWS pacing compliance) to build real-time developing daily bars for the Portfolio watchlist and alert on ML Pivot High/Low detections">
+            <input type="checkbox" id="cfg_tws_live_poll" onchange="toggleTwsLivePolling(this.checked)">
+            <span>📡 Poll TWS Developing Bar</span>
+          </label>
+          <div style="display:flex; align-items:center; gap:4px;">
+            <span id="tws_poll_status_badge" style="font-size:9px; font-weight:800; padding:2px 5px; border-radius:4px; background:#162032; color:#94a3b8; border:1px solid #26354d; white-space:nowrap;">OFF</span>
+            <button class="icon-btn" id="btn_toggle_tws_alerts" onclick="toggleHideTwsAlerts()" style="width:auto; min-width:22px; height:22px; padding:0 5px; font-size:10px; font-weight:800;" title="Show or hide the Real-Time ML Pivot Alert Banner">🔔</button>
+            <button class="icon-btn" id="btn_tws_poll_now" onclick="triggerTwsPollNow()" style="width:22px; height:22px; font-size:11px;" title="Poll TWS Developing Daily Bars & Score 6 ML Pivot Models Now">🔄</button>
+          </div>
+        </div>
+
         <div style="display:flex; gap:5px; align-items:center;">
           <input type="text" id="wl_filter_input" class="search-input" placeholder="Filter watchlist items..." oninput="renderWatchlistItems()">
           <select id="wl_flag_filter" onchange="renderWatchlistItems()" style="background:#131b2b; color:#cbd5e1; border:1px solid #26354d; padding:5px; border-radius:5px; font-size:10px;">
@@ -3323,6 +4091,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         <span class="chart-main-name" id="hdr_asset_name">SPDR S&P 500 ETF Trust</span>
         <span id="hdr_ep_count_badge" style="display:none; background:rgba(16,185,129,0.18); color:#34d399; border:1px solid rgba(16,185,129,0.4); padding:2px 6px; border-radius:4px; font-size:10px; font-weight:700;"></span>
         <span id="hdr_climax_badge" style="display:none; padding:2px 7px; border-radius:4px; font-size:10px; font-weight:800;"></span>
+        <span id="hdr_dev_bar_badge" style="display:none; padding:2px 7px; border-radius:4px; font-size:10px; font-weight:800; background:rgba(56,189,248,0.16); color:#38bdf8; border:1px solid rgba(56,189,248,0.4);"></span>
         <div class="ohlc-legend" id="ohlc_legend"></div>
       </div>
 
@@ -3339,6 +4108,19 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         <button class="btn active" id="btn_settings_bar" onclick="toggleSettingsBar()">⚙️ Indicators & Larsson</button>
         <button class="btn" id="btn_draw_bar" onclick="toggleDrawBar()">✏️ Draw</button>
         <button class="btn" id="btn_fullscreen" onclick="toggleFullscreenChart()">⛶ Enlarge</button>
+      </div>
+    </div>
+
+    <!-- Real-Time TWS Developing Bar ML Pivot Alert Banner -->
+    <div id="tws_pivot_alert_bar" style="display:none; background:linear-gradient(90deg, rgba(244,63,94,0.18), rgba(245,158,11,0.15), rgba(16,185,129,0.15)); border-bottom:1px solid rgba(251,191,36,0.45); padding:6px 12px; align-items:center; justify-content:space-between; gap:10px; z-index:35; flex-shrink:0;">
+      <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap; flex:1; min-width:0;">
+        <span style="font-size:11px; font-weight:900; color:#fbbf24; letter-spacing:0.4px; white-space:nowrap;" id="tws_alert_banner_title">🚨 REAL-TIME ML PIVOT DETECTED:</span>
+        <div id="tws_alert_chips_wrap" style="display:flex; align-items:center; gap:6px; flex-wrap:wrap;"></div>
+      </div>
+      <div style="display:flex; align-items:center; gap:5px; flex-shrink:0;">
+        <button class="btn" id="btn_tws_alert_audio" onclick="toggleTwsAlertAudio()" style="padding:2px 7px; font-size:10px;" title="Toggle Audio Chime on New Real-Time Pivot Detection">🔊 Audio ON</button>
+        <button class="btn" onclick="toggleHideTwsAlerts(true)" style="padding:2px 7px; font-size:10px; color:#cbd5e1;" title="Hide Alert Banner (toggle 🔔 in Watchlist header to re-open)">🙈 Hide</button>
+        <button class="btn" onclick="clearTwsPivotAlerts()" style="padding:2px 7px; font-size:10px; color:#fca5a5;" title="Dismiss Current Alerts">✕ Clear</button>
       </div>
     </div>
 
@@ -3697,12 +4479,373 @@ function onMaSpanChange() {
   loadChart();
 }
 
+// TWS Live Developing Daily Bar & Real-Time ML Pivot Alert State
+let twsLiveState = {
+  enabled: false,
+  status: {},
+  developing_bars: {},
+  pivot_scores: {},
+  alerts: [],
+  seenAlertIds: new Set(),
+  audioEnabled: true,
+  alertsHidden: false,
+  pollTimer: null,
+  lastViewedBarSig: '',
+  isInitialSync: true,
+};
+
 window.addEventListener('DOMContentLoaded', async () => {
+  try {
+    twsLiveState.alertsHidden = localStorage.getItem('ep_wl_hide_tws_alerts') === '1';
+  } catch (e) {}
   restoreSavedMaSpans();
   initChartEngine();
-  await Promise.all([loadCatalog(), loadWatchlists()]);
+  await Promise.all([loadCatalog(), loadWatchlists(), syncTwsLivePollStatus()]);
   loadChart();
 });
+
+function toggleHideTwsAlerts(forceHide) {
+  if (typeof forceHide === 'boolean') {
+    twsLiveState.alertsHidden = forceHide;
+  } else {
+    twsLiveState.alertsHidden = !twsLiveState.alertsHidden;
+  }
+  try {
+    localStorage.setItem('ep_wl_hide_tws_alerts', twsLiveState.alertsHidden ? '1' : '0');
+  } catch (e) {}
+  renderTwsAlertBanner();
+  if (chart) {
+    setTimeout(() => {
+      const c = document.getElementById('chart_tv');
+      if (c && c.parentElement) {
+        chart.applyOptions({ width: c.parentElement.clientWidth, height: c.parentElement.clientHeight });
+      }
+      scheduleLarssonRender();
+      renderAllDrawings();
+    }, 30);
+  }
+}
+
+function playPivotAlertSound(isMajor = false) {
+  if (!twsLiveState.audioEnabled || twsLiveState.alertsHidden) return;
+  try {
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    if (!AudioCtx) return;
+    const ctx = new AudioCtx();
+    const freqs = isMajor ? [659.25, 880.0, 1174.66] : [587.33, 880.0];
+    freqs.forEach((f, idx) => {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(f, ctx.currentTime + idx * 0.13);
+      gain.gain.setValueAtTime(0.14, ctx.currentTime + idx * 0.13);
+      gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + idx * 0.13 + 0.25);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(ctx.currentTime + idx * 0.13);
+      osc.stop(ctx.currentTime + idx * 0.13 + 0.26);
+    });
+  } catch (e) {}
+}
+
+function toggleTwsAlertAudio() {
+  twsLiveState.audioEnabled = !twsLiveState.audioEnabled;
+  const btn = document.getElementById('btn_tws_alert_audio');
+  if (btn) {
+    btn.textContent = twsLiveState.audioEnabled ? '🔊 Audio ON' : '🔇 Muted';
+  }
+}
+
+async function clearTwsPivotAlerts() {
+  try {
+    const res = await fetch('/api/tws_live_poll', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'clear_alerts' }),
+    });
+    const data = await res.json();
+    applyTwsLivePollPayload(data, false);
+  } catch (e) {
+    const bar = document.getElementById('tws_pivot_alert_bar');
+    if (bar) bar.style.display = 'none';
+  }
+}
+
+function updateTwsPollStatusUI() {
+  const chk = document.getElementById('cfg_tws_live_poll');
+  if (chk) chk.checked = !!twsLiveState.enabled;
+
+  const badge = document.getElementById('tws_poll_status_badge');
+  if (!badge) return;
+  const st = twsLiveState.status || {};
+  if (!twsLiveState.enabled) {
+    badge.textContent = 'OFF';
+    badge.style.background = '#162032';
+    badge.style.color = '#94a3b8';
+    badge.style.borderColor = '#26354d';
+    badge.title = 'TWS Developing Daily Bar Polling is OFF';
+    updateHeaderDevelopingBarBadge();
+    return;
+  }
+
+  const src = st.source || 'polling';
+  const iv = st.poll_interval_sec ? `${Math.round(st.poll_interval_sec)}s` : '12s';
+  const nSyms = st.symbols_polled || Object.keys(twsLiveState.developing_bars || {}).length || 0;
+  if (st.tws_connected) {
+    badge.textContent = `🟢 TWS:${st.tws_port || 7497} (${nSyms} · ${iv})`;
+    badge.style.background = 'rgba(16,185,129,0.16)';
+    badge.style.color = '#34d399';
+    badge.style.borderColor = 'rgba(16,185,129,0.45)';
+  } else if (src.includes('yfinance')) {
+    badge.textContent = `🟡 YF-Fallback (${nSyms} · ${iv})`;
+    badge.style.background = 'rgba(245,158,11,0.16)';
+    badge.style.color = '#fbbf24';
+    badge.style.borderColor = 'rgba(245,158,11,0.45)';
+  } else if (st.consecutive_failures > 0) {
+    badge.textContent = `🟠 Retry (${iv})`;
+    badge.style.background = 'rgba(249,115,22,0.18)';
+    badge.style.color = '#fb923c';
+    badge.style.borderColor = 'rgba(249,115,22,0.45)';
+  } else {
+    badge.textContent = `🔵 LIVE (${nSyms} · ${iv})`;
+    badge.style.background = 'rgba(56,189,248,0.16)';
+    badge.style.color = '#38bdf8';
+    badge.style.borderColor = 'rgba(56,189,248,0.45)';
+  }
+  badge.title = `Source: ${src} | Watchlist: ${st.watchlist_name || 'Portfolio'} (${nSyms} syms) | Interval: ${iv} | Last Poll: ${st.last_poll_iso || '--'}${st.last_error ? ' | Note: ' + st.last_error : ''}`;
+  updateHeaderDevelopingBarBadge();
+}
+
+function updateHeaderDevelopingBarBadge() {
+  const hdrBadge = document.getElementById('hdr_dev_bar_badge');
+  if (!hdrBadge) return;
+  if (!twsLiveState.enabled || isRatioMode) {
+    hdrBadge.style.display = 'none';
+    return;
+  }
+  const devBar = (twsLiveState.developing_bars || {})[partA];
+  if (!devBar) {
+    hdrBadge.style.display = 'none';
+    return;
+  }
+  const ret = Number(devBar.ret_1d_pct || 0);
+  const sign = ret >= 0 ? '+' : '';
+  hdrBadge.style.display = 'inline-block';
+  hdrBadge.textContent = `📡 DEV BAR $${Number(devBar.close).toFixed(2)} (${sign}${ret.toFixed(1)}% · H:${Number(devBar.high).toFixed(2)} L:${Number(devBar.low).toFixed(2)})`;
+}
+
+function renderTwsAlertBanner() {
+  const bar = document.getElementById('tws_pivot_alert_bar');
+  const wrap = document.getElementById('tws_alert_chips_wrap');
+  const titleEl = document.getElementById('tws_alert_banner_title');
+  const toggleBtn = document.getElementById('btn_toggle_tws_alerts');
+  const alerts = twsLiveState.alerts || [];
+
+  if (toggleBtn) {
+    const cnt = alerts.length;
+    if (twsLiveState.alertsHidden) {
+      toggleBtn.textContent = cnt > 0 ? `🔕 ${cnt}` : '🔕';
+      toggleBtn.style.color = cnt > 0 ? '#fbbf24' : '#64748b';
+      toggleBtn.title = `Alerts Banner Hidden (${cnt} active alerts) — Click to show`;
+    } else {
+      toggleBtn.textContent = cnt > 0 ? `🔔 ${cnt}` : '🔔';
+      toggleBtn.style.color = cnt > 0 ? '#fbbf24' : '#cbd5e1';
+      toggleBtn.title = `Alerts Banner Enabled (${cnt} active alerts) — Click to hide`;
+    }
+  }
+
+  if (!bar || !wrap) return;
+  if (!alerts.length || twsLiveState.alertsHidden) {
+    bar.style.display = 'none';
+    wrap.innerHTML = '';
+    return;
+  }
+
+  bar.style.display = 'flex';
+  if (titleEl) {
+    titleEl.textContent = `🚨 REAL-TIME ML PIVOT ALERTS (${alerts.length}):`;
+  }
+  wrap.innerHTML = '';
+  alerts.slice(0, 10).forEach(a => {
+    const chip = document.createElement('button');
+    chip.className = 'btn';
+    const isHi = a.is_high_pivot;
+    const isMaj = a.pivot_type === 'maj_ut_top' || a.pivot_type === 'maj_dt_low';
+    chip.style.padding = '3px 8px';
+    chip.style.fontSize = '11px';
+    chip.style.fontWeight = '800';
+    chip.style.borderColor = isMaj ? '#fbbf24' : (isHi ? '#fb923c' : '#38bdf8');
+    chip.style.background = isMaj ? 'rgba(251,191,36,0.2)' : (isHi ? 'rgba(251,146,60,0.18)' : 'rgba(56,189,248,0.18)');
+    chip.style.color = '#fff';
+    const trigSfx = a.trigger_price ? ` (Trig @$${Number(a.trigger_price).toFixed(2)})` : '';
+    chip.textContent = `${a.pivot_label} · ${a.symbol} ${Number(a.prob_pct).toFixed(0)}% @$${Number(a.bar_price).toFixed(2)}${trigSfx}`;
+    chip.title = `${a.message} — Click to view ${a.symbol} chart`;
+    chip.onclick = () => {
+      selectChartIdentifier(a.symbol);
+    };
+    wrap.appendChild(chip);
+  });
+}
+
+function applyDevelopingBarToCurrentChart() {
+  if (!twsLiveState.enabled || isRatioMode || !candleSeries || !currentChartData) return;
+  const devBar = (twsLiveState.developing_bars || {})[partA];
+  if (!devBar || !devBar.date) return;
+
+  try {
+    candleSeries.update({
+      time: devBar.date,
+      open: Number(devBar.open),
+      high: Number(devBar.high),
+      low: Number(devBar.low),
+      close: Number(devBar.close),
+    });
+    if (volumeSeries) {
+      volumeSeries.update({
+        time: devBar.date,
+        value: Number(devBar.volume || 0),
+        color: Number(devBar.close) >= Number(devBar.open) ? 'rgba(16, 185, 129, 0.42)' : 'rgba(239, 68, 68, 0.42)',
+      });
+    }
+  } catch (e) {}
+
+  const piv = (twsLiveState.pivot_scores || {})[partA] || {};
+  const sig = `${partA}|${devBar.date}|${Number(devBar.high).toFixed(2)}|${Number(devBar.low).toFixed(2)}|${piv.top_pivot_type || ''}|${Math.round(piv.top_prob_pct || 0)}`;
+  if (twsLiveState.lastViewedBarSig && twsLiveState.lastViewedBarSig !== sig) {
+    twsLiveState.lastViewedBarSig = sig;
+    loadChart();
+  } else {
+    twsLiveState.lastViewedBarSig = sig;
+  }
+}
+
+function applyTwsLivePollPayload(data, allowSound = true) {
+  if (!data) return;
+  twsLiveState.enabled = !!data.enabled;
+  twsLiveState.status = data.status || {};
+  twsLiveState.developing_bars = data.developing_bars || {};
+  twsLiveState.pivot_scores = data.pivot_scores || {};
+  twsLiveState.alerts = data.alerts || [];
+
+  let hasNewAlert = false;
+  let hasMajorAlert = false;
+  (twsLiveState.alerts || []).forEach(a => {
+    if (a && a.id && !twsLiveState.seenAlertIds.has(a.id)) {
+      twsLiveState.seenAlertIds.add(a.id);
+      if (!twsLiveState.isInitialSync) {
+        hasNewAlert = true;
+        if (a.pivot_type === 'maj_ut_top' || a.pivot_type === 'maj_dt_low') {
+          hasMajorAlert = true;
+        }
+      }
+    }
+  });
+  twsLiveState.isInitialSync = false;
+
+  if (hasNewAlert && allowSound) {
+    playPivotAlertSound(hasMajorAlert);
+    try {
+      if ('Notification' in window && Notification.permission === 'granted' && twsLiveState.alerts.length > 0) {
+        const topA = twsLiveState.alerts[0];
+        new Notification(`🚨 ML Pivot Alert: ${topA.symbol}`, { body: topA.message });
+      }
+    } catch (e) {}
+  }
+
+  updateTwsPollStatusUI();
+  renderTwsAlertBanner();
+  renderWatchlistItems();
+  applyDevelopingBarToCurrentChart();
+
+  if (twsLiveState.enabled && !twsLiveState.pollTimer) {
+    twsLiveState.pollTimer = setInterval(fetchTwsLivePollState, 4000);
+  } else if (!twsLiveState.enabled && twsLiveState.pollTimer) {
+    clearInterval(twsLiveState.pollTimer);
+    twsLiveState.pollTimer = null;
+  }
+}
+
+async function syncTwsLivePollStatus() {
+  try {
+    const res = await fetch('/api/tws_live_poll');
+    const data = await res.json();
+    applyTwsLivePollPayload(data, false);
+  } catch (e) {}
+}
+
+async function fetchTwsLivePollState() {
+  if (!twsLiveState.enabled) return;
+  try {
+    const res = await fetch('/api/tws_live_poll');
+    const data = await res.json();
+    applyTwsLivePollPayload(data, true);
+  } catch (e) {}
+}
+
+async function toggleTwsLivePolling(enabled) {
+  const threshEl = document.getElementById('cfg_climax_thresh');
+  const threshold = threshEl ? Math.max(20, Math.min(90, parseFloat(threshEl.value) || 50)) : 50;
+  const mvEl = document.getElementById('cfg_pivot_model_ver');
+  const model_ver = mvEl ? mvEl.value : 'v3';
+  const badge = document.getElementById('tws_poll_status_badge');
+  if (badge && enabled) {
+    badge.textContent = '⏳ Connecting TWS...';
+    badge.style.color = '#38bdf8';
+  }
+  try {
+    if (enabled && 'Notification' in window && Notification.permission === 'default') {
+      Notification.requestPermission().catch(() => {});
+    }
+  } catch (e) {}
+
+  try {
+    const res = await fetch('/api/tws_live_poll', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        action: 'toggle',
+        enabled: !!enabled,
+        threshold,
+        model_ver,
+        group_id: watchlistsState.active_group_id || '',
+      }),
+    });
+    const data = await res.json();
+    applyTwsLivePollPayload(data, true);
+    loadChart();
+  } catch (e) {
+    console.error('Failed to toggle TWS polling:', e);
+  }
+}
+
+async function triggerTwsPollNow() {
+  const threshEl = document.getElementById('cfg_climax_thresh');
+  const threshold = threshEl ? Math.max(20, Math.min(90, parseFloat(threshEl.value) || 50)) : 50;
+  const mvEl = document.getElementById('cfg_pivot_model_ver');
+  const model_ver = mvEl ? mvEl.value : 'v3';
+  const badge = document.getElementById('tws_poll_status_badge');
+  if (badge) {
+    badge.textContent = '⏳ Polling TWS...';
+    badge.style.color = '#38bdf8';
+  }
+  try {
+    const res = await fetch('/api/tws_live_poll', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        action: 'poll_now',
+        threshold,
+        model_ver,
+        group_id: watchlistsState.active_group_id || '',
+      }),
+    });
+    const data = await res.json();
+    applyTwsLivePollPayload(data, true);
+    loadChart();
+  } catch (e) {
+    console.error('Failed manual TWS poll:', e);
+  }
+}
 
 async function loadCatalog(query = '') {
   const url = query ? `/api/catalog?q=${encodeURIComponent(query)}&limit=400` : '/api/catalog?limit=400';
@@ -3770,6 +4913,8 @@ function renderWatchlistItems() {
   const term = (document.getElementById('wl_filter_input').value || '').trim().toUpperCase();
   const flagFilter = document.getElementById('wl_flag_filter').value;
   const activeChartId = getActiveChartIdentifier();
+  const threshEl = document.getElementById('cfg_climax_thresh');
+  const userThr = threshEl ? Math.max(20, Math.min(90, parseFloat(threshEl.value) || 50)) : 50;
 
   const items = (grp.items || []).filter(it => {
     if (flagFilter !== 'all' && (it.flag || 'none') !== flagFilter) return false;
@@ -3786,12 +4931,33 @@ function renderWatchlistItems() {
   items.forEach(it => {
     const row = document.createElement('div');
     row.className = 'wl-item' + (it.id === activeChartId ? ' active' : '');
-    const r1d = it.ret_1d;
+    const liveBar = twsLiveState.enabled ? ((twsLiveState.developing_bars || {})[it.id] || it.live_bar) : null;
+    const livePiv = twsLiveState.enabled ? ((twsLiveState.pivot_scores || {})[it.id] || it.live_pivot) : null;
+
+    const r1d = (liveBar && liveBar.ret_1d_pct !== undefined) ? liveBar.ret_1d_pct : it.ret_1d;
     const r1m = it.ret_1m;
-    const r1dStr = (r1d !== undefined && r1d !== null) ? `${r1d >= 0 ? '+' : ''}${r1d.toFixed(1)}%` : '';
-    const r1mStr = (r1m !== undefined && r1m !== null) ? `${r1m >= 0 ? '+' : ''}${r1m.toFixed(1)}%` : '';
+    const r1dStr = (r1d !== undefined && r1d !== null) ? `${r1d >= 0 ? '+' : ''}${Number(r1d).toFixed(1)}%` : '';
+    const r1mStr = (r1m !== undefined && r1m !== null) ? `${r1m >= 0 ? '+' : ''}${Number(r1m).toFixed(1)}%` : '';
     const flagCls = `flag-${it.flag || 'none'}`;
     const typeCls = `type-${it.type || 'stock'}`;
+
+    let pivotBadgeHtml = '';
+    if (livePiv && Number(livePiv.top_prob_pct || 0) >= userThr) {
+      const pType = livePiv.top_pivot_type || '';
+      const pProb = Math.round(Number(livePiv.top_prob_pct || 0));
+      const isHi = pType === 'ut_high' || pType === 'dt_high' || pType === 'maj_ut_top';
+      const isMaj = pType === 'maj_ut_top' || pType === 'maj_dt_low';
+      const iconMap = { ut_high: '🔥', ut_low: '💎', dt_high: '🔻', dt_low: '🟢', maj_ut_top: '👑', maj_dt_low: '🚀' };
+      const ic = iconMap[pType] || '🚨';
+      const bg = isMaj ? 'rgba(251,191,36,0.22)' : (isHi ? 'rgba(251,146,60,0.2)' : 'rgba(56,189,248,0.2)');
+      const brd = isMaj ? '#fbbf24' : (isHi ? '#fb923c' : '#38bdf8');
+      const clr = isMaj ? '#fde68a' : (isHi ? '#fdba74' : '#7dd3fc');
+      pivotBadgeHtml = `<span style="font-size:9px; font-weight:800; padding:1px 5px; border-radius:4px; background:${bg}; border:1px solid ${brd}; color:${clr};" title="Real-Time ML Pivot Detected: ${livePiv.top_pivot_label || pType} (${pProb}%)">${ic} ${pProb}%</span>`;
+    }
+
+    const livePriceHtml = liveBar
+      ? `<span style="font-size:9px; color:#38bdf8; font-weight:700;">📡 $${Number(liveBar.close).toFixed(2)}</span>`
+      : '';
 
     row.onclick = (e) => {
       if (e.target.closest('.del-btn')) return;
@@ -3805,9 +4971,10 @@ function renderWatchlistItems() {
           <div style="display:flex; align-items:center; gap:5px;">
             <span class="type-tag ${typeCls}">${(it.type || 'stk').slice(0,3)}</span>
             <strong style="color:#fff; font-size:12px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${it.short_label || it.id}</strong>
+            ${pivotBadgeHtml}
           </div>
           <div style="color:var(--muted); font-size:10px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">
-            ${it.notes ? '📝 ' + it.notes : (it.name || '')}
+            ${livePriceHtml ? livePriceHtml + ' · ' : ''}${it.notes ? '📝 ' + it.notes : (it.name || '')}
           </div>
         </div>
       </div>
@@ -4196,18 +5363,51 @@ function initChartEngine() {
     borderDownColor: '#ef4444',
     wickUpColor: '#10b981',
     wickDownColor: '#ef4444',
+    autoscaleInfoProvider: (baseImpl) => {
+      const base = baseImpl ? baseImpl() : null;
+      const bars = (currentChartData && currentChartData.bars) || [];
+      if (!bars.length) return base;
+      const recent = bars.slice(-90);
+      let rMin = Infinity, rMax = -Infinity;
+      for (let i = 0; i < recent.length; i++) {
+        if (recent[i].low < rMin) rMin = recent[i].low;
+        if (recent[i].high > rMax) rMax = recent[i].high;
+      }
+      if (!isFinite(rMin) || !isFinite(rMax)) return base;
+      if (!base || !base.priceRange) {
+        return { priceRange: { minValue: rMin, maxValue: rMax } };
+      }
+      const bMin = base.priceRange.minValue;
+      const bMax = base.priceRange.maxValue;
+      const bSpan = Math.max(1e-6, bMax - bMin);
+      const rSpan = Math.max(1e-6, rMax - rMin);
+      const latestClose = bars[bars.length - 1].close;
+      // If current bars are outside range or compressed to <22% of chart height by old 2Y/5Y extremes, frame Y-axis around current bars
+      if (latestClose < bMin || latestClose > bMax || (rSpan / bSpan) < 0.22) {
+        const pad = rSpan * 0.12;
+        return {
+          priceRange: {
+            minValue: Math.max(0, rMin - pad),
+            maxValue: rMax + pad,
+          },
+        };
+      }
+      return base;
+    },
   });
 
   // crosshairMarkerVisible: false removes the hover circles on all indicator lines
-  ema8Series = chart.addLineSeries({ color: '#a855f7', lineWidth: 1, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false, visible: false });
-  ema10Series = chart.addLineSeries({ color: '#38bdf8', lineWidth: 1.5, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false });
-  ema20Series = chart.addLineSeries({ color: '#f59e0b', lineWidth: 1.5, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false });
-  ema21Series = chart.addLineSeries({ color: '#22d3ee', lineWidth: 1.5, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false, visible: false });
-  sma50Series = chart.addLineSeries({ color: '#10b981', lineWidth: 2, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false });
-  sma200Series = chart.addLineSeries({ color: '#ef4444', lineWidth: 2, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false });
+  // autoscaleInfoProvider: () => null ensures the Y-axis scales strictly to visible price bars rather than distant lagging MAs
+  const noAutoScale = () => null;
+  ema8Series = chart.addLineSeries({ color: '#a855f7', lineWidth: 1, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false, visible: false, autoscaleInfoProvider: noAutoScale });
+  ema10Series = chart.addLineSeries({ color: '#38bdf8', lineWidth: 1.5, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false, autoscaleInfoProvider: noAutoScale });
+  ema20Series = chart.addLineSeries({ color: '#f59e0b', lineWidth: 1.5, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false, autoscaleInfoProvider: noAutoScale });
+  ema21Series = chart.addLineSeries({ color: '#22d3ee', lineWidth: 1.5, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false, visible: false, autoscaleInfoProvider: noAutoScale });
+  sma50Series = chart.addLineSeries({ color: '#10b981', lineWidth: 2, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false, autoscaleInfoProvider: noAutoScale });
+  sma200Series = chart.addLineSeries({ color: '#ef4444', lineWidth: 2, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false, autoscaleInfoProvider: noAutoScale });
 
-  larssonFastSeries = chart.addLineSeries({ color: 'rgba(234,179,8,0.85)', lineWidth: 1, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false });
-  larssonSlowSeries = chart.addLineSeries({ color: 'rgba(56,189,248,0.85)', lineWidth: 1, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false });
+  larssonFastSeries = chart.addLineSeries({ color: 'rgba(234,179,8,0.85)', lineWidth: 1, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false, autoscaleInfoProvider: noAutoScale });
+  larssonSlowSeries = chart.addLineSeries({ color: 'rgba(56,189,248,0.85)', lineWidth: 1, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false, autoscaleInfoProvider: noAutoScale });
 
   rsLineSeries = chart.addLineSeries({
     color: '#ec4899',
@@ -4319,7 +5519,28 @@ function initChartEngine() {
   resizeCanvas();
 }
 
-async function loadChart() {
+function fitYAxisToVisibleBars(bars) {
+  if (!chart || !candleSeries) return;
+  chart.timeScale().fitContent();
+
+  // Always reset Y-axis autoScale to true so switching tickers immediately scales to the new ticker's visible bars
+  chart.priceScale('right').applyOptions({
+    autoScale: true,
+    scaleMargins: { top: 0.08, bottom: 0.24 },
+  });
+  chart.priceScale('rs_scale').applyOptions({ autoScale: true });
+  chart.priceScale('vol_scale').applyOptions({ autoScale: true });
+
+  requestAnimationFrame(() => {
+    if (!chart) return;
+    chart.timeScale().fitContent();
+    chart.priceScale('right').applyOptions({ autoScale: true });
+    scheduleLarssonRender();
+    renderAllDrawings();
+  });
+}
+
+async function loadChart(forceFullTimeFit = false) {
   const larssonSpan = document.getElementById('cfg_larsson_span').value || '32';
   const emaSpans = getConfiguredEmaSpans().join(',');
   const smaSpans = getConfiguredSmaSpans().join(',');
@@ -4390,18 +5611,19 @@ async function loadChart() {
 
   updateIndicatorVisibility();
   renderEPMarkers();
-  chart.timeScale().fitContent();
+  fitYAxisToVisibleBars(data.bars || [], forceFullTimeFit);
   setTimeout(scheduleLarssonRender, 40);
 
   // Update Info Panel & Annotations
   renderInfoPanel(data);
   syncWatchlistItemNotesUI();
   renderWatchlistItems();
+  updateHeaderDevelopingBarBadge();
   loadAnnotations(getActiveChartIdentifier());
 }
 
 function reloadChart() {
-  loadChart();
+  loadChart(false);
 }
 
 function setHistoryWindow(win) {
@@ -4409,11 +5631,13 @@ function setHistoryWindow(win) {
   ['3m', '6m', '1y', '2y', '5y', 'full'].forEach(w => {
     document.getElementById(`tf_${w}`)?.classList.toggle('active', w === win);
   });
-  loadChart();
+  loadChart(true);
 }
 
 function resetChartZoom() {
-  if (chart) chart.timeScale().fitContent();
+  if (chart) {
+    fitYAxisToVisibleBars((currentChartData && currentChartData.bars) || [], true);
+  }
   scheduleLarssonRender();
 }
 
