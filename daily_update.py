@@ -54,7 +54,15 @@ TARGET_SERVERS = [
     (8785, "QM Setup & EP Cross-Reference Explorer"),
     (8786, "Institutional RS Universe Explorer"),
     (8787, "Optimized EP Strategy Explorer"),
+    (8789, "Universal Chart Viewer, Ratio Analyzer & Watchlist Studio"),
 ]
+PIVOT_MODEL_PATHS = [
+    ROOT / "data" / "models" / "uptrend_pivot_high_classifier.pkl",
+    ROOT / "data" / "models" / "uptrend_pivot_low_classifier.pkl",
+    ROOT / "data" / "models" / "downtrend_pivot_high_classifier.pkl",
+    ROOT / "data" / "models" / "downtrend_pivot_low_classifier.pkl",
+]
+MAX_PIVOT_MODEL_AGE_DAYS = 7
 
 # Ensure data and logs directories exist
 PID_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -107,10 +115,40 @@ def reload_server(port: int, app_name: str) -> Dict[str, Any]:
         return {"port": port, "name": app_name, "status": f"error: {e}"}
 
 
+def update_pivot_models_if_needed(force: bool = False) -> Dict[str, Any]:
+    """Checks the 4 structural swing-pivot ML models (UT High, UT Low, DT High, DT Low)
+    and retrains them if any model file is missing, older than MAX_PIVOT_MODEL_AGE_DAYS, or forced."""
+    now_ts = time.time()
+    missing = [p.name for p in PIVOT_MODEL_PATHS if not p.exists()]
+    stale = []
+    for p in PIVOT_MODEL_PATHS:
+        if p.exists():
+            age_days = (now_ts - p.stat().st_mtime) / 86400.0
+            if age_days > MAX_PIVOT_MODEL_AGE_DAYS:
+                stale.append(f"{p.name} ({age_days:.1f}d)")
+
+    if not force and not missing and not stale:
+        oldest_mtime = min(p.stat().st_mtime for p in PIVOT_MODEL_PATHS)
+        trained_dt = dt.datetime.fromtimestamp(oldest_mtime).strftime("%Y-%m-%d %H:%M")
+        logger.info(f"✅ All 4 structural pivot models are fresh (last updated: {trained_dt}).")
+        return {"status": "up_to_date", "last_updated": trained_dt}
+
+    reason = "forced" if force else (f"missing={missing}" if missing else f"stale={stale}")
+    logger.info(f"🔄 Retraining 4 structural swing-pivot models ({reason})...")
+    import train_uptrend_pivot_model
+    import train_all_pivot_models
+
+    train_uptrend_pivot_model.main()
+    train_all_pivot_models.main()
+    return {"status": "retrained", "reason": reason}
+
+
 def get_dataset_timestamps() -> Dict[str, Any]:
     """Inspects latest data date across all modules."""
     spy = datastore.load_bars("SPY")
     spy_latest = spy.index[-1].strftime("%Y-%m-%d") if spy is not None and not spy.empty else None
+    rsp = datastore.load_bars("RSP")
+    rsp_latest = rsp.index[-1].strftime("%Y-%m-%d") if rsp is not None and not rsp.empty else None
 
     rs_latest, _, rs_count = update_rs_database.get_db_status()
     qm_latest, _, qm_count = update_qm_database.get_qm_status()
@@ -139,8 +177,15 @@ def get_dataset_timestamps() -> Dict[str, Any]:
         except Exception:
             pass
 
+    pivot_models_ready = sum(1 for p in PIVOT_MODEL_PATHS if p.exists())
+    pivot_models_latest = None
+    if pivot_models_ready == len(PIVOT_MODEL_PATHS):
+        oldest_mtime = min(p.stat().st_mtime for p in PIVOT_MODEL_PATHS)
+        pivot_models_latest = dt.datetime.fromtimestamp(oldest_mtime).strftime("%Y-%m-%d %H:%M")
+
     return {
         "spy_bars_latest": spy_latest,
+        "rsp_bars_latest": rsp_latest,
         "rs_db_latest": rs_latest,
         "rs_sessions_count": rs_count,
         "ep_study_latest": ep_latest,
@@ -149,15 +194,18 @@ def get_dataset_timestamps() -> Dict[str, Any]:
         "qm_setups_count": qm_count,
         "opt_strategy_latest": opt_latest,
         "opt_strategy_count": opt_count,
+        "pivot_models_ready": f"{pivot_models_ready}/{len(PIVOT_MODEL_PATHS)}",
+        "pivot_models_latest": pivot_models_latest,
     }
 
 
 def run_pipeline(
-    full_bars: bool = False,
+    full_bars: bool = True,
     force: bool = False,
     skip_download: bool = False,
+    retrain_models: bool = False,
 ) -> Dict[str, Any]:
-    """Runs the complete 5-step daily retrieval and dataset update sequence."""
+    """Runs the complete 7-step daily retrieval, model check, and dataset update sequence."""
     t_start = time.time()
     logger.info("══════════════════════════════════════════════════════════════════════════════")
     logger.info("🚀 STARTING EOD DAILY UNIVERSE RETRIEVAL & UPDATE PIPELINE")
@@ -170,8 +218,8 @@ def run_pipeline(
         "success": False,
     }
 
-    # STEP 1: Download latest EOD daily bars
-    logger.info("▶ STEP 1/5: Downloading incremental daily bars from yfinance...")
+    # STEP 1: Download latest EOD daily bars across ALL universe & ETF tickers
+    logger.info(f"▶ STEP 1/7: Downloading incremental daily bars from yfinance (full_universe={full_bars})...")
     t0 = time.time()
     try:
         if not skip_download:
@@ -186,7 +234,7 @@ def run_pipeline(
         summary["steps"]["bars_download"] = {"status": "error", "error": str(e)}
 
     # STEP 2: Update Institutional RS Database
-    logger.info("▶ STEP 2/5: Synchronizing Institutional RS Database (Port 8786)...")
+    logger.info("▶ STEP 2/7: Synchronizing Institutional RS Database (Port 8786)...")
     t0 = time.time()
     try:
         rs_updated = update_rs_database.update_database(force=force)
@@ -200,7 +248,7 @@ def run_pipeline(
         summary["steps"]["rs_database"] = {"status": "error", "error": str(e)}
 
     # STEP 3: Update EP Historical Study Dataset (Port 8782)
-    logger.info("▶ STEP 3/5: Scanning fresh EPs, V2 conviction models & simulations (Port 8782)...")
+    logger.info("▶ STEP 3/7: Scanning fresh EPs, V2 conviction models & simulations (Port 8782)...")
     t0 = time.time()
     try:
         ep_updater.update_pipeline(skip_download=True, full_download=False, dry_run=False)
@@ -211,7 +259,7 @@ def run_pipeline(
         summary["steps"]["ep_study"] = {"status": "error", "error": str(e)}
 
     # STEP 4: Update QM Setups Database & EP Cross-References (Port 8785)
-    logger.info("▶ STEP 4/6: Mining QM Setups & cross-referencing EP igniters (Port 8785)...")
+    logger.info("▶ STEP 4/7: Mining QM Setups & cross-referencing EP igniters (Port 8785)...")
     t0 = time.time()
     try:
         qm_updated = update_qm_database.run_update(force=force)
@@ -225,7 +273,7 @@ def run_pipeline(
         summary["steps"]["qm_setups"] = {"status": "error", "error": str(e)}
 
     # STEP 5: Update Optimized EP Strategy Dataset (Port 8787)
-    logger.info("▶ STEP 5/6: Synchronizing Optimized EP Strategy dataset (Port 8787)...")
+    logger.info("▶ STEP 5/7: Synchronizing Optimized EP Strategy dataset (Port 8787)...")
     t0 = time.time()
     try:
         sim_optimized_ep_strategy.run_optimization()
@@ -238,8 +286,19 @@ def run_pipeline(
         logger.error(f"❌ Error updating Optimized EP Strategy: {e}")
         summary["steps"]["optimized_ep_strategy"] = {"status": "error", "error": str(e)}
 
-    # STEP 6: Hot-reload active servers across all 4 ports
-    logger.info("▶ STEP 6/6: Notifying live dashboard applications (8782, 8785, 8786, 8787)...")
+    # STEP 6: Verify / Retrain the 4 Structural Swing-Pivot ML Models (Port 8789)
+    logger.info("▶ STEP 6/7: Verifying 4 Structural Swing-Pivot ML Models (Port 8789)...")
+    t0 = time.time()
+    try:
+        pm_res = update_pivot_models_if_needed(force=retrain_models)
+        pm_res["duration_s"] = round(time.time() - t0, 1)
+        summary["steps"]["pivot_models"] = pm_res
+    except Exception as e:
+        logger.error(f"❌ Error verifying/updating Structural Pivot Models: {e}")
+        summary["steps"]["pivot_models"] = {"status": "error", "error": str(e)}
+
+    # STEP 7: Hot-reload active servers across all 5 ports
+    logger.info("▶ STEP 7/7: Notifying live dashboard applications (8782, 8785, 8786, 8787, 8789)...")
     for port, app_name in TARGET_SERVERS:
         summary["server_reloads"][str(port)] = reload_server(port, app_name)
 
@@ -342,8 +401,9 @@ def stop_daemon() -> bool:
 def run_daemon(
     target_time_str: str = "16:45",
     run_now: bool = False,
-    full_bars: bool = False,
+    full_bars: bool = True,
     force: bool = False,
+    retrain_models: bool = False,
 ) -> None:
     """Runs the persistent background daily updater loop."""
     running, existing_pid = is_daemon_running()
@@ -376,7 +436,7 @@ def run_daemon(
     try:
         if run_now:
             logger.info("⚡ Immediate update requested (--now). Running pipeline now...")
-            run_pipeline(full_bars=full_bars, force=force)
+            run_pipeline(full_bars=full_bars, force=force, retrain_models=retrain_models)
 
         tz = ZoneInfo("America/New_York")
         while not _stop_flag:
@@ -402,7 +462,7 @@ def run_daemon(
 
             logger.info(f"🔔 Target time reached ({target_time_str} ET). Launching daily update...")
             try:
-                run_pipeline(full_bars=full_bars, force=force)
+                run_pipeline(full_bars=full_bars, force=force, retrain_models=retrain_models)
             except Exception as e:
                 logger.error(f"❌ Unhandled exception during scheduled update: {e}", exc_info=True)
 
@@ -416,7 +476,7 @@ def run_daemon(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Daily Universe Retrieval & Multi-App Update Orchestrator (Ports 8782, 8785, 8786)"
+        description="Daily Universe Retrieval & Multi-App Update Orchestrator (Ports 8782, 8785, 8786, 8787, 8789)"
     )
     parser.add_argument("--daemon", action="store_true", help="Run as scheduled background daemon")
     parser.add_argument("--once", action="store_true", help="Execute single update cycle immediately and exit")
@@ -425,9 +485,12 @@ def main():
     parser.add_argument("--stop", action="store_true", help="Stop running daily updater daemon")
     parser.add_argument("--check", action="store_true", help="Inspect dataset timestamps and status without running updates")
     parser.add_argument("--time", type=str, default="16:45", help="Target scheduled time in HH:MM ET (default: 16:45)")
-    parser.add_argument("--full-bars", action="store_true", help="Force full download of price bars instead of incremental")
+    parser.add_argument("--full-bars", action="store_true", default=True, help="Update all universe price bars (default: True)")
+    parser.add_argument("--active-only", action="store_true", help="Update only active liquid subset instead of full universe")
+    parser.add_argument("--retrain-models", action="store_true", help="Force retrain of the 4 structural swing-pivot ML models")
     parser.add_argument("--force", action="store_true", help="Force recalculation across all databases")
     args = parser.parse_args()
+    use_full_bars = not args.active_only
 
     if args.stop:
         success = stop_daemon()
@@ -447,24 +510,26 @@ def main():
             print("  • Daemon Status    : ⚪ STOPPED")
         print(f"  • Log File         : {LOG_FILE}")
         print("------------------------------------------------------------------------------")
-        print(f"  • Datastore (SPY)  : {ts['spy_bars_latest'] or 'None'}")
+        print(f"  • Datastore (SPY)  : {ts['spy_bars_latest'] or 'None'} | RSP: {ts['rsp_bars_latest'] or 'None'}")
         print(f"  • Port 8786 (RS)   : {ts['rs_db_latest'] or 'None'} ({ts['rs_sessions_count']} daily sessions)")
         print(f"  • Port 8782 (EP)   : {ts['ep_study_latest'] or 'None'} ({ts['ep_events_count']:,} total events)")
         print(f"  • Port 8785 (QM)   : {ts['qm_setups_latest'] or 'None'} ({ts['qm_setups_count']:,} total setups)")
+        print(f"  • Port 8789 (ML)   : {ts['pivot_models_ready']} Pivot Models ({ts['pivot_models_latest'] or 'None'})")
         print("══════════════════════════════════════════════════════════════════════════════")
         sys.exit(0)
 
     if args.once:
         setup_logger(log_to_stdout=True)
-        res = run_pipeline(full_bars=args.full_bars, force=args.force)
+        res = run_pipeline(full_bars=use_full_bars, force=args.force, retrain_models=args.retrain_models)
         sys.exit(0 if res.get("success") else 1)
 
     if args.daemon:
         run_daemon(
             target_time_str=args.time,
             run_now=args.now,
-            full_bars=args.full_bars,
+            full_bars=use_full_bars,
             force=args.force,
+            retrain_models=args.retrain_models,
         )
         sys.exit(0)
 

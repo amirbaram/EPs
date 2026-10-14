@@ -10,6 +10,7 @@ Located at `/Users/amirbaram/Documents/code/EPs`.
 .venv/bin/python serve_qm.py          # Historical QM Setup & EP Cross-Reference Explorer → http://127.0.0.1:8785
 .venv/bin/python serve_rs.py          # Relative Strength (RS) Universe Explorer → http://127.0.0.1:8786
 .venv/bin/python serve_optimized_ep.py # Optimized EP Strategy Explorer → http://127.0.0.1:8787
+.venv/bin/python serve_watchlist.py   # Universal Chart Viewer, Ratio Analyzer & Watchlist Studio → http://127.0.0.1:8789
 ```
 Deps: Python 3.13 virtual environment located at `.venv/`. Use `.venv/bin/python` for all execution.
 
@@ -45,6 +46,7 @@ bash scripts/check.sh                 # Byte-compiles core EP modules + runs tes
 | QM Setup & EP Cross-Reference Server | `serve_qm.py` (port 8785) |
 | Relative Strength (RS) Universe Server | `serve_rs.py` (port 8786) |
 | Optimized EP Strategy Server & UI | `serve_optimized_ep.py` (port 8787) |
+| Universal Chart Viewer, Ratio & Watchlist Server | `serve_watchlist.py` (port 8789) |
 | Optimized Strategy Full Empirical Report | `docs/OPTIMIZED_EP_TRADING_STRATEGY_REPORT.md` |
 | Optimized Strategy Trade Dataset | `data/simulations/optimized_ep_strategy_trades.parquet` |
 | Daily Historical RS Engine & Query API | `build_rs_history.py` |
@@ -63,12 +65,13 @@ bash scripts/check.sh                 # Byte-compiles core EP modules + runs tes
 | QM Strategy Trade Builder & Engine | `build_qm_strategy_dataset.py` |
 | QM Trailing Exit & Partial Scaling Study | `run_exact_ema_study.py` |
 | QM System Architecture & Pipeline Guide | `docs/QM_SYSTEM_GUIDE.md` |
-| Machine Learning Engine & Feature Extractors | `ep_ml_engine.py` |
+| Machine Learning Engine & Feature Extractors | `ep_ml_engine.py`, `train_uptrend_pivot_model.py`, `train_all_pivot_models.py` |
+| 4-Model Structural Swing-Pivot Architecture Guide | `docs/STRUCTURAL_PIVOT_MODELS_GUIDE.md` |
 | Technical Indicators & Intermediate Ribbons | `scanner_core.py`, `indicators.py` |
 | Local Datastore Bar Loading | `datastore.py` |
 | Sector & Theme Classifications | `labels.py`, `thematic_engine.py` |
 | Playbook Handbook PDF Generator | `generate_handbook_pdf.py` |
-| Model Weights (`data/models/`) | `ep_exhaustion_classifier.pkl`, `ep_dynamic_trailer.pkl`, `ep_ur_reentry_classifier.pkl`, `ep_continuation_dynamic_trailer.pkl`, `amir_rolling_xgboost_ordinal.pkl` |
+| Model Weights (`data/models/`) | `ep_exhaustion_classifier.pkl`, `ep_dynamic_trailer.pkl`, `ep_ur_reentry_classifier.pkl`, `ep_continuation_dynamic_trailer.pkl`, `amir_rolling_xgboost_ordinal.pkl`, `uptrend_pivot_high_classifier.pkl`, `uptrend_pivot_low_classifier.pkl`, `downtrend_pivot_high_classifier.pkl`, `downtrend_pivot_low_classifier.pkl` |
 | Scored Historical Dataset | `data/simulations/ep_combined_study_scored.parquet` |
 | Regression Test Suite | `tests/` |
 

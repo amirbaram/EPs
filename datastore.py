@@ -633,12 +633,18 @@ def init_history(max_tickers: int | None = None) -> None:
 
 def app_critical_etfs() -> set[str]:
     """ETFs the app's panels structurally depend on — theme reps (build_labels.THEME_ETFS), sectors
-    (config.AWARE_SECTOR_ETFS), rotation legs (config.RATIO_BASKET, equities only) and the indices.
+    (config.AWARE_SECTOR_ETFS), Watchlist Studio SPDR/Industry ETFs, rotation legs (config.RATIO_BASKET,
+    equities only) and the indices.
     The daily update ALWAYS covers these even when a thin thematic ETF dips below the active-universe
     liquidity floor, so its close can't go stale — a stale close made open_radar print phantom
     overnight gaps and the themes panel read a week old (BUGS 2026-07-09). Futures legs (=F) live in a
     separate store and are excluded. build_labels imports datastore, so import it lazily here."""
-    etfs: set[str] = {"SPY", "QQQ", "IWM", "DIA"}
+    etfs: set[str] = {
+        "SPY", "QQQ", "IWM", "DIA", "MDY", "RSP",
+        "XLK", "XLV", "XLF", "XLE", "XLI", "XLY", "XLP", "XLC", "XLB", "XLRE", "XLU",
+        "XBI", "XOP", "XME", "XAR", "XHB", "XRT", "KRE", "KBE", "XSD", "XSW", "XHE", "XPH", "XES",
+        "SMH", "SOXX", "IGV", "IBB", "ARKK", "ITA", "ITB", "TAN", "URA", "GDX", "SIL", "COPX", "OIH", "HACK", "BOTZ",
+    }
     try:
         import build_labels
         for v in build_labels.THEME_ETFS.values():
@@ -656,14 +662,20 @@ def app_critical_etfs() -> set[str]:
 def update_daily(full: bool = False) -> None:
     """Fetch the missing tail for the cached tickers. Normal/daily use (full=False) updates the active
     universe PLUS the app-critical ETFs (app_critical_etfs — always covered so theme/rotation reads
-    never go stale). The weekly full refresh (full=True) updates every universe name so membership can
-    be re-evaluated (run build_active_universe.py after)."""
+    never go stale). The full refresh (full=True) updates every universe and cached name so all
+    symbols across all apps remain up to date."""
     if yf is None:
         raise SystemExit("pip install yfinance")
     config.BARS_DIR.mkdir(parents=True, exist_ok=True)
     u = uni.load_universe()
     skip = _load_skiplist()
     symbols = [s for s in u["yf_symbol"] if s not in skip]
+    if full:
+        existing_syms = set( symbols )
+        for s in list_symbols():
+            if s not in skip and s not in existing_syms:
+                symbols.append(s)
+                existing_syms.add(s)
     app_etfs = app_critical_etfs()
     # ALWAYS-COVER set: structural ETFs + the =F futures. Futures are yfinance dailies (uni.FUTURES) but
     # were covered ONLY by the weekly full=True run (app_critical_etfs excludes them as "separate store"
@@ -680,8 +692,9 @@ def update_daily(full: bool = False) -> None:
         if s not in skip:                              # (theme-rep ETFs like BTF/FOTO, futures) — seed them
             symbols.append(s)
 
-    # global last date across cache decides how far back the pull needs to go
-    last_dates = []
+    # Group cached symbols by their last-date cohort so recent tickers only pull a few days
+    # while older/stale tickers pull from their own last date.
+    last_date_map: dict[str, dt.date] = {}
     cached = []
     new = []
     for s in symbols:
@@ -690,37 +703,89 @@ def update_daily(full: bool = False) -> None:
             new.append(s)
         else:
             cached.append(s)
-            last_dates.append(df.index[-1])
+            last_date_map[s] = df.index[-1].date()
     if not cached:
         raise SystemExit("cache empty — run init first")
 
-    oldest_tail = min(last_dates).date()
-    start = oldest_tail - dt.timedelta(days=4)  # small overlap, dedupe below
     end = _settled_end()                        # mid-session: settled bars only, never today's partial
     if end:
         print(f"update: US session open — clamping to settled bars (< {end})")
-    print(f"update: {len(cached)} cached (pull from {start}), {len(new)} new symbols")
+
+    # Refresh SPY first so we know the exact latest settled US trading session date
+    spy_old = load_bars("SPY")
+    spy_start = (spy_old.index[-1].date() - dt.timedelta(days=5)) if spy_old is not None else (dt.date.today() - dt.timedelta(days=10))
+    try:
+        spy_got = _download_batch(["SPY"], spy_start, end).get("SPY")
+        if spy_got is not None and len(spy_got):
+            if spy_old is not None:
+                fac_spy = _adjustment_seam(spy_old, spy_got)
+                if fac_spy is not None and 0.05 < fac_spy < 20.0:
+                    spy_old = spy_old.copy()
+                    for col_c in ("open", "high", "low", "close"):
+                        if col_c in spy_old.columns:
+                            spy_old[col_c] = spy_old[col_c].astype(float) * fac_spy
+                spy_merged = pd.concat([spy_old, spy_got])
+                spy_merged = spy_merged[~spy_merged.index.duplicated(keep="last")].sort_index()
+                spy_merged = spy_merged[spy_merged["close"].notna()]
+            else:
+                spy_merged = spy_got
+            _write(spy_merged, bar_path("SPY"))
+            last_date_map["SPY"] = spy_merged.index[-1].date()
+    except Exception:
+        pass
+
+    target_settled_date = last_date_map.get("SPY", max(last_date_map.values()))
+    already_fresh = [s for s in cached if last_date_map[s] >= target_settled_date]
+    todo_cached = [s for s in cached if last_date_map[s] < target_settled_date]
+
+    recent_cutoff = target_settled_date - dt.timedelta(days=10)
+    cohorts: list[tuple[str, list[str], dt.date]] = []
+    recent_syms = [s for s in todo_cached if last_date_map[s] >= recent_cutoff]
+    older_syms = [s for s in todo_cached if last_date_map[s] < recent_cutoff]
+    if recent_syms:
+        cohorts.append(("recent", recent_syms, min(last_date_map[s] for s in recent_syms) - dt.timedelta(days=4)))
+    if older_syms:
+        cohorts.append(("catchup", older_syms, min(last_date_map[s] for s in older_syms) - dt.timedelta(days=4)))
+
+    print(
+        f"update: {len(cached)} cached ({len(already_fresh)} already at {target_settled_date}, "
+        f"{len(recent_syms)} recent, {len(older_syms)} catch-up), {len(new)} new symbols"
+    )
 
     rebased = []   # symbols whose history was re-based (split/dividend) since our last pull
-    for i in range(0, len(cached), config.BATCH_SIZE):
-        batch = cached[i:i + config.BATCH_SIZE]
-        try:
-            got = _download_batch(batch, start, end)
-        except Exception as e:
-            print(f"  batch {i}: {e} — skipping this run")
-            continue
-        for sym, fresh in got.items():
-            old = load_bars(sym)
-            fac = _adjustment_seam(old, fresh)
-            if fac is not None:
-                rebased.append((sym, fac))   # merging two price scales would print a fake cliff
+    for cohort_name, cohort_syms, start in cohorts:
+        print(f"  cohort [{cohort_name}]: {len(cohort_syms)} symbols (pull from {start})")
+        for i in range(0, len(cohort_syms), config.BATCH_SIZE):
+            batch = cohort_syms[i:i + config.BATCH_SIZE]
+            try:
+                got = _download_batch(batch, start, end)
+            except Exception as e:
+                print(f"  batch {i}: {e} — skipping this run")
                 continue
-            merged = pd.concat([old, fresh])
-            merged = merged[~merged.index.duplicated(keep="last")].sort_index()
-            merged = merged[merged["close"].notna()]   # never keep a no-close bar (also repairs old)
-            _write(merged, bar_path(sym))
-        print(f"  {min(i + config.BATCH_SIZE, len(cached))}/{len(cached)}")
-        time.sleep(0.5)
+            for sym, fresh in got.items():
+                old = load_bars(sym)
+                fac = _adjustment_seam(old, fresh)
+                if fac is not None:
+                    common = old.index.intersection(fresh.index) if old is not None else []
+                    r = (fresh.loc[common, "close"].astype(float) / old.loc[common, "close"].astype(float)).dropna() if len(common) else pd.Series(dtype=float)
+                    # If the adjustment factor is uniform across the overlap dates (e.g. a dividend or split
+                    # occurred after the overlap window), rescale `old` onto `fresh`'s adjusted scale in-place!
+                    if len(r) >= 2 and float((r / fac - 1.0).abs().max()) < 0.005 and 0.05 < fac < 20.0:
+                        old = old.copy()
+                        for col_c in ("open", "high", "low", "close"):
+                            if col_c in old.columns:
+                                old[col_c] = old[col_c].astype(float) * fac
+                        if abs(fac - 1.0) > 0.03 and "volume" in old.columns:
+                            old["volume"] = old["volume"].astype(float) / fac
+                    else:
+                        rebased.append((sym, fac))   # split inside overlap window -> refetch full history
+                        continue
+                merged = pd.concat([old, fresh])
+                merged = merged[~merged.index.duplicated(keep="last")].sort_index()
+                merged = merged[merged["close"].notna()]   # never keep a no-close bar (also repairs old)
+                _write(merged, bar_path(sym))
+            print(f"  [{cohort_name}] {min(i + config.BATCH_SIZE, len(cohort_syms))}/{len(cohort_syms)}")
+            time.sleep(0.3)
 
     if rebased:
         # a split/dividend re-based these histories on yfinance's side: the tail can't be merged,
