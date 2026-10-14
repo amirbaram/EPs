@@ -58,8 +58,11 @@ bash scripts/check.sh                 # Byte-compiles core EP modules + runs tes
 | Intraday Monitor Start / Stop Shell Wrappers | `scripts/start_intraday_monitor.sh`, `scripts/stop_intraday_monitor.sh` |
 | Automated Daily Universe Ingestion & Multi-App Updater | `daily_update.py` |
 | Daemon Start / Stop Shell Wrappers | `scripts/start_daily_updater.sh`, `scripts/stop_daily_updater.sh` |
-| QM System Architecture & Pipeline Guide | `docs/QM_SYSTEM_GUIDE.md` |
 | Precomputed QM Setups Dataset | `data/simulations/qm_historical_setups.parquet` |
+| QM Breakout Strategy Trades Dataset | `data/simulations/qm_strategy_trades.parquet` |
+| QM Strategy Trade Builder & Engine | `build_qm_strategy_dataset.py` |
+| QM Trailing Exit & Partial Scaling Study | `run_exact_ema_study.py` |
+| QM System Architecture & Pipeline Guide | `docs/QM_SYSTEM_GUIDE.md` |
 | Machine Learning Engine & Feature Extractors | `ep_ml_engine.py` |
 | Technical Indicators & Intermediate Ribbons | `scanner_core.py`, `indicators.py` |
 | Local Datastore Bar Loading | `datastore.py` |

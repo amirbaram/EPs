@@ -25,6 +25,7 @@ import datastore
 import ep_catalyst_enricher
 import indicators
 import labels
+import qm_ml_engine
 import scanner_core
 import thematic_engine
 
@@ -78,6 +79,9 @@ def get_df() -> pd.DataFrame:
             DF["ep_badge"] = DF["ep_badge"].fillna("Pure Technical QM")
             if "rs_score" not in DF.columns or "stage2" not in DF.columns or "dist_52w_high" not in DF.columns:
                 DF = _enrich_with_rs_technicals(DF)
+            if "qm_tier" not in DF.columns:
+                s_df = get_strategy_df()
+                DF = qm_ml_engine.get_qm_ml_engine().enrich_setups_with_ml(DF, s_df)
             print(f"Loaded {len(DF)} QM historical setups.")
         else:
             print(f"Warning: {DATA_PATH} not found. Running with empty dataset.")
@@ -172,6 +176,7 @@ def api_events():
         return jsonify({"events": [], "kpis": default_kpis, "sectors": [], "themes": [], "patterns": []})
 
     q = df.copy()
+    _ = get_strategy_df()
 
     # Strategy Mode Override
     strategy_mode = request.args.get("strategy_mode", "0") in ["1", "true", "True"]
@@ -183,13 +188,22 @@ def api_events():
             sq = strat_df.copy()
 
             # 1. Macro Universe Filter
-            strat_macro = request.args.get("strat_macro", "leading").strip()
+            strat_macro = request.args.get("strat_macro", "").strip()
+            macro_param = request.args.get("macro", "").strip()
+            # If toolbar macro chip was clicked and strat_macro is default/leading, respect toolbar macro chip
+            if macro_param and macro_param != "all" and (not strat_macro or strat_macro in ["default", "leading"]):
+                strat_macro = macro_param
+            elif not strat_macro:
+                strat_macro = "leading"
+
             if strat_macro == "leading":
                 sq = sq[sq["is_leading_macro"] == True]
             elif strat_macro == "leading_sectors":
                 sq = sq[sq["is_leading_sector"] == True]
             elif strat_macro == "leading_themes":
                 sq = sq[sq["is_leading_theme"] == True]
+            elif strat_macro == "emerging_themes":
+                sq = sq[sq["is_emerging_theme"] == True]
 
             # 2. Market Trend (SPY) Filter
             strat_spy = request.args.get("strat_spy", "spy200").strip()
@@ -237,14 +251,142 @@ def api_events():
             if strat_tech_lead == "bull_stack":
                 sq = sq[sq["qqq_spy_ratio_bull"] == True]
 
-            # 8. Sizing and Stoploss Models for Stats
+            # 8. Bollinger Band Squeeze (Pinch Ratio) Filter (modal or toolbar)
+            strat_bb_pinch = request.args.get("strat_bb_pinch", "").strip().lower()
+            if not strat_bb_pinch or strat_bb_pinch == "all":
+                strat_bb_pinch = request.args.get("bb_pinch", "all").strip().lower()
+            if strat_bb_pinch == "tight" and "pinch_ratio" in sq.columns:
+                sq = sq[sq["pinch_ratio"] <= 2.5]
+            elif strat_bb_pinch == "moderate" and "pinch_ratio" in sq.columns:
+                sq = sq[sq["pinch_ratio"] <= 3.2]
+            elif strat_bb_pinch == "mild" and "pinch_ratio" in sq.columns:
+                sq = sq[sq["pinch_ratio"] <= 4.0]
+
+            # 9. Pole Linearity (R^2) Filter (modal or toolbar)
+            strat_r2 = request.args.get("strat_r2", "").strip()
+            if not strat_r2 or strat_r2 == "all":
+                strat_r2 = request.args.get("r2", "all").strip()
+            if strat_r2 == "0.80" and "r2" in sq.columns:
+                sq = sq[sq["r2"] >= 0.80]
+            elif strat_r2 == "0.65" and "r2" in sq.columns:
+                sq = sq[sq["r2"] >= 0.65]
+            elif strat_r2 == "0.50" and "r2" in sq.columns:
+                sq = sq[sq["r2"] >= 0.50]
+
+            # 10. Toolbar Filters applied to Strategy Trades
+            # Pattern
+            pat_f = request.args.get("pattern", "all").strip()
+            if pat_f != "all" and pat_f and "pattern" in sq.columns:
+                sq = sq[sq["pattern"] == pat_f]
+
+            # Min Move %
+            min_move = request.args.get("min_move", "").strip()
+            if min_move and "move_pct" in sq.columns:
+                try:
+                    sq = sq[sq["move_pct"] >= float(min_move)]
+                except (ValueError, TypeError):
+                    pass
+
+            # Consolidation Bars
+            cons_f = request.args.get("cons_bars", "all").strip()
+            if "cons_bars" in sq.columns:
+                if cons_f == "3-7":
+                    sq = sq[(sq["cons_bars"] >= 3) & (sq["cons_bars"] <= 7)]
+                elif cons_f == "8-15":
+                    sq = sq[(sq["cons_bars"] >= 8) & (sq["cons_bars"] <= 15)]
+                elif cons_f == "16-25":
+                    sq = sq[(sq["cons_bars"] >= 16) & (sq["cons_bars"] <= 25)]
+                elif cons_f == "26-45":
+                    sq = sq[(sq["cons_bars"] >= 26) & (sq["cons_bars"] <= 45)]
+
+            # Max Pullback %
+            max_pb = request.args.get("max_pullback", "").strip()
+            if max_pb and "pullback_pct" in sq.columns:
+                try:
+                    sq = sq[sq["pullback_pct"] <= float(max_pb)]
+                except (ValueError, TypeError):
+                    pass
+
+            # Sector & Theme
+            sec_f = request.args.get("sector", "all").strip()
+            if sec_f == "leading_sectors":
+                sq = sq[sq["is_leading_sector"] == True]
+            elif sec_f != "all" and sec_f and "sector" in sq.columns:
+                sq = sq[(sq["sector"] == sec_f) | (sq.get("theme", pd.Series(dtype=object)) == sec_f) | sq.get("themes", pd.Series(dtype=object)).astype(str).str.contains(sec_f, case=False, na=False, regex=False)]
+
+            thm_f = request.args.get("theme", "all").strip()
+            if thm_f == "leading_themes":
+                sq = sq[sq["is_leading_theme"] == True]
+            elif thm_f == "emerging_themes":
+                sq = sq[sq["is_emerging_theme"] == True]
+            elif thm_f != "all" and thm_f:
+                sq = sq[sq.get("themes", pd.Series(dtype=object)).astype(str).str.contains(thm_f, case=False, na=False, regex=False) | (sq.get("theme", pd.Series(dtype=object)) == thm_f) | (sq.get("sector", pd.Series(dtype=object)) == thm_f)]
+
+            # Symbol Search
+            search_q = request.args.get("search", "").strip().upper()
+            if search_q and "symbol" in sq.columns:
+                sq = sq[sq["symbol"].str.contains(search_q, case=False, na=False)]
+
+            # 10. Setup Quality & Machine Learning Tier Filter
+            strat_tier = request.args.get("strat_tier", "").strip().lower()
+            if not strat_tier or strat_tier == "all":
+                strat_tier = request.args.get("tier", "all").strip().lower()
+            if "qm_tier" in sq.columns:
+                if strat_tier == "premier":
+                    sq = sq[sq["qm_tier"] == "Premier"]
+                elif strat_tier == "high_quality":
+                    sq = sq[sq["qm_tier"].isin(["Premier", "High Quality"])]
+                elif strat_tier == "avoid_traps":
+                    sq = sq[sq["qm_tier"] != "Toxic / Trap"]
+
+            # 11. Sizing, Stoploss, and Trailing Exit Models for Stats
             strat_stop = request.args.get("strat_stop", "06x").strip()
             strat_sizing = request.args.get("strat_sizing", "dynamic").strip()
+            strat_exit = request.args.get("strat_exit", "10ema").strip().lower()
 
-            r_key = "r_06x" if strat_stop == "06x" else "r_10x"
-            sized_r_key = "sized_r_06x" if strat_stop == "06x" else "sized_r_10x"
-            win_key = "is_win_06x" if strat_stop == "06x" else "is_win_10x"
-            bars_key = "bars_06x" if strat_stop == "06x" else "bars_10x"
+            if strat_exit == "triad_optimal":
+                r_key = "r_triad_optimal"
+                sized_r_key = "sized_r_triad_optimal"
+                win_key = "is_win_triad_optimal"
+                bars_key = "bars_triad_optimal"
+            elif strat_stop == "dynamic":
+                if strat_exit in ["climax_swing", "climax_hybrid"]:
+                    r_key = "r_dyn_climax_swing"
+                    sized_r_key = "sized_r_dyn_climax_swing"
+                    win_key = "is_win_dyn_climax_swing"
+                    bars_key = "bars_dyn_climax_swing"
+                else:
+                    r_key = "r_dyn_06x"
+                    sized_r_key = "sized_r_dyn_06x"
+                    win_key = "is_win_dyn_06x"
+                    bars_key = "bars_dyn_06x"
+            else:
+                exit_map = {
+                    "10ema": "e10",
+                    "20ema": "e20",
+                    "50ema": "e50",
+                    "staged": "staged",
+                    "balanced": "balanced",
+                    "climax_swing": "climax_swing",
+                    "climax_hybrid": "climax_hybrid",
+                    "climax_trend": "climax_trend",
+                }
+                exit_pfx = exit_map.get(strat_exit, "e10")
+                stop_sfx = "06x" if strat_stop == "06x" else "10x"
+
+                r_key = f"r_{exit_pfx}_{stop_sfx}"
+                sized_r_key = f"sized_r_{exit_pfx}_{stop_sfx}"
+                win_key = f"is_win_{exit_pfx}_{stop_sfx}"
+                bars_key = f"bars_{exit_pfx}_{stop_sfx}"
+
+            if r_key not in sq.columns:
+                r_key = f"r_{stop_sfx}" if f"r_{stop_sfx}" in sq.columns else "r_06x"
+            if sized_r_key not in sq.columns:
+                sized_r_key = f"sized_r_{stop_sfx}" if f"sized_r_{stop_sfx}" in sq.columns else "sized_r_06x"
+            if win_key not in sq.columns:
+                win_key = f"is_win_{stop_sfx}" if f"is_win_{stop_sfx}" in sq.columns else "is_win_06x"
+            if bars_key not in sq.columns:
+                bars_key = f"bars_{stop_sfx}" if f"bars_{stop_sfx}" in sq.columns else "bars_06x"
 
             eff_r = sq[sized_r_key] if strat_sizing == "dynamic" else sq[r_key]
             n_trades = len(sq)
@@ -281,138 +423,172 @@ def api_events():
                 "avg_bars": avg_bars,
                 "strat_stop": strat_stop,
                 "strat_sizing": strat_sizing,
+                "strat_exit": strat_exit,
+                "strat_tier": strat_tier,
                 "strat_macro": strat_macro,
                 "strat_spy": strat_spy,
                 "strat_rs": strat_rs,
+                "strat_bb_pinch": strat_bb_pinch,
+                "strat_r2": strat_r2,
             }
 
             # Filter events to only the qualifying breakout trades
             valid_keys = set(zip(sq["symbol"].astype(str), sq["date"].astype(str)))
             q = q[(q["state"] == "breakout") & q.apply(lambda r: (str(r["symbol"]), str(r["date"])) in valid_keys, axis=1)]
 
-    # 1. State Filter (when not in strategy mode)
+    lead_secs, lead_thms, emerg_thms = get_thematic_macro_sets()
+
+    # Filters applied only in standard Setup Mode (in Strategy Mode, all filtering is already executed on sq)
     if not strategy_mode:
+        # 1. State Filter
         state_f = request.args.get("state", "all")
         if state_f in ["breakout", "building"]:
             q = q[q["state"] == state_f]
 
-    # 2. EP Catalyst Link Filter
-    ep_link_f = request.args.get("ep_link", "all")
-    if ep_link_f == "prior":
-        q = q[q["has_prior_ep"]]
-    elif ep_link_f == "post":
-        q = q[q["has_post_ep"]]
-    elif ep_link_f == "ignited":
-        q = q[q["ep_badge"].str.contains("Ignited", case=False, na=False)]
-    elif ep_link_f == "boosted":
-        q = q[q["ep_badge"].str.contains("Boosted", case=False, na=False)]
-    elif ep_link_f == "both":
-        q = q[q["has_prior_ep"] & q["has_post_ep"]]
-    elif ep_link_f == "none":
-        q = q[~q["has_prior_ep"] & ~q["has_post_ep"]]
+        # 1b. ML Setup Quality Tier Filter (Applies to all setups & fresh building setups)
+        strat_tier = request.args.get("strat_tier", "").strip().lower()
+        if not strat_tier or strat_tier == "all":
+            strat_tier = request.args.get("tier", "all").strip().lower()
+        if strat_tier and strat_tier != "all" and "qm_tier" in q.columns:
+            if strat_tier == "premier":
+                q = q[q["qm_tier"] == "Premier"]
+            elif strat_tier == "high_quality":
+                q = q[q["qm_tier"].isin(["Premier", "High Quality"])]
+            elif strat_tier == "avoid_traps":
+                q = q[q["qm_tier"] != "Toxic / Trap"]
 
-    # 3. Pattern Filter
-    pat_f = request.args.get("pattern", "all")
-    if pat_f != "all" and pat_f:
-        q = q[q["pattern"] == pat_f]
+        # 2. EP Catalyst Link Filter
+        ep_link_f = request.args.get("ep_link", "all")
+        if ep_link_f == "prior":
+            q = q[q["has_prior_ep"]]
+        elif ep_link_f == "post":
+            q = q[q["has_post_ep"]]
+        elif ep_link_f == "ignited":
+            q = q[q["ep_badge"].str.contains("Ignited", case=False, na=False)]
+        elif ep_link_f == "boosted":
+            q = q[q["ep_badge"].str.contains("Boosted", case=False, na=False)]
+        elif ep_link_f == "both":
+            q = q[q["has_prior_ep"] & q["has_post_ep"]]
+        elif ep_link_f == "none":
+            q = q[~q["has_prior_ep"] & ~q["has_post_ep"]]
 
-    # 4. Move % Filter
-    min_move = request.args.get("min_move", "")
-    if min_move:
-        try:
-            val = float(min_move)
-            q = q[q["move_pct"] >= val]
-        except (ValueError, TypeError):
+        # 3. Pattern Filter
+        pat_f = request.args.get("pattern", "all")
+        if pat_f != "all" and pat_f:
+            q = q[q["pattern"] == pat_f]
+
+        # 4. Move % Filter
+        min_move = request.args.get("min_move", "")
+        if min_move:
+            try:
+                val = float(min_move)
+                q = q[q["move_pct"] >= val]
+            except (ValueError, TypeError):
+                pass
+
+        # 5. Consolidation Bars Filter
+        cons_f = request.args.get("cons_bars", "all")
+        if cons_f == "3-7":
+            q = q[(q["cons_bars"] >= 3) & (q["cons_bars"] <= 7)]
+        elif cons_f == "8-15":
+            q = q[(q["cons_bars"] >= 8) & (q["cons_bars"] <= 15)]
+        elif cons_f == "16-25":
+            q = q[(q["cons_bars"] >= 16) & (q["cons_bars"] <= 25)]
+        elif cons_f == "26-45":
+            q = q[(q["cons_bars"] >= 26) & (q["cons_bars"] <= 45)]
+
+        # 6. Pullback % Filter
+        max_pb = request.args.get("max_pullback", "")
+        if max_pb:
+            try:
+                val = float(max_pb)
+                q = q[q["pullback_pct"] <= val]
+            except (ValueError, TypeError):
+                pass
+
+        # 6b. Bollinger Band Squeeze (Pinch Ratio) Filter
+        bb_pinch_f = request.args.get("bb_pinch", "all").strip().lower()
+        if bb_pinch_f in ["tight", "moderate", "mild"] and "pinch_ratio" in q.columns:
+            if bb_pinch_f == "tight":
+                q = q[q["pinch_ratio"].notna() & (q["pinch_ratio"] <= 2.5)]
+            elif bb_pinch_f == "moderate":
+                q = q[q["pinch_ratio"].notna() & (q["pinch_ratio"] <= 3.2)]
+            elif bb_pinch_f == "mild":
+                q = q[q["pinch_ratio"].notna() & (q["pinch_ratio"] <= 4.0)]
+
+        # 6c. Pole Linear Regression R2 Filter
+        r2_f = request.args.get("r2", "all").strip()
+        if r2_f not in ["all", ""] and "r2" in q.columns:
+            try:
+                min_r2 = float(r2_f)
+                q = q[q["r2"].notna() & (q["r2"] >= min_r2)]
+            except (ValueError, TypeError):
+                pass
+
+        # 7. Thematic / Macro Flow Filter (Leading Sectors, Leading Themes, Emerging Themes)
+        macro_f = request.args.get("macro", "all")
+        if macro_f == "leading_sectors":
+            q = q[q["sector"].isin(lead_secs) | q["theme"].isin(lead_secs) | q["themes"].apply(lambda x: any(s in str(x) for s in lead_secs) if pd.notna(x) else False)]
+        elif macro_f == "leading_themes":
+            q = q[q["theme"].isin(lead_thms) | q["themes"].apply(lambda x: any(t in str(x) for t in lead_thms) if pd.notna(x) else False)]
+        elif macro_f == "emerging_themes":
+            q = q[q["theme"].isin(emerg_thms) | q["themes"].apply(lambda x: any(t in str(x) for t in emerg_thms) if pd.notna(x) else False)]
+
+        # 8. Sector & Theme Filters
+        sec_f = request.args.get("sector", "all")
+        if sec_f == "leading_sectors":
+            q = q[q["sector"].isin(lead_secs) | q["theme"].isin(lead_secs) | q["themes"].apply(lambda x: any(s in str(x) for s in lead_secs) if pd.notna(x) else False)]
+        elif sec_f != "all" and sec_f:
+            q = q[(q["sector"] == sec_f) | (q["theme"] == sec_f) | q["themes"].astype(str).str.contains(sec_f, case=False, na=False, regex=False)]
+
+        thm_f = request.args.get("theme", "all")
+        if thm_f == "leading_themes":
+            q = q[q["theme"].isin(lead_thms) | q["themes"].apply(lambda x: any(t in str(x) for t in lead_thms) if pd.notna(x) else False)]
+        elif thm_f == "emerging_themes":
+            q = q[q["theme"].isin(emerg_thms) | q["themes"].apply(lambda x: any(t in str(x) for t in emerg_thms) if pd.notna(x) else False)]
+        elif thm_f != "all" and thm_f:
+            q = q[q["themes"].astype(str).str.contains(thm_f, case=False, na=False, regex=False) | (q["theme"] == thm_f) | (q["sector"] == thm_f)]
+
+        # 9. Search Symbol
+        search_q = request.args.get("search", "").strip().upper()
+        if search_q:
+            q = q[q["symbol"].str.contains(search_q, case=False, na=False)]
+
+        # Relative Strength (RS) Score & Posture Filter
+        # Default: RS >= 90 for stage 2 bullish (stage2 == True) or within 15% 52w high (dist_52w_high >= -15.0)
+        rs_f = request.args.get("rs_filter", "rs90_stage2_or_15").strip()
+        if search_q and rs_f in ["rs90_stage2_or_15", "default"]:
+            pass
+        elif rs_f in ["rs90_stage2_or_15", "default"]:
+            q = q[(q["rs_score"] >= 90) & ((q["stage2"] == True) | (q["dist_52w_high"] >= -15.0))]
+        elif rs_f == "rs95_stage2_or_15":
+            q = q[(q["rs_score"] >= 95) & ((q["stage2"] == True) | (q["dist_52w_high"] >= -15.0))]
+        elif rs_f == "rs80_stage2_or_15":
+            q = q[(q["rs_score"] >= 80) & ((q["stage2"] == True) | (q["dist_52w_high"] >= -15.0))]
+        elif rs_f == "rs70_stage2_or_15":
+            q = q[(q["rs_score"] >= 70) & ((q["stage2"] == True) | (q["dist_52w_high"] >= -15.0))]
+        elif rs_f == "rs90_any":
+            q = q[q["rs_score"] >= 90]
+        elif rs_f == "rs80_any":
+            q = q[q["rs_score"] >= 80]
+        elif rs_f == "stage2_only":
+            q = q[q["stage2"] == True]
+        elif rs_f == "near_ath_only":
+            q = q[q["dist_52w_high"] >= -15.0]
+        elif rs_f == "all":
             pass
 
-    # 5. Consolidation Bars Filter
-    cons_f = request.args.get("cons_bars", "all")
-    if cons_f == "3-7":
-        q = q[(q["cons_bars"] >= 3) & (q["cons_bars"] <= 7)]
-    elif cons_f == "8-15":
-        q = q[(q["cons_bars"] >= 8) & (q["cons_bars"] <= 15)]
-    elif cons_f == "16-25":
-        q = q[(q["cons_bars"] >= 16) & (q["cons_bars"] <= 25)]
-    elif cons_f == "26-45":
-        q = q[(q["cons_bars"] >= 26) & (q["cons_bars"] <= 45)]
-
-    # 6. Pullback % Filter
-    max_pb = request.args.get("max_pullback", "")
-    if max_pb:
-        try:
-            val = float(max_pb)
-            q = q[q["pullback_pct"] <= val]
-        except (ValueError, TypeError):
-            pass
-
-    lead_secs, lead_thms, emerg_thms = get_thematic_macro_sets()
-
-    # 7. Thematic / Macro Flow Filter (Leading Sectors, Leading Themes, Emerging Themes)
-    macro_f = request.args.get("macro", "all")
-    if macro_f == "leading_sectors":
-        q = q[q["sector"].isin(lead_secs)]
-    elif macro_f == "leading_themes":
-        q = q[q["theme"].isin(lead_thms) | q["themes"].apply(lambda x: any(t in str(x) for t in lead_thms) if pd.notna(x) else False)]
-    elif macro_f == "emerging_themes":
-        q = q[q["theme"].isin(emerg_thms) | q["themes"].apply(lambda x: any(t in str(x) for t in emerg_thms) if pd.notna(x) else False)]
-
-    # 8. Sector & Theme Filters
-    sec_f = request.args.get("sector", "all")
-    if sec_f == "leading_sectors":
-        q = q[q["sector"].isin(lead_secs)]
-    elif sec_f != "all" and sec_f:
-        q = q[q["sector"] == sec_f]
-
-    thm_f = request.args.get("theme", "all")
-    if thm_f == "leading_themes":
-        q = q[q["theme"].isin(lead_thms) | q["themes"].apply(lambda x: any(t in str(x) for t in lead_thms) if pd.notna(x) else False)]
-    elif thm_f == "emerging_themes":
-        q = q[q["theme"].isin(emerg_thms) | q["themes"].apply(lambda x: any(t in str(x) for t in emerg_thms) if pd.notna(x) else False)]
-    elif thm_f != "all" and thm_f:
-        q = q[q["themes"].str.contains(thm_f, case=False, na=False) | (q["theme"] == thm_f)]
-
-    # 9. Search Symbol
-    search_q = request.args.get("search", "").strip().upper()
-    if search_q:
-        q = q[q["symbol"].str.contains(search_q, case=False, na=False)]
-
-    # Relative Strength (RS) Score & Posture Filter
-    # Default: RS >= 90 for stage 2 bullish (stage2 == True) or within 15% 52w high (dist_52w_high >= -15.0)
-    rs_f = request.args.get("rs_filter", "rs90_stage2_or_15").strip()
-    if search_q and rs_f in ["rs90_stage2_or_15", "default"]:
-        # When specifically searching for a ticker symbol, show full historical setups for that stock
-        # rather than restricting to only moments the ticker had RS >= 90
-        pass
-    elif rs_f in ["rs90_stage2_or_15", "default"]:
-        q = q[(q["rs_score"] >= 90) & ((q["stage2"] == True) | (q["dist_52w_high"] >= -15.0))]
-    elif rs_f == "rs95_stage2_or_15":
-        q = q[(q["rs_score"] >= 95) & ((q["stage2"] == True) | (q["dist_52w_high"] >= -15.0))]
-    elif rs_f == "rs80_stage2_or_15":
-        q = q[(q["rs_score"] >= 80) & ((q["stage2"] == True) | (q["dist_52w_high"] >= -15.0))]
-    elif rs_f == "rs70_stage2_or_15":
-        q = q[(q["rs_score"] >= 70) & ((q["stage2"] == True) | (q["dist_52w_high"] >= -15.0))]
-    elif rs_f == "rs90_any":
-        q = q[q["rs_score"] >= 90]
-    elif rs_f == "rs80_any":
-        q = q[q["rs_score"] >= 80]
-    elif rs_f == "stage2_only":
-        q = q[q["stage2"] == True]
-    elif rs_f == "near_ath_only":
-        q = q[q["dist_52w_high"] >= -15.0]
-    elif rs_f == "all":
-        pass
-
-    min_rs = request.args.get("min_rs", "").strip()
-    if min_rs:
-        try:
-            val_rs = float(min_rs)
-            req_posture = request.args.get("rs_posture", "1") in ["1", "true", "True"]
-            if req_posture:
-                q = q[(q["rs_score"] >= val_rs) & ((q["stage2"] == True) | (q["dist_52w_high"] >= -15.0))]
-            else:
-                q = q[q["rs_score"] >= val_rs]
-        except (ValueError, TypeError):
-            pass
+        min_rs = request.args.get("min_rs", "").strip()
+        if min_rs:
+            try:
+                val_rs = float(min_rs)
+                req_posture = request.args.get("rs_posture", "1") in ["1", "true", "True"]
+                if req_posture:
+                    q = q[(q["rs_score"] >= val_rs) & ((q["stage2"] == True) | (q["dist_52w_high"] >= -15.0))]
+                else:
+                    q = q[q["rs_score"] >= val_rs]
+            except (ValueError, TypeError):
+                pass
 
     # Sort default by date descending
     sort_col = request.args.get("sort", "date")
@@ -430,7 +606,7 @@ def api_events():
     ignited_cnt = int(q["ep_badge"].str.contains("Ignited", case=False, na=False).sum())
     avg_move = round(float(q["move_pct"].mean()), 1) if not q.empty else 0.0
 
-    lead_sec_cnt = int(q["sector"].isin(lead_secs).sum())
+    lead_sec_cnt = int((q["sector"].isin(lead_secs) | q["theme"].isin(lead_secs) | q["themes"].apply(lambda x: any(s in str(x) for s in lead_secs) if pd.notna(x) else False)).sum())
     lead_thm_cnt = int((q["theme"].isin(lead_thms) | q["themes"].apply(lambda x: any(t in str(x) for t in lead_thms) if pd.notna(x) else False)).sum())
     emerg_thm_cnt = int((q["theme"].isin(emerg_thms) | q["themes"].apply(lambda x: any(t in str(x) for t in emerg_thms) if pd.notna(x) else False)).sum())
     rs_lead_cnt = int(((q["rs_score"] >= 90) & ((q["stage2"] == True) | (q["dist_52w_high"] >= -15.0))).sum()) if not q.empty else 0
@@ -468,13 +644,39 @@ def api_events():
         sec_val = str(row.get("sector", ""))
         thm_val = str(row.get("theme", ""))
         thms_val = str(row.get("themes", ""))
-        is_lead_sec = sec_val in lead_secs
+        is_lead_sec = (sec_val in lead_secs) or (thm_val in lead_secs) or any(s in thms_val for s in lead_secs)
         is_lead_thm = (thm_val in lead_thms) or any(t in thms_val for t in lead_thms)
         is_emerg_thm = (thm_val in emerg_thms) or any(t in thms_val for t in emerg_thms)
 
+        sym_str = str(row["symbol"])
+        date_str = str(row["date"])
+        strat_trade = STRATEGY_LOOKUP.get((sym_str, date_str)) if STRATEGY_LOOKUP else None
+
+        qm_tier = None
+        qm_score = None
+        p_big_move = None
+        p_trap = None
+        if strat_trade:
+            if "qm_tier" in strat_trade and pd.notna(strat_trade["qm_tier"]):
+                qm_tier = str(strat_trade["qm_tier"])
+            if "qm_score" in strat_trade and pd.notna(strat_trade["qm_score"]):
+                qm_score = round(float(strat_trade["qm_score"]), 1)
+            if "p_big_move" in strat_trade and pd.notna(strat_trade["p_big_move"]):
+                p_big_move = round(float(strat_trade["p_big_move"]), 3)
+            if "p_trap" in strat_trade and pd.notna(strat_trade["p_trap"]):
+                p_trap = round(float(strat_trade["p_trap"]), 3)
+        elif "qm_tier" in row and pd.notna(row.get("qm_tier")):
+            qm_tier = str(row["qm_tier"])
+            if "qm_score" in row and pd.notna(row.get("qm_score")):
+                qm_score = round(float(row["qm_score"]), 1)
+            if "p_big_move" in row and pd.notna(row.get("p_big_move")):
+                p_big_move = round(float(row["p_big_move"]), 3)
+            if "p_trap" in row and pd.notna(row.get("p_trap")):
+                p_trap = round(float(row["p_trap"]), 3)
+
         rec = {
-            "symbol": str(row["symbol"]),
-            "date": str(row["date"]),
+            "symbol": sym_str,
+            "date": date_str,
             "state": str(row["state"]),
             "rs_score": int(row["rs_score"]) if pd.notna(row.get("rs_score")) else None,
             "stage2": bool(row.get("stage2", False)) if pd.notna(row.get("stage2")) else False,
@@ -482,6 +684,8 @@ def api_events():
             "move_pct": round(float(row["move_pct"]), 1),
             "cons_bars": int(row["cons_bars"]),
             "pullback_pct": round(float(row["pullback_pct"]), 1),
+            "r2": round(float(row["r2"]), 3) if ("r2" in row and pd.notna(row.get("r2"))) else None,
+            "pinch_ratio": round(float(row["pinch_ratio"]), 2) if ("pinch_ratio" in row and pd.notna(row.get("pinch_ratio"))) else None,
             "ride_frac": round(float(row["ride_frac"]), 2) if pd.notna(row.get("ride_frac")) else 0.0,
             "shakeouts": int(row["shakeouts"]) if pd.notna(row.get("shakeouts")) else 0,
             "vol_x": round(float(row["vol_x"]), 2) if pd.notna(row.get("vol_x")) else None,
@@ -514,6 +718,10 @@ def api_events():
             "post_ep_subtype": str(row.get("post_ep_subtype", "")) if pd.notna(row.get("post_ep_subtype")) else None,
             "post_ep_catalyst": str(row.get("post_ep_catalyst", "")) if pd.notna(row.get("post_ep_catalyst")) else "",
             "ep_badge": str(row.get("ep_badge", "Pure Technical QM")),
+            "qm_tier": qm_tier,
+            "qm_score": qm_score,
+            "p_big_move": p_big_move,
+            "p_trap": p_trap,
         }
         events_list.append(rec)
 
@@ -768,6 +976,8 @@ def api_chart():
         "move_pct": round(float(setup_row.get("move_pct", 0.0)), 1) if setup_row else 0.0,
         "cons_bars": int(setup_row.get("cons_bars", 0)) if setup_row else 0,
         "pullback_pct": round(float(setup_row.get("pullback_pct", 0.0)), 1) if setup_row else 0.0,
+        "r2": round(float(setup_row["r2"]), 3) if setup_row and "r2" in setup_row and pd.notna(setup_row.get("r2")) else None,
+        "pinch_ratio": round(float(setup_row["pinch_ratio"]), 2) if setup_row and "pinch_ratio" in setup_row and pd.notna(setup_row.get("pinch_ratio")) else None,
         "ride_frac": round(float(setup_row.get("ride_frac", 0.0)), 2) if setup_row else 0.0,
         "shakeouts": int(setup_row.get("shakeouts", 0)) if setup_row else 0,
         "vol_x": round(float(setup_row.get("vol_x", 1.0)), 2) if (setup_row and pd.notna(setup_row.get("vol_x"))) else None,
@@ -800,6 +1010,37 @@ def api_chart():
         "ep_badge": str(setup_row.get("ep_badge", "Pure Technical QM")) if setup_row else "Pure Technical QM",
     }
 
+    # Fetch all setups for this symbol for multi-setup visualization
+    symbol_setups = []
+    if not dataset.empty:
+        sym_matches = dataset[dataset["symbol"] == sym].sort_values("date")
+        for _, s_row in sym_matches.iterrows():
+            st_levs = s_row.get("stack_levels", [])
+            if isinstance(st_levs, np.ndarray):
+                st_levs = st_levs.tolist()
+            elif not isinstance(st_levs, (list, tuple)):
+                st_levs = []
+            symbol_setups.append({
+                "symbol": sym,
+                "date": str(s_row["date"]),
+                "state": str(s_row.get("state", "building")),
+                "level": round(float(s_row.get("level", 0.0)), 2),
+                "trigger": round(float(s_row.get("trigger", 0.0)), 2),
+                "dist_to_trigger_pct": round(float(s_row.get("dist_to_trigger_pct", 0.0)), 2),
+                "qm_pole_start": str(s_row.get("qm_pole_start", "")),
+                "qm_pole_end": str(s_row.get("qm_pole_end", "")),
+                "qm_cons_start": str(s_row.get("qm_cons_start", "")),
+                "qm_cons_end": str(s_row.get("qm_cons_end", "")),
+                "stack_levels": [round(float(x), 2) for x in st_levs],
+                "r2": round(float(s_row["r2"]), 3) if ("r2" in s_row and pd.notna(s_row.get("r2"))) else None,
+                "pinch_ratio": round(float(s_row["pinch_ratio"]), 2) if ("pinch_ratio" in s_row and pd.notna(s_row.get("pinch_ratio"))) else None,
+                "move_pct": round(float(s_row.get("move_pct", 0.0)), 1),
+                "cons_bars": int(s_row.get("cons_bars", 0)),
+                "pullback_pct": round(float(s_row.get("pullback_pct", 0.0)), 1),
+                "pattern": str(s_row.get("pattern", "other")),
+                "ep_badge": str(s_row.get("ep_badge", "Pure Technical QM")),
+            })
+
     # Enrich with Strategy Trade Execution & Conviction Sizing if breakout
     _ = get_strategy_df()
     if STRATEGY_LOOKUP:
@@ -816,24 +1057,101 @@ def api_chart():
                 "exit_price_06x": round(float(tr["exit_price_06x"]), 2),
                 "exit_reason_06x": str(tr["exit_reason_06x"]),
                 "bars_06x": int(tr["bars_06x"]),
-                "r_06x": round(float(tr["r_06x"]), 2),
-                "sized_r_06x": round(float(tr["sized_r_06x"]), 2),
+                "r_06x": round(float(tr.get("r_e10_06x", tr.get("r_06x", 0.0))), 2),
+                "sized_r_06x": round(float(tr.get("sized_r_e10_06x", tr.get("sized_r_06x", 0.0))), 2),
                 "gain_pct_06x": round(float(tr["gain_pct_06x"]), 1),
                 "mfe_r_06x": round(float(tr["mfe_r_06x"]), 2),
                 "mae_r_06x": round(float(tr["mae_r_06x"]), 2),
-                "is_win_06x": bool(tr["is_win_06x"]),
+                "is_win_06x": bool(tr.get("is_win_e10_06x", tr.get("is_win_06x", False))),
+                # Trailing Exits (0.6x Stop)
+                "r_e10_06x": round(float(tr.get("r_e10_06x", tr.get("r_06x", 0.0))), 2),
+                "sized_r_e10_06x": round(float(tr.get("sized_r_e10_06x", tr.get("sized_r_06x", 0.0))), 2),
+                "is_win_e10_06x": bool(tr.get("is_win_e10_06x", tr.get("is_win_06x", False))),
+                "bars_e10_06x": int(tr.get("bars_e10_06x", tr.get("bars_06x", 0))),
+                "r_e20_06x": round(float(tr.get("r_e20_06x", 0.0)), 2),
+                "sized_r_e20_06x": round(float(tr.get("sized_r_e20_06x", 0.0)), 2),
+                "is_win_e20_06x": bool(tr.get("is_win_e20_06x", False)),
+                "bars_e20_06x": int(tr.get("bars_e20_06x", 0)),
+                "r_e50_06x": round(float(tr.get("r_e50_06x", 0.0)), 2),
+                "sized_r_e50_06x": round(float(tr.get("sized_r_e50_06x", 0.0)), 2),
+                "is_win_e50_06x": bool(tr.get("is_win_e50_06x", False)),
+                "bars_e50_06x": int(tr.get("bars_e50_06x", 0)),
+                "r_staged_06x": round(float(tr.get("r_staged_06x", 0.0)), 2),
+                "sized_r_staged_06x": round(float(tr.get("sized_r_staged_06x", 0.0)), 2),
+                "is_win_staged_06x": bool(tr.get("is_win_staged_06x", False)),
+                "bars_staged_06x": int(tr.get("bars_staged_06x", 0)),
+                "r_balanced_06x": round(float(tr.get("r_balanced_06x", 0.0)), 2),
+                "sized_r_balanced_06x": round(float(tr.get("sized_r_balanced_06x", 0.0)), 2),
+                "is_win_balanced_06x": bool(tr.get("is_win_balanced_06x", False)),
+                "bars_balanced_06x": int(tr.get("bars_balanced_06x", 0)),
+                # Dedicated ML Climax Partial Scaling Exits (0.6x Stop)
+                "r_climax_swing_06x": round(float(tr.get("r_climax_swing_06x", 0.0)), 2),
+                "sized_r_climax_swing_06x": round(float(tr.get("sized_r_climax_swing_06x", 0.0)), 2),
+                "is_win_climax_swing_06x": bool(tr.get("is_win_climax_swing_06x", False)),
+                "bars_climax_swing_06x": int(tr.get("bars_climax_swing_06x", 0)),
+                "climax_date_06x": str(tr["climax_date_06x"]) if pd.notna(tr.get("climax_date_06x")) and tr.get("climax_date_06x") else None,
+                "climax_price_06x": round(float(tr["climax_price_06x"]), 2) if pd.notna(tr.get("climax_price_06x")) and tr.get("climax_price_06x") is not None else None,
+                "climax_r_06x": round(float(tr["climax_r_06x"]), 2) if pd.notna(tr.get("climax_r_06x")) and tr.get("climax_r_06x") is not None else None,
+                "prob_exhaustion_06x": round(float(tr["prob_exhaustion_06x"]), 3) if pd.notna(tr.get("prob_exhaustion_06x")) and tr.get("prob_exhaustion_06x") is not None else None,
+                "r_climax_hybrid_06x": round(float(tr.get("r_climax_hybrid_06x", 0.0)), 2),
+                "sized_r_climax_hybrid_06x": round(float(tr.get("sized_r_climax_hybrid_06x", 0.0)), 2),
+                "is_win_climax_hybrid_06x": bool(tr.get("is_win_climax_hybrid_06x", False)),
+                "bars_climax_hybrid_06x": int(tr.get("bars_climax_hybrid_06x", 0)),
+                "r_climax_trend_06x": round(float(tr.get("r_climax_trend_06x", 0.0)), 2),
+                "sized_r_climax_trend_06x": round(float(tr.get("sized_r_climax_trend_06x", 0.0)), 2),
+                "is_win_climax_trend_06x": bool(tr.get("is_win_climax_trend_06x", False)),
+                "bars_climax_trend_06x": int(tr.get("bars_climax_trend_06x", 0)),
+                # 1.0x Full Pivot Stoploss Trade
                 "stop_loss_10x": round(float(tr["stop_loss_10x"]), 2),
                 "risk_pct_10x": round(float(tr["risk_pct_10x"]), 1),
                 "exit_date_10x": str(tr["exit_date_10x"]),
                 "exit_price_10x": round(float(tr["exit_price_10x"]), 2),
                 "exit_reason_10x": str(tr["exit_reason_10x"]),
                 "bars_10x": int(tr["bars_10x"]),
-                "r_10x": round(float(tr["r_10x"]), 2),
-                "sized_r_10x": round(float(tr["sized_r_10x"]), 2),
+                "r_10x": round(float(tr.get("r_e10_10x", tr.get("r_10x", 0.0))), 2),
+                "sized_r_10x": round(float(tr.get("sized_r_e10_10x", tr.get("sized_r_10x", 0.0))), 2),
                 "gain_pct_10x": round(float(tr["gain_pct_10x"]), 1),
                 "mfe_r_10x": round(float(tr["mfe_r_10x"]), 2),
                 "mae_r_10x": round(float(tr["mae_r_10x"]), 2),
-                "is_win_10x": bool(tr["is_win_10x"]),
+                "is_win_10x": bool(tr.get("is_win_e10_10x", tr.get("is_win_10x", False))),
+                # Trailing Exits (1.0x Stop)
+                "r_e10_10x": round(float(tr.get("r_e10_10x", tr.get("r_10x", 0.0))), 2),
+                "sized_r_e10_10x": round(float(tr.get("sized_r_e10_10x", tr.get("sized_r_10x", 0.0))), 2),
+                "is_win_e10_10x": bool(tr.get("is_win_e10_10x", tr.get("is_win_10x", False))),
+                "bars_e10_10x": int(tr.get("bars_e10_10x", tr.get("bars_10x", 0))),
+                "r_e20_10x": round(float(tr.get("r_e20_10x", 0.0)), 2),
+                "sized_r_e20_10x": round(float(tr.get("sized_r_e20_10x", 0.0)), 2),
+                "is_win_e20_10x": bool(tr.get("is_win_e20_10x", False)),
+                "bars_e20_10x": int(tr.get("bars_e20_10x", 0)),
+                "r_e50_10x": round(float(tr.get("r_e50_10x", 0.0)), 2),
+                "sized_r_e50_10x": round(float(tr.get("sized_r_e50_10x", 0.0)), 2),
+                "is_win_e50_10x": bool(tr.get("is_win_e50_10x", False)),
+                "bars_e50_10x": int(tr.get("bars_e50_10x", 0)),
+                "r_staged_10x": round(float(tr.get("r_staged_10x", 0.0)), 2),
+                "sized_r_staged_10x": round(float(tr.get("sized_r_staged_10x", 0.0)), 2),
+                "is_win_staged_10x": bool(tr.get("is_win_staged_10x", False)),
+                "bars_staged_10x": int(tr.get("bars_staged_10x", 0)),
+                "r_balanced_10x": round(float(tr.get("r_balanced_10x", 0.0)), 2),
+                "sized_r_balanced_10x": round(float(tr.get("sized_r_balanced_10x", 0.0)), 2),
+                "is_win_balanced_10x": bool(tr.get("is_win_balanced_10x", False)),
+                "bars_balanced_10x": int(tr.get("bars_balanced_10x", 0)),
+                # Dedicated ML Climax Partial Scaling Exits (1.0x Stop)
+                "r_climax_swing_10x": round(float(tr.get("r_climax_swing_10x", 0.0)), 2),
+                "sized_r_climax_swing_10x": round(float(tr.get("sized_r_climax_swing_10x", 0.0)), 2),
+                "is_win_climax_swing_10x": bool(tr.get("is_win_climax_swing_10x", False)),
+                "bars_climax_swing_10x": int(tr.get("bars_climax_swing_10x", 0)),
+                "climax_date_10x": str(tr["climax_date_10x"]) if pd.notna(tr.get("climax_date_10x")) and tr.get("climax_date_10x") else None,
+                "climax_price_10x": round(float(tr["climax_price_10x"]), 2) if pd.notna(tr.get("climax_price_10x")) and tr.get("climax_price_10x") is not None else None,
+                "climax_r_10x": round(float(tr["climax_r_10x"]), 2) if pd.notna(tr.get("climax_r_10x")) and tr.get("climax_r_10x") is not None else None,
+                "prob_exhaustion_10x": round(float(tr["prob_exhaustion_10x"]), 3) if pd.notna(tr.get("prob_exhaustion_10x")) and tr.get("prob_exhaustion_10x") is not None else None,
+                "r_climax_hybrid_10x": round(float(tr.get("r_climax_hybrid_10x", 0.0)), 2),
+                "sized_r_climax_hybrid_10x": round(float(tr.get("sized_r_climax_hybrid_10x", 0.0)), 2),
+                "is_win_climax_hybrid_10x": bool(tr.get("is_win_climax_hybrid_10x", False)),
+                "bars_climax_hybrid_10x": int(tr.get("bars_climax_hybrid_10x", 0)),
+                "r_climax_trend_10x": round(float(tr.get("r_climax_trend_10x", 0.0)), 2),
+                "sized_r_climax_trend_10x": round(float(tr.get("sized_r_climax_trend_10x", 0.0)), 2),
+                "is_win_climax_trend_10x": bool(tr.get("is_win_climax_trend_10x", False)),
+                "bars_climax_trend_10x": int(tr.get("bars_climax_trend_10x", 0)),
                 "pos_size_mult": round(float(tr["pos_size_mult"]), 2),
                 "s_ep": round(float(tr["s_ep"]), 2),
                 "s_pole": round(float(tr["s_pole"]), 2),
@@ -847,7 +1165,38 @@ def api_chart():
                 "is_leading_macro": bool(tr["is_leading_macro"]),
                 "is_leading_sector": bool(tr["is_leading_sector"]),
                 "is_leading_theme": bool(tr["is_leading_theme"]),
+                # Institutional ML Triad Fields
+                "qm_score": round(float(tr.get("qm_score", 50.0)), 1) if pd.notna(tr.get("qm_score")) else None,
+                "qm_tier": str(tr.get("qm_tier", "Standard")) if pd.notna(tr.get("qm_tier")) else "Standard",
+                "p_big_move": round(float(tr.get("p_big_move", 0.25)), 3) if pd.notna(tr.get("p_big_move")) else None,
+                "p_trap": round(float(tr.get("p_trap", 0.23)), 3) if pd.notna(tr.get("p_trap")) else None,
+                "conviction_sizing": round(float(tr.get("conviction_sizing", 1.0)), 2) if pd.notna(tr.get("conviction_sizing")) else 1.0,
+                "ml_recommendation": str(tr.get("ml_recommendation", "")) if pd.notna(tr.get("ml_recommendation")) else "",
+                "pred_mae_pct": round(float(tr.get("pred_mae_pct", 4.5)), 2) if pd.notna(tr.get("pred_mae_pct")) else None,
+                "stop_loss_dynamic": round(float(tr.get("stop_loss_dynamic", 0.0)), 2) if pd.notna(tr.get("stop_loss_dynamic")) else None,
+                "risk_pct_dynamic": round(float(tr.get("risk_pct_dynamic", 4.5)), 2) if pd.notna(tr.get("risk_pct_dynamic")) else None,
+                "r_dyn_06x": round(float(tr.get("r_dyn_06x", 0.0)), 2) if pd.notna(tr.get("r_dyn_06x")) else 0.0,
+                "sized_r_dyn_06x": round(float(tr.get("sized_r_dyn_06x", 0.0)), 2) if pd.notna(tr.get("sized_r_dyn_06x")) else 0.0,
+                "is_win_dyn_06x": bool(tr.get("is_win_dyn_06x", False)),
+                "r_dyn_climax_swing": round(float(tr.get("r_dyn_climax_swing", 0.0)), 2) if pd.notna(tr.get("r_dyn_climax_swing")) else 0.0,
+                "sized_r_dyn_climax_swing": round(float(tr.get("sized_r_dyn_climax_swing", 0.0)), 2) if pd.notna(tr.get("sized_r_dyn_climax_swing")) else 0.0,
+                "is_win_dyn_climax_swing": bool(tr.get("is_win_dyn_climax_swing", False)),
+                "r_triad_optimal": round(float(tr.get("r_triad_optimal", 0.0)), 2) if pd.notna(tr.get("r_triad_optimal")) else 0.0,
+                "sized_r_triad_optimal": round(float(tr.get("sized_r_triad_optimal", 0.0)), 2) if pd.notna(tr.get("sized_r_triad_optimal")) else 0.0,
+                "is_win_triad_optimal": bool(tr.get("is_win_triad_optimal", False)),
             }
+
+    # Generate Real-Time ML Guidance for any setup (fresh or historical)
+    try:
+        if setup_payload.get("trade_info"):
+            cur_p = float(setup_payload["trade_info"]["entry_price"])
+            p_low = float(setup_payload["trade_info"]["pivot_low_price"])
+        else:
+            cur_p = float(setup_payload.get("trigger", df["close"].iloc[pos])) if setup_payload else float(df["close"].iloc[pos])
+            p_low = float(setup_payload.get("level", df["low"].iloc[pos])) if setup_payload else float(df["low"].iloc[pos])
+        setup_payload["ml_guidance"] = qm_ml_engine.get_qm_ml_engine().get_setup_guidance(setup_row if setup_row is not None else {}, cur_p, p_low)
+    except Exception:
+        pass
 
     return jsonify({
         "symbol": sym,
@@ -862,6 +1211,7 @@ def api_chart():
         "larsson": larsson_data,
         "larsson_spans": list(larsson_spans),
         "setup": setup_payload,
+        "symbol_setups": symbol_setups,
         "sector_theme": sector_theme_payload,
         "catalyst": catalyst_dossier,
         "all_eps": symbol_eps,
@@ -956,6 +1306,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   tr { cursor: pointer; transition: background 0.1s; }
   tr:hover { background: #1a2233; }
   tr.selected { background: #1e293b; outline: 1px solid var(--accent); }
+  .setup-cb { cursor: pointer; accent-color: #38bdf8; width: 14px; height: 14px; vertical-align: middle; }
+  .color-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 5px; vertical-align: middle; }
 
   /* Center Pane: Full-Height Chart */
   .chart-pane { flex: 1.5; min-width: 480px; min-height: 0; display: flex; flex-direction: column; background: #0c0f16; border-right: 1px solid var(--border); position: relative; overflow: hidden; }
@@ -1382,6 +1734,26 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   </div>
 
   <div class="filter-group">
+    <label>BB Squeeze:</label>
+    <select id="sel_bb_pinch" onchange="fetchEvents()">
+      <option value="all" selected>All</option>
+      <option value="tight">⚡ Tight (≤ 2.5x ADR)</option>
+      <option value="moderate">Moderate (≤ 3.2x ADR)</option>
+      <option value="mild">Mild (≤ 4.0x ADR)</option>
+    </select>
+  </div>
+
+  <div class="filter-group">
+    <label>Pole R²:</label>
+    <select id="sel_r2" onchange="fetchEvents()">
+      <option value="all" selected>All</option>
+      <option value="0.80">🔥 High (R² ≥ 0.80)</option>
+      <option value="0.65">Standard (R² ≥ 0.65)</option>
+      <option value="0.50">Permissive (R² ≥ 0.50)</option>
+    </select>
+  </div>
+
+  <div class="filter-group">
     <label>Sector:</label>
     <select id="sel_sector" onchange="onSectorChange()">
       <option value="all">All Sectors</option>
@@ -1400,6 +1772,44 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
   <div class="filter-group">
     <input type="text" id="inp_search" placeholder="Search symbol..." style="width:120px;" oninput="onSearchInput()">
+  </div>
+
+  <div class="filter-group" id="grp_strat_tier" style="display:flex; align-items:center; gap:5px;">
+    <label style="color:#10b981; font-weight:700; font-size:11px;">ML Quality:</label>
+    <select id="sel_strat_tier" onchange="onStratTierChange()" style="font-size:11px; border-color:#059669; background:#0f172a; color:#34d399; font-weight:600; border-radius:4px; padding:3px 6px;">
+      <option value="all" selected>🌐 All Setups (Unfiltered Universe)</option>
+      <option value="avoid_traps">🛡️ Broad System (Avoid Traps — 173 Trades)</option>
+      <option value="high_quality">⭐ Active Balanced (Tiers 1-2 — 58 Trades)</option>
+      <option value="premier">💎 Apex Conviction (Premier Tier 1 — 16 Trades)</option>
+    </select>
+  </div>
+
+  <div class="filter-group" id="grp_strat_archetype" style="display:flex; align-items:center; gap:5px;">
+    <label style="color:#c084fc; font-weight:700; font-size:11px;">Archetype:</label>
+    <select id="sel_trader_archetype" onchange="onTraderArchetypeChange()" style="font-size:11px; border-color:#9333ea; background:#0f172a; color:#c084fc; font-weight:600; border-radius:4px; padding:3px 6px;">
+      <option value="custom">Custom Configuration</option>
+      <option value="institutional_triad">👑 Institutional Triad: All Trades (518 Trades)</option>
+      <option value="institutional_triad_balanced">⭐ Institutional Triad: Active Balanced (58 Trades)</option>
+      <option value="institutional_triad_apex">💎 Institutional Triad: Apex Conviction (16 Trades)</option>
+      <option value="high_velocity" selected>⚡ High-Velocity Swing (Tight Stops, Climax Partial, Fast Turnover)</option>
+      <option value="institutional_hybrid">🏛️ Institutional Scale-Out (Multi-Leg Staged, RS Leaders)</option>
+      <option value="position_trend">📈 Position / Trend (Wider Stops, 50 EMA Runners)</option>
+    </select>
+  </div>
+
+  <div class="filter-group" id="grp_strat_exit" style="display:none; align-items:center; gap:5px;">
+    <label style="color:#38bdf8; font-weight:700; font-size:11px;">Exit Model:</label>
+    <select id="sel_strat_exit" onchange="onStratExitChange()" style="font-size:11px; border-color:#0284c7; background:#0f172a; color:#38bdf8; font-weight:600; border-radius:4px; padding:3px 6px;">
+      <option value="triad_optimal">👑 Institutional Triad (Dynamic Stop + Climax + Conviction)</option>
+      <option value="climax_swing" selected>🎯 ML Climax Swing (50% Climax @ P≥0.45, 50% 10 EMA)</option>
+      <option value="climax_hybrid">🎯 ML Climax Hybrid (33% Climax @ P≥0.50, 33% 10E, 34% 20E)</option>
+      <option value="climax_trend">🎯 ML Climax Trend (50% Climax @ P≥0.65, 50% 50 EMA)</option>
+      <option value="10ema">10 EMA Trailing</option>
+      <option value="20ema">20 EMA Trailing</option>
+      <option value="50ema">50 EMA Trailing</option>
+      <option value="staged">Staged Scale (33/33/34)</option>
+      <option value="balanced">Balanced Scale (50/50)</option>
+    </select>
   </div>
 
   <div class="filter-group" style="margin-left:auto; display:flex; align-items:center; gap:5px;">
@@ -1463,9 +1873,20 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
   <!-- Left: Main Table -->
   <div class="table-pane" id="table_pane">
+    <div style="display:flex; justify-content:space-between; align-items:center; padding:6px 10px; background:#11151f; border-bottom:1px solid var(--border); position:sticky; top:0; z-index:15;">
+      <span style="font-weight:700; font-size:11.5px; color:#94a3b8;" id="table_setups_count">QM Setups</span>
+      <div style="display:flex; gap:6px;">
+        <button class="btn-filter-chip" onclick="selectAllSetups()" style="padding:2px 8px; font-size:10.5px;">Select All</button>
+        <button class="btn-filter-chip" onclick="clearSelectedSetups()" style="padding:2px 8px; font-size:10.5px;">Clear</button>
+      </div>
+    </div>
     <table>
       <thead>
         <tr>
+          <th style="width:28px; text-align:center;">
+            <input type="checkbox" id="header_select_all" onchange="toggleSelectAll(this.checked)" title="Select/Deselect All Visible Setups" class="setup-cb">
+          </th>
+          <th style="width:38px; text-align:center;">#</th>
           <th class="tl" onclick="sortTable('symbol')">Symbol</th>
           <th class="tl" onclick="sortTable('date')">Date</th>
           <th class="tl" onclick="sortTable('state')">State</th>
@@ -1473,12 +1894,14 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           <th onclick="sortTable('move_pct')">Pole Move</th>
           <th onclick="sortTable('cons_bars')">Cons</th>
           <th onclick="sortTable('pullback_pct')">Pullback</th>
+          <th onclick="sortTable('r2')" title="Pole Linearity R² (0.00-1.00)">R²</th>
+          <th onclick="sortTable('pinch_ratio')" title="Base Bollinger Band Squeeze (Min BB Width / ADR20)">BB Squeeze</th>
           <th class="tl" onclick="sortTable('pattern')">Pattern</th>
           <th class="tl" onclick="sortTable('ep_badge')">EP Catalyst Link</th>
         </tr>
       </thead>
       <tbody id="events_tbody">
-        <tr><td colspan="9" style="text-align:center; padding:30px; color:var(--muted);">Loading QM setups...</td></tr>
+        <tr><td colspan="13" style="text-align:center; padding:30px; color:var(--muted);">Loading QM setups...</td></tr>
       </tbody>
     </table>
   </div>
@@ -1656,6 +2079,46 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       </div>
     </div>
 
+    <!-- Dedicated ML Setup Quality & Dynamic Trade Execution Card -->
+    <div class="dossier-card" id="card_ml_guidance" style="border-color:#10b981; background:linear-gradient(180deg, #071914 0%, #061210 100%); display:none;">
+      <div class="dossier-title">
+        <span style="color:#34d399; font-weight:700;">🧠 ML SETUP QUALITY &amp; GUIDANCE</span>
+        <span id="dos_ml_tier_badge" class="pctile-badge pctile-high">--</span>
+      </div>
+
+      <div style="background:#04140e; border:1px solid #064e3b; border-radius:6px; padding:6px 10px; margin-bottom:6px;">
+        <div style="font-size:11px; font-weight:700; color:#6ee7b7;" id="dos_ml_rec_text">--</div>
+      </div>
+
+      <div style="display:grid; grid-template-columns:1fr 1fr; gap:6px; margin-bottom:6px;">
+        <div style="background:#082218; border:1px solid #047857; border-radius:6px; padding:5px 8px; text-align:center;">
+          <div style="font-size:9.5px; color:#a7f3d0; text-transform:uppercase; font-weight:700;">QM Quality Score</div>
+          <div style="font-size:16px; font-weight:800; color:#34d399;" id="dos_ml_score">-- / 100</div>
+          <div style="font-size:9.5px; color:#6ee7b7;" id="dos_ml_sizing">--x Conviction</div>
+        </div>
+        <div style="background:#082218; border:1px solid #047857; border-radius:6px; padding:5px 8px; text-align:center;">
+          <div style="font-size:9.5px; color:#a7f3d0; text-transform:uppercase; font-weight:700;">Dynamic Stop Loss</div>
+          <div style="font-size:15px; font-weight:800; color:#f87171;" id="dos_ml_stop">$--</div>
+          <div style="font-size:9.5px; color:#fca5a5;" id="dos_ml_risk">--% risk</div>
+        </div>
+      </div>
+
+      <div style="display:flex; justify-content:space-between; font-size:10.5px; color:#cbd5e1; background:#051911; padding:5px 8px; border-radius:4px; border:1px solid #064e3b;">
+        <span>P(Big Move ≥ 3R): <strong style="color:#34d399;" id="dos_ml_p_big">--%</strong></span>
+        <span>P(Trap Failure): <strong style="color:#f87171;" id="dos_ml_p_trap">--%</strong></span>
+      </div>
+
+      <!-- Trade Management & Scaling Guidance -->
+      <div style="margin-top:6px; background:#071a13; border:1px solid #064e3b; border-radius:6px; padding:6px 8px;">
+        <div style="font-size:9.5px; color:#a7f3d0; text-transform:uppercase; font-weight:700; margin-bottom:4px;">🎯 Pre-Trade Hurdle Targets (At Entry via Dynamic Stop)</div>
+        <div style="display:flex; justify-content:space-between; font-size:10.5px; color:#e2e8f0; margin-bottom:4px;">
+          <span>Target 1 (+2.5R Partial): <strong style="color:#38bdf8;" id="dos_ml_hurdle_25r">$--</strong></span>
+          <span>Target 2 (+3.5R Climax): <strong style="color:#a855f7;" id="dos_ml_hurdle_35r">$--</strong></span>
+        </div>
+        <div style="font-size:9.5px; color:#6ee7b7; line-height:1.3;" id="dos_ml_plan">Sell 50% partial into Climax High (P ≥ 0.45 or +2.5R), move stop to Breakeven, trail 50% runner on 10 EMA.</div>
+      </div>
+    </div>
+
     <!-- QM Breakout Strategy Trade Execution & Conviction Sizing Card -->
     <div class="dossier-card" id="card_strategy_trade" style="border-color:#0284c7; background:linear-gradient(180deg, #0d1527 0%, #0b111e 100%); display:none;">
       <div class="dossier-title">
@@ -1673,8 +2136,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           <span style="color:var(--muted); font-size:11px;">Stop Loss Level:</span>
           <span style="font-weight:700; color:#f87171;" id="dos_strat_stop">--</span>
         </div>
+        <div id="dos_strat_partial_row" style="display:none; justify-content:space-between; align-items:center; background:rgba(147, 51, 234, 0.15); border:1px solid #7c3aed; padding:3px 6px; border-radius:4px;">
+          <span style="color:#d8b4fe; font-size:10.5px; font-weight:700;">🎯 Climax Partial:</span>
+          <span style="font-weight:700; color:#c084fc; font-size:11px;" id="dos_strat_partial_exit">--</span>
+        </div>
         <div style="display:flex; justify-content:space-between; align-items:center;">
-          <span style="color:var(--muted); font-size:11px;">10 EMA Trailing Exit:</span>
+          <span style="color:var(--muted); font-size:11px;" id="dos_strat_exit_lbl">Trailing Exit:</span>
           <span style="font-weight:700; color:#38bdf8;" id="dos_strat_exit">--</span>
         </div>
         <div style="display:flex; justify-content:space-between; align-items:center;">
@@ -1850,6 +2317,14 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <span class="dossier-label">Resistance Stack:</span>
         <span class="dossier-val" style="font-family:monospace; font-size:11px;" id="dos_stack">--</span>
       </div>
+      <div class="dossier-row">
+        <span class="dossier-label">Pole Linearity (R²):</span>
+        <span class="dossier-val" style="color:#38bdf8; font-weight:700;" id="dos_r2">--</span>
+      </div>
+      <div class="dossier-row">
+        <span class="dossier-label">BB Squeeze (Pinch Ratio):</span>
+        <span class="dossier-val" style="color:#fbbf24; font-weight:700;" id="dos_pinch_ratio">--</span>
+      </div>
     </div>
 
     <!-- EP Catalyst Linkage Card -->
@@ -1988,6 +2463,37 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       <button class="modal-close" onclick="closeStrategySettingsModal()">&times;</button>
     </div>
     <div class="modal-body" style="background:#090d16; padding:16px 20px; display:flex; flex-direction:column; gap:12px; overflow-y:auto;">
+      <!-- Trader Archetype Quick Presets -->
+      <div class="settings-group" style="background:#1e1b4b; border:1px solid #6366f1; border-radius:6px; padding:10px;">
+        <div class="settings-group-title" style="color:#c7d2fe;">
+          <span>⚡ Trader Archetype Presets</span>
+        </div>
+        <div class="settings-group-desc" style="color:#a5b4fc;">Instantly configure institutional strategy settings and filters for your trading style.</div>
+        <select id="cfg_trader_archetype" class="cfg-select" onchange="applyArchetypePreset(this.value)" style="border-color:#818cf8; background:#0f172a; color:#e0e7ff; font-weight:600;">
+          <option value="custom">Custom Configuration</option>
+          <option value="institutional_triad">👑 Institutional Triad: All Trades (518 Trades)</option>
+          <option value="institutional_triad_balanced">⭐ Institutional Triad: Active Balanced (58 Trades)</option>
+          <option value="institutional_triad_apex">💎 Institutional Triad: Apex Conviction (16 Trades)</option>
+          <option value="high_velocity" selected>⚡ High-Velocity Swing (Tight Stops, Climax Partial, Fast Turnover)</option>
+          <option value="institutional_hybrid">🏛️ Institutional Scale-Out (Multi-Leg Staged, RS Leaders, Macro Tailwinds)</option>
+          <option value="position_trend">📈 Position / Trend (Wider Stops, 50 EMA Runners, Major Themes)</option>
+        </select>
+      </div>
+
+      <!-- ML Setup Quality Tier -->
+      <div class="settings-group">
+        <div class="settings-group-title">
+          <span>🧠 Setup Quality &amp; Failure Avoidance (QM-V2)</span>
+        </div>
+        <div class="settings-group-desc">Filters low-expectancy traps and prioritizes high-probability monster breakout runners.</div>
+        <select id="cfg_strat_tier" class="cfg-select">
+          <option value="all" selected>🌐 All Setups (Unfiltered Universe — 518 Trades)</option>
+          <option value="avoid_traps">🛡️ Broad System (Avoid Toxic Traps — 173 Trades)</option>
+          <option value="high_quality">⭐ Active Balanced (Tiers 1 &amp; 2: 65.5% WR, +1.68 R, PF 10.6 — 58 Trades)</option>
+          <option value="premier">💎 Apex Conviction (Premier Tier 1: 64.3% WR, +2.15 R, PF 13.1 — 16 Trades)</option>
+        </select>
+      </div>
+
       <!-- Macro / Universe -->
       <div class="settings-group">
         <div class="settings-group-title">
@@ -2020,10 +2526,30 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <div class="settings-group-title">
           <span>🛑 Stop Loss Mechanics</span>
         </div>
-        <div class="settings-group-desc">0.6x stoploss cuts initial risk distance by 40% and boosts Expectancy +142% (+0.180 R vs +0.057 R).</div>
+        <div class="settings-group-desc">Dynamic Quantile Stop (QM-Stop) tailors risk to volatility (~3.5% risk, PF 3.02) vs fixed pivot stops.</div>
         <select id="cfg_strat_stop" class="cfg-select">
+          <option value="dynamic">🎯 Dynamic Quantile Regression Stop (QM-Stop: ~3.5% Risk, PF 3.02)</option>
           <option value="06x" selected>0.6x Distance to Previous TrendLab Pivot Low — Optimized (+0.180 R, PF 1.30)</option>
           <option value="10x">1.0x Full Distance to Previous Pivot Low — Classical (+0.057 R, PF 1.09)</option>
+        </select>
+      </div>
+
+      <!-- Trailing Exit Strategy -->
+      <div class="settings-group">
+        <div class="settings-group-title">
+          <span>🏁 Trailing Exit Model</span>
+        </div>
+        <div class="settings-group-desc">Dynamic exit discipline across moving averages, staged scaling, and ML climax exhaustion.</div>
+        <select id="cfg_strat_exit" class="cfg-select">
+          <option value="triad_optimal">👑 Institutional Triad (Dynamic Stop + Climax Partial + Conviction Sizing)</option>
+          <option value="climax_swing" selected>🎯 ML Climax Swing (50% Climax @ P≥0.45, 50% 10 EMA Trailing)</option>
+          <option value="climax_hybrid">🎯 ML Climax Hybrid (33% Climax @ P≥0.50, 33% 10E, 34% 20E)</option>
+          <option value="climax_trend">🎯 ML Climax Trend (50% Climax @ P≥0.65, 50% 50 EMA Trailing)</option>
+          <option value="10ema">10 EMA Trailing Exit (Fast / Momentum Turnover — 8.6 bars)</option>
+          <option value="20ema">20 EMA Trailing Exit (Intermediate Sweet Spot — 13.5 bars)</option>
+          <option value="50ema">50 EMA Trailing Exit (Major Trend Runner — Peak Compounding)</option>
+          <option value="staged">Staged Scaling (33% @ 10E / 33% @ 20E / 34% @ 50E — Lowest Drawdown)</option>
+          <option value="balanced">Balanced Scaling (50% @ 10E / 50% @ 50E — High Win Rate + Big Runners)</option>
         </select>
       </div>
 
@@ -2106,6 +2632,34 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         </select>
       </div>
 
+      <!-- Bollinger Band Squeeze (Pinch Ratio) -->
+      <div class="settings-group">
+        <div class="settings-group-title">
+          <span>🎯 Bollinger Band Squeeze (Pinch Ratio)</span>
+        </div>
+        <div class="settings-group-desc">Measures contraction of Bollinger Bands within the base. Tight pinch (≤2.5) yields +0.098 R avg expectancy (+63% vs baseline).</div>
+        <select id="cfg_strat_bb_pinch" class="cfg-select">
+          <option value="all" selected>All Base Consolidations (No Squeeze Filter)</option>
+          <option value="tight">Tight Pinch (≤ 2.5) — High Expansion Potential (+0.098 R, PF 1.17)</option>
+          <option value="moderate">Moderate Pinch (≤ 3.2)</option>
+          <option value="mild">Mild Pinch (≤ 4.0)</option>
+        </select>
+      </div>
+
+      <!-- Pole Linearity (R² Regression) -->
+      <div class="settings-group">
+        <div class="settings-group-title">
+          <span>📏 Pole Linearity (R² Regression)</span>
+        </div>
+        <div class="settings-group-desc">Measures cleanliness of the momentum pole. When combined with BB Pinch ≤ 2.5, R² ≥ 0.65 delivers +0.141 R (+135% edge, PF 1.24).</div>
+        <select id="cfg_strat_r2" class="cfg-select">
+          <option value="all" selected>All Pole Trajectories (No R² Filter)</option>
+          <option value="0.80">Ultra Linear (R² ≥ 0.80) — Institutional Staircase</option>
+          <option value="0.65">Strong Trend (R² ≥ 0.65) — Clean Upward Drive</option>
+          <option value="0.50">Moderate Trend (R² ≥ 0.50)</option>
+        </select>
+      </div>
+
       <div style="display:flex; justify-content:space-between; margin-top:8px; padding-top:10px; border-top:1px solid #1f2937;">
         <button class="btn-filter-chip" onclick="resetStrategySettings()">Reset to Defaults</button>
         <button class="reload-btn" onclick="applyStrategySettings()">✓ Apply Settings &amp; Filter</button>
@@ -2124,20 +2678,188 @@ let activeStateFilter = 'all';
 let activeEpFilter = 'all';
 let activeMacroFilter = 'all';
 let searchDebounceTimer = null;
+let selectedSetupKeys = new Set();
+
+const SETUP_PALETTE = [
+  { stroke: '#10b981', fill: 'rgba(16, 185, 129, 0.12)', text: '#34d399', name: 'Emerald' },
+  { stroke: '#38bdf8', fill: 'rgba(56, 189, 248, 0.12)', text: '#38bdf8', name: 'Sky' },
+  { stroke: '#f59e0b', fill: 'rgba(245, 158, 11, 0.12)', text: '#fbbf24', name: 'Amber' },
+  { stroke: '#a855f7', fill: 'rgba(168, 85, 247, 0.12)', text: '#c084fc', name: 'Purple' },
+  { stroke: '#f43f5e', fill: 'rgba(244, 63, 94, 0.12)', text: '#fb7185', name: 'Rose' },
+  { stroke: '#06b6d4', fill: 'rgba(6, 182, 212, 0.12)', text: '#22d3ee', name: 'Cyan' },
+  { stroke: '#e879f9', fill: 'rgba(232, 121, 249, 0.12)', text: '#f0abfc', name: 'Fuchsia' },
+  { stroke: '#fb923c', fill: 'rgba(251, 146, 60, 0.12)', text: '#fdba74', name: 'Orange' },
+];
 
 // Strategy Mode & Settings State
 let strategyMode = false;
+let selectedTraderArchetype = 'high_velocity';
 let strategySettings = {
   macro: 'leading',
   spy: 'spy200',
   stop: '06x',
   sizing: 'dynamic',
+  exit: 'climax_swing',
+  tier: 'all',
   rs: 'rs90_lead',
   fresh_ep: 'all',
   rvol: 'all',
   qqq: 'all',
-  tech_lead: 'all'
+  tech_lead: 'all',
+  bb_pinch: 'all',
+  r2: 'all'
 };
+
+function applyArchetypePreset(preset) {
+  selectedTraderArchetype = preset;
+  const selArch = document.getElementById('sel_trader_archetype');
+  if (selArch) selArch.value = preset;
+  const cfgArch = document.getElementById('cfg_trader_archetype');
+  if (cfgArch) cfgArch.value = preset;
+
+  if (preset === 'institutional_triad') {
+    // Institutional Triad: Dynamic Quantile Stop (QM-Stop), ML Climax Swing, Conviction Sizing, All Universe (518 Trades)
+    strategySettings.macro = 'leading';
+    strategySettings.spy = 'spy200';
+    strategySettings.stop = 'dynamic';
+    strategySettings.exit = 'triad_optimal';
+    strategySettings.sizing = 'dynamic';
+    strategySettings.tier = 'all';
+    strategySettings.rs = 'rs90_lead';
+    strategySettings.fresh_ep = 'all';
+    strategySettings.rvol = 'all';
+    strategySettings.qqq = 'all';
+    strategySettings.tech_lead = 'all';
+    strategySettings.bb_pinch = 'all';
+    strategySettings.r2 = 'all';
+  } else if (preset === 'institutional_triad_balanced') {
+    // Institutional Triad (Active Balanced): Tiers 1-2 (58 Trades, 65.5% WR, +1.68 R, 10.6 PF)
+    strategySettings.macro = 'leading';
+    strategySettings.spy = 'spy200';
+    strategySettings.stop = 'dynamic';
+    strategySettings.exit = 'triad_optimal';
+    strategySettings.sizing = 'dynamic';
+    strategySettings.tier = 'high_quality';
+    strategySettings.rs = 'rs90_lead';
+    strategySettings.fresh_ep = 'all';
+    strategySettings.rvol = 'all';
+    strategySettings.qqq = 'all';
+    strategySettings.tech_lead = 'all';
+    strategySettings.bb_pinch = 'all';
+    strategySettings.r2 = 'all';
+  } else if (preset === 'institutional_triad_apex') {
+    // Institutional Triad (Apex Conviction): Premier Tier 1 (16 Trades, 64.3% WR, +2.15 R, 13.1 PF)
+    strategySettings.macro = 'leading';
+    strategySettings.spy = 'spy200';
+    strategySettings.stop = 'dynamic';
+    strategySettings.exit = 'triad_optimal';
+    strategySettings.sizing = 'dynamic';
+    strategySettings.tier = 'premier';
+    strategySettings.rs = 'rs90_lead';
+    strategySettings.fresh_ep = 'all';
+    strategySettings.rvol = 'all';
+    strategySettings.qqq = 'all';
+    strategySettings.tech_lead = 'all';
+    strategySettings.bb_pinch = 'all';
+    strategySettings.r2 = 'all';
+  } else if (preset === 'high_velocity') {
+    // High-Velocity Swing: 0.6x Stop, ML Climax Partial (P>=0.45) + 10 EMA Trailing, Dynamic Sizing, Leading Macro, All BB Pinch
+    strategySettings.macro = 'leading';
+    strategySettings.spy = 'spy200';
+    strategySettings.stop = '06x';
+    strategySettings.exit = 'climax_swing';
+    strategySettings.sizing = 'dynamic';
+    strategySettings.tier = 'avoid_traps';
+    strategySettings.rs = 'rs90_lead';
+    strategySettings.fresh_ep = 'all';
+    strategySettings.rvol = 'all';
+    strategySettings.qqq = 'all';
+    strategySettings.tech_lead = 'all';
+    strategySettings.bb_pinch = 'all';
+    strategySettings.r2 = 'all';
+  } else if (preset === 'institutional_hybrid') {
+    // Institutional Scale-Out: 0.6x Stop, Multi-Leg Staged (P>=0.50 + Staged 10/20 EMA), RS 90 Leaders, Fresh EP <= 30d, RVOL >= 1.5x
+    strategySettings.macro = 'leading';
+    strategySettings.spy = 'spy200';
+    strategySettings.stop = '06x';
+    strategySettings.exit = 'climax_hybrid';
+    strategySettings.sizing = 'dynamic';
+    strategySettings.tier = 'all';
+    strategySettings.rs = 'rs90_lead';
+    strategySettings.fresh_ep = '30d';
+    strategySettings.rvol = '1.5x';
+    strategySettings.qqq = 'all';
+    strategySettings.tech_lead = 'all';
+    strategySettings.bb_pinch = 'all';
+    strategySettings.r2 = 'all';
+  } else if (preset === 'position_trend') {
+    // Position / Trend: 1.0x Full Pivot Stop, Major Trend Climax (P>=0.65 + 50 EMA Trailing), Dynamic Sizing, Leading Macro, RS 90
+    strategySettings.macro = 'leading';
+    strategySettings.spy = 'spy200';
+    strategySettings.stop = '10x';
+    strategySettings.exit = 'climax_trend';
+    strategySettings.sizing = 'dynamic';
+    strategySettings.tier = 'all';
+    strategySettings.rs = 'rs90_lead';
+    strategySettings.fresh_ep = 'all';
+    strategySettings.rvol = 'all';
+    strategySettings.qqq = 'all';
+    strategySettings.tech_lead = 'all';
+    strategySettings.bb_pinch = 'all';
+    strategySettings.r2 = 'all';
+  }
+
+  // Update modal fields
+  const selMacro = document.getElementById('cfg_strat_macro');
+  const selSpy = document.getElementById('cfg_strat_spy');
+  const selStop = document.getElementById('cfg_strat_stop');
+  const selExit = document.getElementById('cfg_strat_exit');
+  const selSizing = document.getElementById('cfg_strat_sizing');
+  const selRs = document.getElementById('cfg_strat_rs');
+  const selFresh = document.getElementById('cfg_strat_fresh_ep');
+  const selRvol = document.getElementById('cfg_strat_rvol');
+  const selQqq = document.getElementById('cfg_strat_qqq');
+  const selTech = document.getElementById('cfg_strat_tech_lead');
+  const selBb = document.getElementById('cfg_strat_bb_pinch');
+  const selR2 = document.getElementById('cfg_strat_r2');
+  const selTier = document.getElementById('cfg_strat_tier');
+
+  if (selMacro) selMacro.value = strategySettings.macro;
+  if (selSpy) selSpy.value = strategySettings.spy;
+  if (selStop) selStop.value = strategySettings.stop;
+  if (selExit) selExit.value = strategySettings.exit;
+  if (selSizing) selSizing.value = strategySettings.sizing;
+  if (selRs) selRs.value = strategySettings.rs;
+  if (selFresh) selFresh.value = strategySettings.fresh_ep;
+  if (selRvol) selRvol.value = strategySettings.rvol;
+  if (selQqq) selQqq.value = strategySettings.qqq;
+  if (selTech) selTech.value = strategySettings.tech_lead;
+  if (selBb) selBb.value = strategySettings.bb_pinch;
+  if (selR2) selR2.value = strategySettings.r2;
+  if (selTier) selTier.value = strategySettings.tier || 'all';
+
+  // Sync toolbar fields
+  const selExitToolbar = document.getElementById('sel_strat_exit');
+  if (selExitToolbar) selExitToolbar.value = strategySettings.exit;
+  const selBbToolbar = document.getElementById('sel_bb_pinch');
+  if (selBbToolbar) selBbToolbar.value = strategySettings.bb_pinch;
+  const selR2Toolbar = document.getElementById('sel_r2');
+  if (selR2Toolbar) selR2Toolbar.value = strategySettings.r2;
+  const selTierToolbar = document.getElementById('sel_strat_tier');
+  if (selTierToolbar) selTierToolbar.value = strategySettings.tier || 'all';
+}
+
+function onTraderArchetypeChange() {
+  const sel = document.getElementById('sel_trader_archetype');
+  if (sel) {
+    applyArchetypePreset(sel.value);
+    if (!strategyMode) {
+      toggleStrategyMode();
+    } else {
+      fetchEvents();
+    }
+  }
+}
 
 function toggleStrategyMode() {
   strategyMode = !strategyMode;
@@ -2145,41 +2867,155 @@ function toggleStrategyMode() {
   const lbl = document.getElementById('strategy_mode_lbl');
   const stratKpis = document.getElementById('strategy_kpi_bar');
   const normKpis = document.getElementById('kpi_row');
+  const grpExit = document.getElementById('grp_strat_exit');
+  const grpArch = document.getElementById('grp_strat_archetype');
 
   if (strategyMode) {
     if (btn) btn.classList.add('active');
     if (lbl) lbl.textContent = '🎯 Strategy Mode: ACTIVE';
     if (stratKpis) stratKpis.style.display = 'flex';
     if (normKpis) normKpis.style.display = 'none';
+    if (grpExit) grpExit.style.display = 'flex';
+    if (grpArch) grpArch.style.display = 'flex';
   } else {
     if (btn) btn.classList.remove('active');
     if (lbl) lbl.textContent = 'Strategy Mode: OFF';
     if (stratKpis) stratKpis.style.display = 'none';
     if (normKpis) normKpis.style.display = 'flex';
+    if (grpExit) grpExit.style.display = 'none';
+    if (grpArch) grpArch.style.display = 'flex';
   }
   fetchEvents();
+}
+
+function onStratExitChange() {
+  const sel = document.getElementById('sel_strat_exit');
+  if (sel) {
+    strategySettings.exit = sel.value;
+    const cfg = document.getElementById('cfg_strat_exit');
+    if (cfg) cfg.value = sel.value;
+    // Mark as custom if manually modified away from archetype preset
+    checkCustomArchetype();
+  }
+  fetchEvents();
+}
+
+function onStratTierChange() {
+  const sel = document.getElementById('sel_strat_tier');
+  if (sel) {
+    strategySettings.tier = sel.value;
+    const cfg = document.getElementById('cfg_strat_tier');
+    if (cfg) cfg.value = sel.value;
+    checkCustomArchetype();
+  }
+  fetchEvents();
+}
+
+function checkCustomArchetype() {
+  const isInstTriadApex = (
+    strategySettings.stop === 'dynamic' &&
+    strategySettings.exit === 'triad_optimal' &&
+    strategySettings.sizing === 'dynamic' &&
+    strategySettings.macro === 'leading' &&
+    strategySettings.tier === 'premier' &&
+    strategySettings.bb_pinch === 'all' &&
+    strategySettings.fresh_ep === 'all' &&
+    strategySettings.rvol === 'all'
+  );
+  const isInstTriadBalanced = (
+    strategySettings.stop === 'dynamic' &&
+    strategySettings.exit === 'triad_optimal' &&
+    strategySettings.sizing === 'dynamic' &&
+    strategySettings.macro === 'leading' &&
+    strategySettings.tier === 'high_quality' &&
+    strategySettings.bb_pinch === 'all' &&
+    strategySettings.fresh_ep === 'all' &&
+    strategySettings.rvol === 'all'
+  );
+  const isInstTriadAll = (
+    strategySettings.stop === 'dynamic' &&
+    strategySettings.exit === 'triad_optimal' &&
+    strategySettings.sizing === 'dynamic' &&
+    strategySettings.macro === 'leading' &&
+    (strategySettings.tier === 'all' || strategySettings.tier === 'avoid_traps') &&
+    strategySettings.bb_pinch === 'all' &&
+    strategySettings.fresh_ep === 'all' &&
+    strategySettings.rvol === 'all'
+  );
+  const isHighVelocity = (
+    strategySettings.stop === '06x' &&
+    strategySettings.exit === 'climax_swing' &&
+    strategySettings.sizing === 'dynamic' &&
+    strategySettings.macro === 'leading' &&
+    strategySettings.tier === 'avoid_traps' &&
+    strategySettings.bb_pinch === 'all' &&
+    strategySettings.fresh_ep === 'all' &&
+    strategySettings.rvol === 'all'
+  );
+  const isInstHybrid = (
+    strategySettings.stop === '06x' &&
+    strategySettings.exit === 'climax_hybrid' &&
+    strategySettings.sizing === 'dynamic' &&
+    strategySettings.macro === 'leading' &&
+    strategySettings.tier === 'all' &&
+    strategySettings.fresh_ep === '30d' &&
+    strategySettings.rvol === '1.5x'
+  );
+  const isPosTrend = (
+    strategySettings.stop === '10x' &&
+    strategySettings.exit === 'climax_trend' &&
+    strategySettings.sizing === 'dynamic' &&
+    strategySettings.macro === 'leading' &&
+    strategySettings.tier === 'all' &&
+    strategySettings.fresh_ep === 'all' &&
+    strategySettings.rvol === 'all'
+  );
+
+  let detected = 'custom';
+  if (isInstTriadApex) detected = 'institutional_triad_apex';
+  else if (isInstTriadBalanced) detected = 'institutional_triad_balanced';
+  else if (isInstTriadAll) detected = 'institutional_triad';
+  else if (isHighVelocity) detected = 'high_velocity';
+  else if (isInstHybrid) detected = 'institutional_hybrid';
+  else if (isPosTrend) detected = 'position_trend';
+
+  selectedTraderArchetype = detected;
+  const selArch = document.getElementById('sel_trader_archetype');
+  if (selArch) selArch.value = detected;
+  const cfgArch = document.getElementById('cfg_trader_archetype');
+  if (cfgArch) cfgArch.value = detected;
 }
 
 function openStrategySettingsModal() {
   const selMacro = document.getElementById('cfg_strat_macro');
   const selSpy = document.getElementById('cfg_strat_spy');
   const selStop = document.getElementById('cfg_strat_stop');
+  const selExit = document.getElementById('cfg_strat_exit');
   const selSizing = document.getElementById('cfg_strat_sizing');
   const selRs = document.getElementById('cfg_strat_rs');
   const selFresh = document.getElementById('cfg_strat_fresh_ep');
   const selRvol = document.getElementById('cfg_strat_rvol');
   const selQqq = document.getElementById('cfg_strat_qqq');
   const selTech = document.getElementById('cfg_strat_tech_lead');
+  const selBb = document.getElementById('cfg_strat_bb_pinch');
+  const selR2 = document.getElementById('cfg_strat_r2');
+  const selTier = document.getElementById('cfg_strat_tier');
+  const selArch = document.getElementById('cfg_trader_archetype');
 
+  if (selArch) selArch.value = selectedTraderArchetype;
   if (selMacro) selMacro.value = strategySettings.macro;
   if (selSpy) selSpy.value = strategySettings.spy;
   if (selStop) selStop.value = strategySettings.stop;
+  if (selExit) selExit.value = strategySettings.exit || 'climax_swing';
   if (selSizing) selSizing.value = strategySettings.sizing;
   if (selRs) selRs.value = strategySettings.rs;
   if (selFresh) selFresh.value = strategySettings.fresh_ep;
   if (selRvol) selRvol.value = strategySettings.rvol;
   if (selQqq) selQqq.value = strategySettings.qqq;
   if (selTech) selTech.value = strategySettings.tech_lead;
+  if (selBb) selBb.value = strategySettings.bb_pinch;
+  if (selR2) selR2.value = strategySettings.r2;
+  if (selTier) selTier.value = strategySettings.tier || 'all';
 
   const m = document.getElementById('strategy_settings_modal');
   if (m) m.classList.add('active');
@@ -2195,13 +3031,27 @@ function applyStrategySettings() {
   strategySettings.macro = document.getElementById('cfg_strat_macro').value;
   strategySettings.spy = document.getElementById('cfg_strat_spy').value;
   strategySettings.stop = document.getElementById('cfg_strat_stop').value;
+  if (document.getElementById('cfg_strat_exit')) strategySettings.exit = document.getElementById('cfg_strat_exit').value;
   strategySettings.sizing = document.getElementById('cfg_strat_sizing').value;
   strategySettings.rs = document.getElementById('cfg_strat_rs').value;
   strategySettings.fresh_ep = document.getElementById('cfg_strat_fresh_ep').value;
   strategySettings.rvol = document.getElementById('cfg_strat_rvol').value;
   strategySettings.qqq = document.getElementById('cfg_strat_qqq').value;
   strategySettings.tech_lead = document.getElementById('cfg_strat_tech_lead').value;
+  if (document.getElementById('cfg_strat_bb_pinch')) strategySettings.bb_pinch = document.getElementById('cfg_strat_bb_pinch').value;
+  if (document.getElementById('cfg_strat_r2')) strategySettings.r2 = document.getElementById('cfg_strat_r2').value;
+  if (document.getElementById('cfg_strat_tier')) strategySettings.tier = document.getElementById('cfg_strat_tier').value;
 
+  const selExit = document.getElementById('sel_strat_exit');
+  if (selExit) selExit.value = strategySettings.exit;
+  const selBb = document.getElementById('sel_bb_pinch');
+  if (selBb) selBb.value = strategySettings.bb_pinch;
+  const selR2 = document.getElementById('sel_r2');
+  if (selR2) selR2.value = strategySettings.r2;
+  const selTier = document.getElementById('sel_strat_tier');
+  if (selTier) selTier.value = strategySettings.tier;
+
+  checkCustomArchetype();
   closeStrategySettingsModal();
 
   if (!strategyMode) {
@@ -2212,17 +3062,7 @@ function applyStrategySettings() {
 }
 
 function resetStrategySettings() {
-  strategySettings = {
-    macro: 'leading',
-    spy: 'spy200',
-    stop: '06x',
-    sizing: 'dynamic',
-    rs: 'rs90_lead',
-    fresh_ep: 'all',
-    rvol: 'all',
-    qqq: 'all',
-    tech_lead: 'all'
-  };
+  applyArchetypePreset('high_velocity');
   openStrategySettingsModal();
 }
 
@@ -2233,7 +3073,20 @@ function updateStrategyKPIs(k) {
   const wrEl = document.getElementById('skpi_winrate');
   if (wrEl) wrEl.textContent = (k.win_rate != null ? k.win_rate.toFixed(1) : '0.0') + '%';
   const subWrEl = document.getElementById('skpi_sub_winrate');
-  if (subWrEl) subWrEl.textContent = (k.strat_stop === '06x' ? '0.6x Stop' : '1.0x Stop') + ' • 10 EMA Exit';
+  const exitLabels = {
+    'triad_optimal': '👑 Institutional Triad (Dynamic + Climax Swing)',
+    'climax_swing': 'ML Climax Swing (P≥0.45 + 10 EMA)',
+    'climax_hybrid': 'ML Climax Hybrid (P≥0.50 + Staged)',
+    'climax_trend': 'ML Climax Trend (P≥0.65 + 50 EMA)',
+    '10ema': '10 EMA Trailing Exit',
+    '20ema': '20 EMA Trailing Exit',
+    '50ema': '50 EMA Trailing Exit',
+    'staged': 'Staged Scale (33/33/34)',
+    'balanced': 'Balanced Scale (50/50)',
+  };
+  const exLbl = exitLabels[k.strat_exit] || '10 EMA Exit';
+  const stopLbl = k.strat_stop === 'dynamic' ? 'Dynamic ML Stop' : (k.strat_stop === '06x' ? '0.6x Stop' : '1.0x Stop');
+  if (subWrEl) subWrEl.textContent = stopLbl + ' • ' + exLbl;
   const pfEl = document.getElementById('skpi_pf');
   if (pfEl) pfEl.textContent = k.profit_factor != null ? k.profit_factor.toFixed(2) : '--';
   const expEl = document.getElementById('skpi_expectancy');
@@ -2704,53 +3557,134 @@ function drawCanvasOverlays() {
   const h = canvas.height = canvas.parentElement.clientHeight;
   ctx.clearRect(0, 0, w, h);
 
-  const setup = currentChartData.setup;
-  if (!setup) return;
   const timeScale = chart.timeScale();
+  const allSymSetups = currentChartData.symbol_setups || (currentChartData.setup ? [currentChartData.setup] : []);
+  if (!allSymSetups.length) return;
 
-  // 1. Shaded Pole Box (Emerald Green)
-  if (showPoleBox && setup.qm_pole_start && setup.qm_pole_end) {
-    const x1 = timeScale.timeToCoordinate(setup.qm_pole_start);
-    const x2 = timeScale.timeToCoordinate(setup.qm_pole_end);
-    if (x1 !== null && x2 !== null) {
-      const left = Math.min(x1, x2);
-      const width = Math.max(8, Math.abs(x2 - x1));
-      ctx.fillStyle = 'rgba(16, 185, 129, 0.12)';
-      ctx.fillRect(left, 0, width, h);
-      ctx.strokeStyle = 'rgba(16, 185, 129, 0.45)';
-      ctx.lineWidth = 1;
-      ctx.setLineDash([4, 4]);
-      ctx.strokeRect(left, 0, width, h);
-      ctx.setLineDash([]);
-      
-      // Label
-      ctx.fillStyle = '#34d399';
-      ctx.font = 'bold 11px monospace';
-      ctx.fillText(`POLE +${setup.move_pct}%`, left + 6, 26);
-    }
+  // Filter to setups selected by user toggles, or default to current setup if none selected for this symbol
+  let setupsToDraw = allSymSetups.filter(s => selectedSetupKeys.has(`${s.symbol}_${s.date}`));
+  if (setupsToDraw.length === 0 && currentChartData.setup) {
+    setupsToDraw = [currentChartData.setup];
   }
 
-  // 2. Shaded Base Box (Amber/Yellow)
-  if (showConsBox && setup.qm_cons_start && setup.qm_cons_end) {
-    const x1 = timeScale.timeToCoordinate(setup.qm_cons_start);
-    const x2 = timeScale.timeToCoordinate(setup.qm_cons_end);
-    if (x1 !== null && x2 !== null) {
-      const left = Math.min(x1, x2);
-      const width = Math.max(12, Math.abs(x2 - x1));
-      ctx.fillStyle = 'rgba(245, 158, 11, 0.12)';
-      ctx.fillRect(left, 0, width, h);
-      ctx.strokeStyle = 'rgba(245, 158, 11, 0.45)';
-      ctx.lineWidth = 1;
-      ctx.setLineDash([4, 4]);
-      ctx.strokeRect(left, 0, width, h);
-      ctx.setLineDash([]);
-      
-      // Label
-      ctx.fillStyle = '#fbbf24';
-      ctx.font = 'bold 11px monospace';
-      ctx.fillText(`BASE (${setup.cons_bars}d, -${setup.pullback_pct}%)`, left + 6, 42);
+  // Draw original full-height background visualization for setups
+  setupsToDraw.forEach((setup, idx) => {
+    const isCurrent = (currentEvent && currentEvent.symbol === setup.symbol && currentEvent.date === setup.date);
+
+    // 1. Shaded Pole Area (Emerald Green vertical strip from top 0 to bottom h)
+    if (showPoleBox && setup.qm_pole_start && setup.qm_pole_end) {
+      const x1 = timeScale.timeToCoordinate(setup.qm_pole_start);
+      const x2 = timeScale.timeToCoordinate(setup.qm_pole_end);
+      if (x1 !== null && x2 !== null) {
+        const left = Math.min(x1, x2);
+        const width = Math.max(8, Math.abs(x2 - x1));
+        ctx.fillStyle = isCurrent ? 'rgba(16, 185, 129, 0.12)' : 'rgba(16, 185, 129, 0.06)';
+        ctx.fillRect(left, 0, width, h);
+        ctx.strokeStyle = isCurrent ? 'rgba(16, 185, 129, 0.45)' : 'rgba(16, 185, 129, 0.25)';
+        ctx.lineWidth = 1;
+        ctx.setLineDash([4, 4]);
+        ctx.strokeRect(left, 0, width, h);
+        ctx.setLineDash([]);
+
+        // Label at top
+        ctx.fillStyle = '#34d399';
+        ctx.font = 'bold 11px monospace';
+        let poleLbl = `POLE +${setup.move_pct}%`;
+        if (setup.r2 != null) poleLbl += ` (R² ${setup.r2.toFixed(2)})`;
+        ctx.fillText(poleLbl, left + 6, 26);
+      }
     }
-  }
+
+    // 2. Shaded Consolidation / Base Area (Amber vertical strip from top 0 to bottom h)
+    const cStart = setup.qm_cons_start || setup.qm_pole_end;
+    const cEnd = setup.qm_cons_end || setup.date;
+    if (showConsBox && cStart && cEnd) {
+      const x1 = timeScale.timeToCoordinate(cStart);
+      const x2 = timeScale.timeToCoordinate(cEnd);
+      if (x1 !== null && x2 !== null) {
+        const left = Math.min(x1, x2);
+        const width = Math.max(12, Math.abs(x2 - x1));
+        ctx.fillStyle = isCurrent ? 'rgba(245, 158, 11, 0.12)' : 'rgba(245, 158, 11, 0.06)';
+        ctx.fillRect(left, 0, width, h);
+        ctx.strokeStyle = isCurrent ? 'rgba(245, 158, 11, 0.45)' : 'rgba(245, 158, 11, 0.25)';
+        ctx.lineWidth = 1;
+        ctx.setLineDash([4, 4]);
+        ctx.strokeRect(left, 0, width, h);
+        ctx.setLineDash([]);
+
+        // Label at top
+        ctx.fillStyle = '#fbbf24';
+        ctx.font = 'bold 11px monospace';
+        let baseLbl = `BASE (${setup.cons_bars}d, -${setup.pullback_pct}%)`;
+        if (setup.pinch_ratio != null) baseLbl += ` [Pinch ${setup.pinch_ratio.toFixed(1)}x]`;
+        ctx.fillText(baseLbl, left + 6, 44);
+      }
+    }
+
+    // 3. Marking the Breakout (Vertical line and top badge)
+    const isBk = (setup.state === 'breakout');
+    const bkDate = setup.date || setup.qm_cons_end;
+    if (bkDate) {
+      const xBk = timeScale.timeToCoordinate(bkDate);
+      if (xBk !== null && xBk >= 0 && xBk <= w) {
+        ctx.save();
+        ctx.strokeStyle = isBk ? 'rgba(16, 185, 129, 0.85)' : 'rgba(245, 158, 11, 0.85)';
+        ctx.lineWidth = isCurrent ? 2 : 1;
+        ctx.setLineDash([4, 4]);
+        ctx.beginPath();
+        ctx.moveTo(xBk, 0);
+        ctx.lineTo(xBk, h);
+        ctx.stroke();
+        ctx.restore();
+
+        // Breakout pill at top of vertical line
+        const badgeText = isBk 
+          ? `🚀 BREAKOUT ${setup.trigger ? '$' + setup.trigger.toFixed(2) : ''}`
+          : `⏳ COILING`;
+        ctx.font = 'bold 10.5px monospace';
+        const textW = ctx.measureText(badgeText).width;
+        const pillW = textW + 14;
+        const pillH = 18;
+        const pillX = Math.max(4, Math.min(w - pillW - 4, xBk - pillW / 2));
+        const pillY = 6;
+
+        ctx.fillStyle = 'rgba(15, 23, 42, 0.92)';
+        ctx.strokeStyle = isBk ? '#10b981' : '#f59e0b';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        if (ctx.roundRect) {
+          ctx.roundRect(pillX, pillY, pillW, pillH, 4);
+        } else {
+          ctx.rect(pillX, pillY, pillW, pillH);
+        }
+        ctx.fill();
+        ctx.stroke();
+
+        ctx.fillStyle = isBk ? '#34d399' : '#fbbf24';
+        ctx.fillText(badgeText, pillX + 7, pillY + 13);
+      }
+    }
+
+    // 4. Horizontal Trigger Line across consolidation into breakout
+    if (setup.trigger && setup.trigger > 0) {
+      const yTrig = candleSeries.priceToCoordinate(setup.trigger);
+      if (yTrig !== null && yTrig >= 0 && yTrig <= h) {
+        const xStart = cStart ? timeScale.timeToCoordinate(cStart) : 0;
+        const xEnd = bkDate ? timeScale.timeToCoordinate(bkDate) : w;
+        if (xStart !== null && xEnd !== null) {
+          ctx.save();
+          ctx.strokeStyle = '#10b981';
+          ctx.lineWidth = isCurrent ? 1.5 : 1;
+          ctx.setLineDash([5, 3]);
+          ctx.beginPath();
+          ctx.moveTo(Math.max(0, xStart), yTrig);
+          ctx.lineTo(Math.min(w, xEnd + 25), yTrig);
+          ctx.stroke();
+          ctx.restore();
+        }
+      }
+    }
+  });
 }
 
 // Fetch Events List with active filters
@@ -2772,6 +3706,12 @@ function fetchEvents() {
   const pb = document.getElementById('sel_pullback').value;
   if (pb) p.set('max_pullback', pb);
 
+  const bbPinchEl = document.getElementById('sel_bb_pinch');
+  if (bbPinchEl && bbPinchEl.value !== 'all') p.set('bb_pinch', bbPinchEl.value);
+
+  const r2El = document.getElementById('sel_r2');
+  if (r2El && r2El.value !== 'all') p.set('r2', r2El.value);
+
   const sec = document.getElementById('sel_sector').value;
   if (sec !== 'all') p.set('sector', sec);
 
@@ -2780,6 +3720,9 @@ function fetchEvents() {
 
   const rsEl = document.getElementById('sel_rs');
   if (rsEl) p.set('rs_filter', rsEl.value);
+
+  const tierEl = document.getElementById('sel_strat_tier');
+  if (tierEl && tierEl.value !== 'all') p.set('strat_tier', tierEl.value);
 
   const srch = document.getElementById('inp_search').value.trim();
   if (srch) p.set('search', srch);
@@ -2793,11 +3736,28 @@ function fetchEvents() {
     p.set('strat_spy', strategySettings.spy);
     p.set('strat_stop', strategySettings.stop);
     p.set('strat_sizing', strategySettings.sizing);
+
+    const curTier = document.getElementById('sel_strat_tier')?.value;
+    if (curTier) strategySettings.tier = curTier;
+    p.set('strat_tier', strategySettings.tier || 'all');
+
+    const curExit = document.getElementById('sel_strat_exit')?.value;
+    if (curExit) strategySettings.exit = curExit;
+    p.set('strat_exit', strategySettings.exit || '10ema');
+
     p.set('strat_rs', strategySettings.rs);
     p.set('strat_fresh_ep', strategySettings.fresh_ep);
     p.set('strat_rvol', strategySettings.rvol);
     p.set('strat_qqq', strategySettings.qqq);
     p.set('strat_tech_lead', strategySettings.tech_lead);
+
+    const curBb = document.getElementById('sel_bb_pinch')?.value;
+    if (curBb && curBb !== 'all') strategySettings.bb_pinch = curBb;
+    const curR2 = document.getElementById('sel_r2')?.value;
+    if (curR2 && curR2 !== 'all') strategySettings.r2 = curR2;
+
+    p.set('strat_bb_pinch', strategySettings.bb_pinch);
+    p.set('strat_r2', strategySettings.r2);
   }
 
   fetch('/api/events?' + p.toString())
@@ -2823,7 +3783,8 @@ function fetchEvents() {
         renderEnlargedStockList();
       }
       if (allEvents.length > 0) {
-        selectEvent(allEvents[0]);
+        const matched = currentEvent ? allEvents.find(e => e.symbol === currentEvent.symbol && e.date === currentEvent.date) : null;
+        selectEvent(matched || allEvents[0]);
       } else {
         clearDossier();
       }
@@ -2917,8 +3878,17 @@ function renderTable() {
   const tbody = document.getElementById('events_tbody');
   tbody.innerHTML = '';
 
+  const cntEl = document.getElementById('table_setups_count');
+  if (cntEl) cntEl.textContent = `${allEvents.length} Setups`;
+
   if (allEvents.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="9" style="text-align:center; padding:30px; color:var(--muted);">No matching QM setups found.</td></tr>';
+    let msg = 'No matching QM setups found.';
+    const curPinch = document.getElementById('sel_bb_pinch')?.value;
+    if (curPinch && curPinch !== 'all') {
+      msg += `<div style="margin-top:8px; font-size:11px; color:#38bdf8;">💡 <b>Tip:</b> BB Squeeze is set to <i>${curPinch}</i>. Set <b>BB Squeeze to "All"</b> to allow the ML model to evaluate volatility dynamically.</div>`;
+    }
+    tbody.innerHTML = `<tr><td colspan="13" style="text-align:center; padding:35px 20px; color:var(--muted); line-height:1.6;">${msg}</td></tr>`;
+    updateHeaderCheckbox();
     return;
   }
 
@@ -2965,26 +3935,117 @@ function renderTable() {
       macroBadge = ' <span class="badge" style="background:#1e3a8a; color:#bfdbfe; font-size:9.5px; margin-left:4px;" title="Leading Sector: Score ≥ 65">🏭 Leading</span>';
     }
 
+    // Machine Learning Quality Tier badge
+    let mlPill = '';
+    if (ev.qm_tier === 'Premier') {
+      mlPill = ' <span class="badge" style="background:#065f46; color:#6ee7b7; font-size:9.5px; font-weight:700; margin-left:4px;" title="ML Setup Quality: Premier Pinnacle (Score ≥ 75, Failure Risk < 22%)">💎 PREMIER</span>';
+    } else if (ev.qm_tier === 'High Quality') {
+      mlPill = ' <span class="badge" style="background:#064e3b; color:#a7f3d0; font-size:9.5px; font-weight:700; margin-left:4px;" title="ML Setup Quality: High Quality Setup (Score ≥ 60)">⭐ HIGH</span>';
+    } else if (ev.qm_tier === 'Toxic / Trap') {
+      mlPill = ' <span class="badge" style="background:#7f1d1d; color:#fca5a5; font-size:9.5px; font-weight:700; margin-left:4px;" title="ML Trap Warning: Toxic Failure Risk ≥ 35%">⚠️ TRAP</span>';
+    }
+
+    const k = `${ev.symbol}_${ev.date}`;
+    const isChecked = selectedSetupKeys.has(k) ? 'checked' : '';
+    const pal = SETUP_PALETTE[idx % SETUP_PALETTE.length];
+    const r2Str = (ev.r2 != null) ? `<span style="font-weight:700; color:#38bdf8;">${ev.r2.toFixed(2)}</span>` : '<span style="color:#64748b;">-</span>';
+    const pinchStr = (ev.pinch_ratio != null) ? `<span style="font-weight:700; color:#fbbf24;">${ev.pinch_ratio.toFixed(2)}x</span>` : '<span style="color:#64748b;">-</span>';
+
     tr.innerHTML = `
+      <td style="text-align:center;" onclick="event.stopPropagation()">
+        <input type="checkbox" class="setup-cb" id="cb_${ev.symbol}_${ev.date}" ${isChecked} onchange="toggleSetupCheckbox('${ev.symbol}', '${ev.date}', this.checked)">
+      </td>
+      <td style="text-align:center; font-weight:700; color:${pal.stroke}; white-space:nowrap;">
+        <span class="color-dot" style="background:${pal.stroke};"></span>#${idx + 1}
+      </td>
       <td class="tl"><strong style="color:#38bdf8;">${ev.symbol}</strong>${macroBadge}</td>
       <td class="tl" style="font-family:monospace; color:#94a3b8;">${ev.date}</td>
-      <td class="tl">${statePill}</td>
+      <td class="tl">${statePill}${mlPill}</td>
       <td style="text-align:center;">${rsPill}</td>
       <td style="color:#34d399; font-weight:600;">+${ev.move_pct.toFixed(1)}%</td>
       <td>${ev.cons_bars}d</td>
       <td style="color:${ev.pullback_pct > 25 ? '#f87171' : '#cbd5e1'}">-${ev.pullback_pct.toFixed(1)}%</td>
+      <td style="text-align:center;">${r2Str}</td>
+      <td style="text-align:center;">${pinchStr}</td>
       <td class="tl" style="font-size:11px; color:#cbd5e1;">${ev.pattern}</td>
       <td class="tl">${epBadgeHtml}</td>
     `;
     tbody.appendChild(tr);
   });
+
+  updateHeaderCheckbox();
 }
+
+function toggleSetupCheckbox(sym, date, checked) {
+  const k = `${sym}_${date}`;
+  if (checked) {
+    selectedSetupKeys.add(k);
+  } else {
+    selectedSetupKeys.delete(k);
+  }
+  updateHeaderCheckbox();
+
+  if (currentChartSymbol === sym) {
+    drawCanvasOverlays();
+  } else if (checked) {
+    const ev = allEvents.find(e => e.symbol === sym && e.date === date);
+    if (ev) selectEvent(ev);
+  }
+}
+
+function updateHeaderCheckbox() {
+  const hcb = document.getElementById('header_select_all');
+  if (!hcb) return;
+  if (!allEvents || allEvents.length === 0) {
+    hcb.checked = false;
+    hcb.indeterminate = false;
+  } else {
+    const visibleKeys = allEvents.map(e => `${e.symbol}_${e.date}`);
+    const selectedCount = visibleKeys.filter(k => selectedSetupKeys.has(k)).length;
+    if (selectedCount === visibleKeys.length && visibleKeys.length > 0) {
+      hcb.checked = true;
+      hcb.indeterminate = false;
+    } else if (selectedCount === 0) {
+      hcb.checked = false;
+      hcb.indeterminate = false;
+    } else {
+      hcb.checked = false;
+      hcb.indeterminate = true;
+    }
+  }
+}
+
+function toggleSelectAll(checked) {
+  allEvents.forEach(ev => {
+    const k = `${ev.symbol}_${ev.date}`;
+    if (checked) selectedSetupKeys.add(k);
+    else selectedSetupKeys.delete(k);
+  });
+  document.querySelectorAll('.setup-cb').forEach(cb => { cb.checked = checked; });
+  updateHeaderCheckbox();
+  drawCanvasOverlays();
+}
+
+function selectAllSetups() { toggleSelectAll(true); }
+function clearSelectedSetups() { toggleSelectAll(false); }
 
 function selectEvent(ev) {
   currentEvent = ev;
   document.querySelectorAll('#events_tbody tr').forEach(r => r.classList.remove('selected'));
   const activeRow = document.getElementById(`row_${ev.symbol}_${ev.date}`);
   if (activeRow) activeRow.classList.add('selected');
+
+  const k = `${ev.symbol}_${ev.date}`;
+  if (!selectedSetupKeys.has(k)) {
+    if (currentChartSymbol !== ev.symbol) {
+      selectedSetupKeys.clear();
+      document.querySelectorAll('.setup-cb').forEach(cb => { cb.checked = false; });
+    }
+    selectedSetupKeys.add(k);
+    const cb = document.getElementById(`cb_${ev.symbol}_${ev.date}`);
+    if (cb) cb.checked = true;
+  }
+  updateHeaderCheckbox();
 
   updateEnlargedStockCount();
   loadChart(ev.symbol, ev.date);
@@ -3035,18 +4096,37 @@ function applySetupPriceLines(setup) {
 
   if (setup.trade_info) {
     const ti = setup.trade_info;
-    const is06 = (strategySettings.stop === '06x');
-    const stopP = is06 ? ti.stop_loss_06x : ti.stop_loss_10x;
+    const curStop = (typeof strategySettings !== 'undefined' && strategySettings.stop) ? strategySettings.stop : '06x';
+    const isStop10 = (curStop === '10x');
+    let stopP = ti.stop_loss_06x;
+    let stopLbl = '0.6x';
+    if (curStop === 'dynamic' && ti.stop_loss_dynamic && ti.stop_loss_dynamic > 0) {
+      stopP = ti.stop_loss_dynamic;
+      stopLbl = 'Dynamic';
+    } else if (isStop10) {
+      stopP = ti.stop_loss_10x;
+      stopLbl = '1.0x';
+    }
     if (stopP && stopP > 0) {
       activePriceLines.push(candleSeries.createPriceLine({
-        price: stopP, color: '#f87171', lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: `Stop (${is06 ? '0.6x' : '1.0x'}) $${stopP}`
+        price: stopP, color: '#f87171', lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: `Stop (${stopLbl}) $${stopP.toFixed(2)}`
       }));
     }
-    const exitP = is06 ? ti.exit_price_06x : ti.exit_price_10x;
+    const exitP = isStop10 ? ti.exit_price_10x : ti.exit_price_06x;
     if (exitP && exitP > 0) {
       activePriceLines.push(candleSeries.createPriceLine({
-        price: exitP, color: '#38bdf8', lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: `Exit $${exitP}`
+        price: exitP, color: '#38bdf8', lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: `Exit $${exitP.toFixed(2)}`
       }));
+    }
+    const curExit = (typeof strategySettings !== 'undefined' && strategySettings.exit) ? strategySettings.exit : '10ema';
+    const isClimaxModel = curExit.startsWith('climax_') || curExit === 'triad_optimal';
+    if (isClimaxModel) {
+      const cP = isStop10 ? ti.climax_price_10x : ti.climax_price_06x;
+      if (cP && cP > 0) {
+        activePriceLines.push(candleSeries.createPriceLine({
+          price: cP, color: '#c084fc', lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: `Climax $${cP.toFixed(2)}`
+        }));
+      }
     }
   }
 }
@@ -3099,6 +4179,30 @@ function applyCandleMarkers(data) {
       shape: 'circle',
       text: isBk ? '🚀 QM BREAKOUT' : '⏳ QM COIL'
     });
+  }
+
+  if (setup.trade_info) {
+    const ti = setup.trade_info;
+    const curStop = (typeof strategySettings !== 'undefined' && strategySettings.stop) ? strategySettings.stop : '06x';
+    const curExit = (typeof strategySettings !== 'undefined' && strategySettings.exit) ? strategySettings.exit : 'climax_swing';
+    const isClimaxModel = curExit.startsWith('climax_') || curExit === 'triad_optimal';
+
+    if (isClimaxModel) {
+      const isStop10 = (curStop === '10x');
+      const cDate = isStop10 ? ti.climax_date_10x : ti.climax_date_06x;
+      const cR = isStop10 ? ti.climax_r_10x : ti.climax_r_06x;
+      const cP = isStop10 ? ti.climax_price_10x : ti.climax_price_06x;
+      const cProb = isStop10 ? ti.prob_exhaustion_10x : ti.prob_exhaustion_06x;
+      if (cDate && cP) {
+        markers.push({
+          time: cDate,
+          position: 'aboveBar',
+          color: '#c084fc',
+          shape: 'arrowDown',
+          text: `🎯 ML CLIMAX: +${cR}R ($${cP.toFixed(2)}) P=${cProb}`
+        });
+      }
+    }
   }
 
   markers.sort((a, b) => a.time.localeCompare(b.time));
@@ -3202,25 +4306,145 @@ function renderDossier(s, eps, st, cat) {
   document.getElementById('dos_sector').textContent = s.sector || 'Unknown';
   document.getElementById('dos_themes').textContent = s.themes || s.theme || 'General';
 
+  // ML Setup Quality & Dynamic Trade Execution Card
+  const mlCard = document.getElementById('card_ml_guidance');
+  if (mlCard) {
+    const ti = s ? (s.trade_info || (s.ml_guidance ? {
+      qm_tier: s.ml_guidance.quality?.tier,
+      qm_score: s.ml_guidance.quality?.qm_score,
+      p_big_move: s.ml_guidance.quality?.p_big,
+      p_trap: s.ml_guidance.quality?.p_trap,
+      conviction_sizing: s.ml_guidance.quality?.sizing,
+      ml_recommendation: s.ml_guidance.quality?.recommendation,
+      stop_loss_dynamic: s.ml_guidance.stop_loss?.dynamic_stop_price,
+      risk_pct_dynamic: s.ml_guidance.stop_loss?.risk_pct
+    } : null)) : null;
+
+    if (ti && (ti.qm_tier || ti.qm_score !== undefined)) {
+      mlCard.style.display = 'flex';
+      const tierBadge = document.getElementById('dos_ml_tier_badge');
+      if (tierBadge) {
+        if (ti.qm_tier === 'Premier') {
+          tierBadge.className = 'pctile-badge pctile-high';
+          tierBadge.textContent = '💎 PREMIER PINNACLE';
+        } else if (ti.qm_tier === 'High Quality') {
+          tierBadge.className = 'pctile-badge pctile-high';
+          tierBadge.textContent = '⭐ HIGH QUALITY';
+        } else if (ti.qm_tier === 'Toxic / Trap') {
+          tierBadge.className = 'pctile-badge pctile-low';
+          tierBadge.textContent = '⚠️ TOXIC TRAP';
+        } else {
+          tierBadge.className = 'pctile-badge pctile-mid';
+          tierBadge.textContent = ti.qm_tier || 'Standard';
+        }
+      }
+
+      document.getElementById('dos_ml_rec_text').textContent = ti.ml_recommendation || 'Standard Breakout Setup';
+      document.getElementById('dos_ml_score').textContent = `${(ti.qm_score !== null && ti.qm_score !== undefined) ? ti.qm_score.toFixed(1) : '50.0'} / 100`;
+      document.getElementById('dos_ml_sizing').textContent = `${(ti.conviction_sizing !== null && ti.conviction_sizing !== undefined) ? ti.conviction_sizing.toFixed(2) : '1.00'}x Conviction`;
+
+      if (ti.stop_loss_dynamic && ti.stop_loss_dynamic > 0) {
+        document.getElementById('dos_ml_stop').textContent = `$${ti.stop_loss_dynamic.toFixed(2)}`;
+        document.getElementById('dos_ml_risk').textContent = `-${ti.risk_pct_dynamic ? ti.risk_pct_dynamic.toFixed(1) : '3.5'}% risk`;
+      } else {
+        document.getElementById('dos_ml_stop').textContent = '--';
+        document.getElementById('dos_ml_risk').textContent = '--';
+      }
+
+      document.getElementById('dos_ml_p_big').textContent = (ti.p_big_move !== null && ti.p_big_move !== undefined) ? `${(ti.p_big_move * 100).toFixed(1)}%` : '--';
+      document.getElementById('dos_ml_p_trap').textContent = (ti.p_trap !== null && ti.p_trap !== undefined) ? `${(ti.p_trap * 100).toFixed(1)}%` : '--';
+
+      const tgts = s?.ml_guidance?.targets;
+      const el25r = document.getElementById('dos_ml_hurdle_25r');
+      const el35r = document.getElementById('dos_ml_hurdle_35r');
+      const elPlan = document.getElementById('dos_ml_plan');
+      if (el25r) el25r.textContent = (tgts && tgts.hurdle_25r) ? `$${tgts.hurdle_25r.toFixed(2)}` : '--';
+      if (el35r) el35r.textContent = (tgts && tgts.hurdle_35r) ? `$${tgts.hurdle_35r.toFixed(2)}` : '--';
+      if (elPlan && tgts && tgts.scale_out_plan) elPlan.textContent = tgts.scale_out_plan;
+    } else {
+      mlCard.style.display = 'none';
+    }
+  }
+
   // QM Breakout Strategy Trade Execution & Sizing Card
   const stratCard = document.getElementById('card_strategy_trade');
   if (stratCard) {
     if (s && s.trade_info) {
       stratCard.style.display = 'flex';
       const ti = s.trade_info;
-      const use06 = (strategySettings.stop === '06x');
-      const isWin = use06 ? ti.is_win_06x : ti.is_win_10x;
-      const realizedR = use06 ? ti.r_06x : ti.r_10x;
-      const sizedR = use06 ? ti.sized_r_06x : ti.sized_r_10x;
-      const gainPct = use06 ? ti.gain_pct_06x : ti.gain_pct_10x;
-      const stopPrice = use06 ? ti.stop_loss_06x : ti.stop_loss_10x;
-      const riskPct = use06 ? ti.risk_pct_06x : ti.risk_pct_10x;
-      const exitPrice = use06 ? ti.exit_price_06x : ti.exit_price_10x;
-      const exitDate = use06 ? ti.exit_date_06x : ti.exit_date_10x;
-      const exitReason = use06 ? ti.exit_reason_06x : ti.exit_reason_10x;
-      const barsHeld = use06 ? ti.bars_06x : ti.bars_10x;
-      const mfeR = use06 ? ti.mfe_r_06x : ti.mfe_r_10x;
-      const maeR = use06 ? ti.mae_r_06x : ti.mae_r_10x;
+      const curStop = (typeof strategySettings !== 'undefined' && strategySettings.stop) ? strategySettings.stop : '06x';
+      const curExit = (typeof strategySettings !== 'undefined' && strategySettings.exit) ? strategySettings.exit : '10ema';
+      const exitMap = {
+        '10ema': 'e10',
+        '20ema': 'e20',
+        '50ema': 'e50',
+        'staged': 'staged',
+        'balanced': 'balanced',
+        'climax_swing': 'climax_swing',
+        'climax_hybrid': 'climax_hybrid',
+        'climax_trend': 'climax_trend',
+        'triad_optimal': 'triad_optimal'
+      };
+      const isStop10 = (curStop === '10x');
+      const stSfx = isStop10 ? '10x' : '06x';
+
+      let stopPrice = ti.stop_loss_06x;
+      let riskPct = ti.risk_pct_06x;
+      let stopLabel = '0.6x';
+      if (curStop === 'dynamic' && ti.stop_loss_dynamic && ti.stop_loss_dynamic > 0) {
+        stopPrice = ti.stop_loss_dynamic;
+        riskPct = ti.risk_pct_dynamic || (((ti.entry_price - stopPrice) / ti.entry_price) * 100);
+        stopLabel = 'Dynamic Stop';
+      } else if (curStop === '10x') {
+        stopPrice = ti.stop_loss_10x;
+        riskPct = ti.risk_pct_10x;
+        stopLabel = '1.0x';
+      }
+
+      let realizedR = isStop10 ? ti.r_10x : ti.r_06x;
+      let sizedR = isStop10 ? ti.sized_r_10x : ti.sized_r_06x;
+      let barsHeld = isStop10 ? ti.bars_10x : ti.bars_06x;
+      let isWin = isStop10 ? ti.is_win_10x : ti.is_win_06x;
+      let gainPct = isStop10 ? ti.gain_pct_10x : ti.gain_pct_06x;
+
+      if (curExit === 'triad_optimal') {
+        realizedR = (ti.r_triad_optimal != null) ? ti.r_triad_optimal : ((ti.r_dyn_climax_swing != null) ? ti.r_dyn_climax_swing : ti.r_climax_swing_06x);
+        sizedR = (ti.sized_r_triad_optimal != null) ? ti.sized_r_triad_optimal : ((ti.sized_r_dyn_climax_swing != null) ? ti.sized_r_dyn_climax_swing : ti.sized_r_climax_swing_06x);
+        barsHeld = (ti.bars_triad_optimal != null) ? ti.bars_triad_optimal : ti.bars_climax_swing_06x;
+        isWin = (ti.is_win_triad_optimal != null) ? ti.is_win_triad_optimal : ti.is_win_climax_swing_06x;
+      } else if (curExit.startsWith('climax_')) {
+        const kR = `r_${curExit}_${stSfx}`;
+        const kSized = `sized_r_${curExit}_${stSfx}`;
+        const kBars = `bars_${curExit}_${stSfx}`;
+        const kWin = `is_win_${curExit}_${stSfx}`;
+        realizedR = (ti[kR] != null) ? ti[kR] : (isStop10 ? ti.r_10x : ti.r_06x);
+        sizedR = (ti[kSized] != null) ? ti[kSized] : (isStop10 ? ti.sized_r_10x : ti.sized_r_06x);
+        barsHeld = (ti[kBars] != null) ? ti[kBars] : (isStop10 ? ti.bars_10x : ti.bars_06x);
+        isWin = (ti[kWin] != null) ? ti[kWin] : (isStop10 ? ti.is_win_10x : ti.is_win_06x);
+      } else {
+        const exitMap = { '10ema': 'e10', '20ema': 'e20', '50ema': 'e50', 'staged': 'staged', 'balanced': 'balanced' };
+        const exPfx = exitMap[curExit] || 'e10';
+        const kR = `r_${exPfx}_${stSfx}`;
+        const kSized = `sized_r_${exPfx}_${stSfx}`;
+        const kBars = `bars_${exPfx}_${stSfx}`;
+        const kWin = `is_win_${exPfx}_${stSfx}`;
+        realizedR = (ti[kR] != null) ? ti[kR] : (isStop10 ? ti.r_10x : ti.r_06x);
+        sizedR = (ti[kSized] != null) ? ti[kSized] : (isStop10 ? ti.sized_r_10x : ti.sized_r_06x);
+        barsHeld = (ti[kBars] != null) ? ti[kBars] : (isStop10 ? ti.bars_10x : ti.bars_06x);
+        isWin = (ti[kWin] != null) ? ti[kWin] : (isStop10 ? ti.is_win_10x : ti.is_win_06x);
+      }
+
+      const exitPrice = isStop10 ? ti.exit_price_10x : ti.exit_price_06x;
+      const exitDate = isStop10 ? ti.exit_date_10x : ti.exit_date_06x;
+      const exitReason = isStop10 ? ti.exit_reason_10x : ti.exit_reason_06x;
+      const mfeR = isStop10 ? ti.mfe_r_10x : ti.mfe_r_06x;
+      const maeR = isStop10 ? ti.mae_r_10x : ti.mae_r_06x;
+
+      const isClimaxModel = curExit.startsWith('climax_') || curExit === 'triad_optimal';
+      const cDate = isStop10 ? ti.climax_date_10x : ti.climax_date_06x;
+      const cP = isStop10 ? ti.climax_price_10x : ti.climax_price_06x;
+      const cR = isStop10 ? ti.climax_r_10x : ti.climax_r_06x;
+      const cProb = isStop10 ? ti.prob_exhaustion_10x : ti.prob_exhaustion_06x;
 
       const badgeEl = document.getElementById('dos_strat_result_badge');
       if (badgeEl) {
@@ -3234,10 +4458,36 @@ function renderDossier(s, eps, st, cat) {
       }
 
       document.getElementById('dos_strat_entry').textContent = `$${ti.entry_price.toFixed(2)}`;
-      document.getElementById('dos_strat_stop').textContent = `$${stopPrice.toFixed(2)} (-${riskPct.toFixed(1)}%) [${use06 ? '0.6x' : '1.0x'}]`;
-      document.getElementById('dos_strat_exit').textContent = `$${exitPrice.toFixed(2)} on ${exitDate}`;
+      document.getElementById('dos_strat_stop').textContent = `$${stopPrice.toFixed(2)} (-${riskPct.toFixed(1)}%) [${stopLabel}]`;
+
+      const partialRow = document.getElementById('dos_strat_partial_row');
+      const exitLbl = document.getElementById('dos_strat_exit_lbl');
+
+      if (isClimaxModel && cDate && cP) {
+        if (partialRow) {
+          partialRow.style.display = 'flex';
+          document.getElementById('dos_strat_partial_exit').textContent = `50% @ $${cP.toFixed(2)} (+${cR}R) on ${cDate} (P=${cProb})`;
+        }
+        if (exitLbl) exitLbl.textContent = 'Runner Exit (50%):';
+        document.getElementById('dos_strat_exit').textContent = `$${exitPrice.toFixed(2)} on ${exitDate}`;
+      } else {
+        if (partialRow) partialRow.style.display = 'none';
+        if (exitLbl) {
+          exitLbl.textContent = curExit === '20ema' ? '20 EMA Exit (100%):' : (curExit === '50ema' ? '50 EMA Exit (100%):' : '10 EMA Exit (100%):');
+        }
+        document.getElementById('dos_strat_exit').textContent = `$${exitPrice.toFixed(2)} on ${exitDate}`;
+      }
 
       let humanExit = '10 EMA Close Violation';
+      if (curExit === '20ema') humanExit = '20 EMA Close Violation';
+      else if (curExit === '50ema') humanExit = '50 EMA Close Violation';
+      else if (curExit === 'staged') humanExit = 'Staged Scaling (33% @ 10E / 33% @ 20E / 34% @ 50E)';
+      else if (curExit === 'balanced') humanExit = 'Balanced Scaling (50% @ 10E / 50% @ 50E)';
+      else if (curExit === 'climax_swing') humanExit = 'ML Climax Swing (50% Climax @ P≥0.45, 50% 10 EMA)';
+      else if (curExit === 'climax_hybrid') humanExit = 'ML Climax Hybrid (33% Climax @ P≥0.50, 33% 10E, 34% 20E)';
+      else if (curExit === 'climax_trend') humanExit = 'ML Climax Trend (50% Climax @ P≥0.65, 50% 50 EMA)';
+      else if (curExit === 'triad_optimal') humanExit = '👑 Institutional Triad (Dynamic Stop + Climax Partial + Runner)';
+
       if (exitReason && exitReason.includes('stop')) humanExit = 'Initial Stop Loss Breached';
       else if (exitReason && exitReason.includes('max')) humanExit = 'Max Holding (250 bars)';
       document.getElementById('dos_strat_exit_reason').textContent = humanExit;
@@ -3388,6 +4638,10 @@ function renderDossier(s, eps, st, cat) {
   document.getElementById('dos_level').textContent = `$${s.level.toFixed(2)}`;
   document.getElementById('dos_trigger').textContent = `$${s.trigger.toFixed(2)} (${s.dist_to_trigger_pct > 0 ? '+' : ''}${s.dist_to_trigger_pct.toFixed(2)}%)`;
   document.getElementById('dos_stack').textContent = (s.stack_levels && s.stack_levels.length > 0) ? s.stack_levels.map(x => `$${x}`).join(', ') : `$${s.trigger}`;
+  const dosR2 = document.getElementById('dos_r2');
+  if (dosR2) dosR2.textContent = (s.r2 != null) ? s.r2.toFixed(3) : '·';
+  const dosPinch = document.getElementById('dos_pinch_ratio');
+  if (dosPinch) dosPinch.textContent = (s.pinch_ratio != null) ? `${s.pinch_ratio.toFixed(2)}x ADR` : '·';
 
   // EP Catalyst Linkage Card
   document.getElementById('dos_ep_badge').textContent = s.ep_badge;
@@ -3725,8 +4979,12 @@ function clearDossier() {
   if (document.getElementById('dos_stage2')) document.getElementById('dos_stage2').textContent = '--';
   if (document.getElementById('dos_dist_52w')) document.getElementById('dos_dist_52w').textContent = '--';
   if (document.getElementById('dos_rs_posture_status')) document.getElementById('dos_rs_posture_status').textContent = '--';
+  if (document.getElementById('dos_r2')) document.getElementById('dos_r2').textContent = '--';
+  if (document.getElementById('dos_pinch_ratio')) document.getElementById('dos_pinch_ratio').textContent = '--';
   const stratCard = document.getElementById('card_strategy_trade');
   if (stratCard) stratCard.style.display = 'none';
+  const mlCard = document.getElementById('card_ml_guidance');
+  if (mlCard) mlCard.style.display = 'none';
 }
 
 // Filter Actions
@@ -3757,16 +5015,22 @@ function setMacroFilter(mf) {
   if (mf === 'leading_sectors') {
     document.getElementById('sel_sector').value = 'leading_sectors';
     document.getElementById('sel_theme').value = 'all';
+    strategySettings.macro = 'leading_sectors';
   } else if (mf === 'leading_themes') {
     document.getElementById('sel_theme').value = 'leading_themes';
     document.getElementById('sel_sector').value = 'all';
+    strategySettings.macro = 'leading_themes';
   } else if (mf === 'emerging_themes') {
     document.getElementById('sel_theme').value = 'emerging_themes';
     document.getElementById('sel_sector').value = 'all';
+    strategySettings.macro = 'emerging_themes';
   } else {
     document.getElementById('sel_sector').value = 'all';
     document.getElementById('sel_theme').value = 'all';
+    strategySettings.macro = 'all';
   }
+  const cfgMacro = document.getElementById('cfg_strat_macro');
+  if (cfgMacro) cfgMacro.value = strategySettings.macro;
   fetchEvents();
 }
 
@@ -3828,6 +5092,11 @@ function resetFilters() {
   document.getElementById('sel_pullback').value = '';
   document.getElementById('sel_sector').value = 'all';
   document.getElementById('sel_theme').value = 'all';
+  if (document.getElementById('sel_bb_pinch')) document.getElementById('sel_bb_pinch').value = 'all';
+  if (document.getElementById('sel_r2')) document.getElementById('sel_r2').value = 'all';
+  if (document.getElementById('sel_strat_exit')) document.getElementById('sel_strat_exit').value = '10ema';
+  if (document.getElementById('cfg_strat_exit')) document.getElementById('cfg_strat_exit').value = '10ema';
+  strategySettings.exit = '10ema';
   document.getElementById('inp_search').value = '';
   fetchEvents();
 }
@@ -3837,7 +5106,7 @@ function sortTable(col) {
     currentSort.asc = !currentSort.asc;
   } else {
     currentSort.col = col;
-    currentSort.asc = (col === 'symbol' || col === 'pattern');
+    currentSort.asc = (col === 'symbol' || col === 'pattern' || col === 'pinch_ratio');
   }
   fetchEvents();
 }

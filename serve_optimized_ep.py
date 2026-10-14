@@ -49,9 +49,11 @@ EP_SCORED_PATH = ROOT / "data" / "simulations" / "ep_combined_study_scored.parqu
 RS_SCORED_PATH = ROOT / "data" / "simulations" / "rs_universe_scores.parquet"
 PORT = 8787
 EXTREME_PEAK_MODEL_PATH = ROOT / "data" / "models" / "ep_extreme_peak_classifier.pkl"
+DELAYED_STOP_MODEL_PATH = ROOT / "data" / "models" / "ep_delayed_stop_model.pkl"
 INTRADAY_CACHE_PATH = ROOT / "data" / "cache" / "intraday_watchlist_status.json"
 MONITOR_SETTINGS_FILE = ROOT / "data" / "cache" / "monitor_settings.json"
 _EXTREME_PEAK_MODEL = None
+_DELAYED_STOP_MODEL = None
 
 
 def compute_watchlist_ev(it: Dict[str, Any]) -> float:
@@ -182,6 +184,17 @@ def get_extreme_peak_model():
     return _EXTREME_PEAK_MODEL
 
 
+def get_delayed_stop_model():
+    """Loads and caches the 20-Day MAE Stop-Loss Quantile Regressor (ep_delayed_stop_model.pkl)."""
+    global _DELAYED_STOP_MODEL
+    if _DELAYED_STOP_MODEL is None and DELAYED_STOP_MODEL_PATH.exists():
+        try:
+            _DELAYED_STOP_MODEL = joblib.load(DELAYED_STOP_MODEL_PATH)
+        except Exception:
+            pass
+    return _DELAYED_STOP_MODEL
+
+
 def compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
     """Calculates standard Wilder's RSI."""
     delta = series.diff()
@@ -290,6 +303,126 @@ def predict_exhaustion_for_bars(bars: pd.DataFrame, entry_px: float, stop_px: fl
         return float(0.55 * p_lgb + 0.45 * p_xgb)
     except Exception:
         return 0.0
+
+
+def predict_ml_adaptive_stop(
+    bars: pd.DataFrame,
+    ep_idx: int,
+    trigger_px: float,
+    stop_px: float,
+    row: pd.Series | Dict[str, Any],
+    rs_val: float,
+    stage2_val: bool,
+    sec_m1: float,
+    thm_m1: float,
+    spy_ret20: float,
+    pre_dist_52w: float,
+    pre_runup: float,
+    pre_consol_tightness: float,
+    day1_upper_wick: float,
+    close_pos_val: float,
+    is_active_long: bool = False,
+    breakout_idx: Optional[int] = None,
+) -> Tuple[float, float]:
+    """Computes the ML Adaptive Stop loss price and percentage using the 20-Day MAE quantile regressor.
+
+    Returns (ml_stop_price, ml_stop_pct).
+    Clamped between 4.5% minimum cushion and the structural stop_px (never wider than D1 Low).
+    """
+    init_risk = max(0.01, ((trigger_px - stop_px) / trigger_px) * 100.0)
+    model_data = get_delayed_stop_model()
+    if model_data is None:
+        clamped_pct = round(max(4.5, min(init_risk, 8.0)), 1)
+        clamped_px = round(trigger_px * (1.0 - clamped_pct / 100.0), 2)
+        return clamped_px, clamped_pct
+
+    try:
+        model = model_data.get("model")
+        feature_cols = model_data.get("feature_cols", [])
+        if model is None or not feature_cols:
+            clamped_pct = round(max(4.5, min(init_risk, 8.0)), 1)
+            clamped_px = round(trigger_px * (1.0 - clamped_pct / 100.0), 2)
+            return clamped_px, clamped_pct
+
+        d1_high = float(bars["high"].iloc[ep_idx])
+        d1_low = float(bars["low"].iloc[ep_idx])
+        d1_close = float(bars["close"].iloc[ep_idx])
+        d1_open = float(bars["open"].iloc[ep_idx])
+        d1_rng = max(0.01, d1_high - d1_low)
+
+        left_bars = bars.iloc[max(0, ep_idx - 250):ep_idx]
+        d0_close = float(left_bars["close"].iloc[-1]) if not left_bars.empty else d1_open
+
+        bars_sma50 = bars["close"].rolling(50, min_periods=20).mean()
+        bars_sma200 = bars["close"].rolling(200, min_periods=50).mean()
+        pre_above_50 = bool(d0_close > bars_sma50.iloc[ep_idx - 1]) if ep_idx > 0 else False
+        pre_above_200 = bool(d0_close > bars_sma200.iloc[ep_idx - 1]) if ep_idx > 0 else False
+        s50_curr = bars_sma50.iloc[ep_idx - 1] if ep_idx > 0 else 0.0
+        s50_prev = bars_sma50.iloc[max(0, ep_idx - 21)] if ep_idx > 0 else 0.0
+        s50_slope = ((s50_curr - s50_prev) / s50_prev) * 100.0 if s50_prev > 0 else 0.0
+
+        c65 = float(left_bars["close"].iloc[-65]) if len(left_bars) >= 65 else d0_close
+        pre_run65 = ((d0_close - c65) / c65) * 100.0 if c65 > 0 else 0.0
+
+        vol_5 = float(left_bars["volume"].iloc[-5:].mean()) if len(left_bars) >= 5 else 1.0
+        vol_50 = float(left_bars["volume"].iloc[-50:].mean()) if len(left_bars) >= 50 else 1.0
+        pre_dryup = (vol_5 / vol_50) if vol_50 > 0 else 1.0
+
+        entry_idx = (ep_idx + 1 + breakout_idx) if (is_active_long and breakout_idx is not None) else len(bars) - 1
+        vol_entry = float(bars["volume"].iloc[entry_idx])
+        vol_50_entry = float(bars["volume"].iloc[max(0, entry_idx - 50):entry_idx].mean())
+        bk_rvol = (vol_entry / vol_50_entry) if vol_50_entry > 0 else 1.0
+        prev_c = float(bars["close"].iloc[entry_idx - 1])
+        bk_gap = ((float(bars["open"].iloc[entry_idx]) - prev_c) / prev_c) * 100.0 if prev_c > 0 else 0.0
+        shelf_l = float(bars["low"].iloc[ep_idx:entry_idx + 1].min())
+        shelf_pullback = ((d1_high - shelf_l) / d1_high) * 100.0 if d1_high > 0 else 0.0
+
+        dvol = (float(bars["volume"].iloc[ep_idx]) * float(bars["close"].iloc[ep_idx])) / 1e6
+        prev_close_ep = float(bars["close"].iloc[ep_idx - 1]) if ep_idx > 0 else d1_open
+        tr_val = max(d1_high - d1_low, abs(d1_high - prev_close_ep), abs(d1_low - prev_close_ep))
+        adr_val = (tr_val / d1_close) * 100.0 if d1_close > 0 else 5.0
+
+        f_dict = {
+            "gap_pct": safe_float(row.get("gap_pct", 0.0)),
+            "rvol": safe_float(row.get("rvol", 1.0), 1.0),
+            "dvol_m": dvol,
+            "close_pos": close_pos_val,
+            "adr_pct": adr_val,
+            "day1_body_pct": (abs(d1_close - d1_open) / d1_rng) * 100.0,
+            "day1_upper_wick_pct": day1_upper_wick,
+            "prev_day_gap_up": bool(row.get("prev_day_gap_up", False)),
+            "breakout_rvol": bk_rvol,
+            "breakout_gap_pct": bk_gap,
+            "shelf_pullback_pct": shelf_pullback,
+            "days_to_breakout": (breakout_idx + 1) if (is_active_long and breakout_idx is not None) else 2,
+            "rs_score_breakout": rs_val,
+            "dist_52w_breakout": pre_dist_52w,
+            "stage2_breakout": int(stage2_val),
+            "pre_consol_tightness_20d": pre_consol_tightness,
+            "pre_runup_20d": pre_runup,
+            "pre_runup_65d": pre_run65,
+            "pre_volume_dryup_5d": pre_dryup,
+            "pre_above_sma50": int(pre_above_50),
+            "pre_above_sma200": int(pre_above_200),
+            "pre_sma50_slope": s50_slope,
+            "sec_m1_breakout": sec_m1,
+            "sec_m3_breakout": sec_m1,
+            "thm_m1_breakout": thm_m1,
+            "thm_m3_breakout": thm_m1,
+            "spy_ret_20d_ep": spy_ret20,
+            "spy_ret_20d_entry": spy_ret20,
+            "initial_risk_pct": init_risk,
+        }
+
+        df_f = pd.DataFrame([f_dict]).reindex(columns=feature_cols, fill_value=0.0)
+        pred_mae = float(model.predict(df_f)[0])
+        clamped_stop_pct = max(4.5, min(init_risk, pred_mae))
+        ml_stop_price = round(trigger_px * (1.0 - clamped_stop_pct / 100.0), 2)
+        return ml_stop_price, round(clamped_stop_pct, 1)
+    except Exception:
+        clamped_stop_pct = round(max(4.5, min(init_risk, 8.0)), 1)
+        ml_stop_price = round(trigger_px * (1.0 - clamped_stop_pct / 100.0), 2)
+        return ml_stop_price, clamped_stop_pct
 
 
 def classify_institutional_archetype(row_data: Dict[str, Any], thm_eval: Dict[str, Any], rs: float, stage2: bool) -> Tuple[str, str, str, str]:
@@ -580,6 +713,45 @@ def get_active_watchlist(force_reload: bool = False) -> List[Dict[str, Any]]:
         # Fundamental Catalyst & SEC Filings are loaded on-demand by /api/chart for selected setup
         cat_dossier = None
 
+        # Portfolio Tier Classification (Institutional Core vs Tier 1 Ultra)
+        core_v2 = (v2_win >= 0.35) or (v2_50 >= 0.20)
+        core_rs = (rs >= 75.0)
+        core_posture = stage2 or (pre_dist_52w <= 30.0)
+        core_left = (pre_runup <= 15.0)
+        core_ep = (close_pos_val >= 0.40)
+        core_mkt = bool(spy_50)
+        is_core = bool(core_v2 and core_rs and core_posture and core_left and core_ep and core_mkt)
+
+        t1_v2 = (v2_50 >= 0.08)
+        t1_rs = (rs >= 88.0)
+        t1_posture = stage2 and (pre_dist_52w <= 20.0)
+        t1_left = (pre_runup <= 10.0)
+        t1_ep = (close_pos_val >= 0.50) and (day1_upper_wick <= 35.0)
+        t1_mkt = bool(spy_50)
+        is_t1 = bool(t1_v2 and t1_rs and t1_posture and t1_left and t1_ep and t1_mkt)
+
+        tier_name = "Tier 1: Ultra-Elite" if is_t1 else ("Tier 2: Institutional Core" if is_core else "Broad Watchlist")
+
+        ml_stop_px, ml_stop_pct = predict_ml_adaptive_stop(
+            bars=bars,
+            ep_idx=ep_idx,
+            trigger_px=trigger_px,
+            stop_px=stop_px,
+            row=row,
+            rs_val=rs,
+            stage2_val=stage2,
+            sec_m1=sec_m1,
+            thm_m1=thm_m1,
+            spy_ret20=spy_ret20,
+            pre_dist_52w=pre_dist_52w,
+            pre_runup=pre_runup,
+            pre_consol_tightness=pre_consol_tightness,
+            day1_upper_wick=day1_upper_wick,
+            close_pos_val=close_pos_val,
+            is_active_long=(broke_out and not stopped_out),
+            breakout_idx=breakout_idx,
+        )
+
         if broke_out and not stopped_out:
             unr_r = round((curr_close - trigger_px) / risk_pts, 2)
             unr_pct = round(((curr_close / trigger_px) - 1.0) * 100.0, 1)
@@ -598,6 +770,8 @@ def get_active_watchlist(force_reload: bool = False) -> List[Dict[str, Any]]:
                 "trigger_price": trigger_px,
                 "current_price": round(curr_close, 2),
                 "stop_price": stop_px,
+                "ml_stop_price": ml_stop_px,
+                "ml_stop_pct": ml_stop_pct,
                 "unrealized_r": unr_r,
                 "unrealized_pct": unr_pct,
                 "dist_to_trigger": 0.0,
@@ -647,6 +821,9 @@ def get_active_watchlist(force_reload: bool = False) -> List[Dict[str, Any]]:
                 "qqq_ret_20d_entry": qqq_ret20,
                 "qqq_bull_stack": qqq_bull,
                 "qqq_spy_ratio_bull": tech_lead,
+                "is_tier1": is_t1,
+                "is_institutional_core": is_core,
+                "tier": tier_name,
             }
             it_dict["expected_value_r"] = compute_watchlist_ev(it_dict)
             items.append(it_dict)
@@ -661,6 +838,8 @@ def get_active_watchlist(force_reload: bool = False) -> List[Dict[str, Any]]:
                 "trigger_price": trigger_px,
                 "current_price": round(curr_close, 2),
                 "stop_price": stop_px,
+                "ml_stop_price": ml_stop_px,
+                "ml_stop_pct": ml_stop_pct,
                 "unrealized_r": 0.0,
                 "unrealized_pct": 0.0,
                 "dist_to_trigger": dist_to_trigger,
@@ -710,6 +889,9 @@ def get_active_watchlist(force_reload: bool = False) -> List[Dict[str, Any]]:
                 "qqq_ret_20d_entry": qqq_ret20,
                 "qqq_bull_stack": qqq_bull,
                 "qqq_spy_ratio_bull": tech_lead,
+                "is_tier1": is_t1,
+                "is_institutional_core": is_core,
+                "tier": tier_name,
             }
             it_dict["expected_value_r"] = compute_watchlist_ev(it_dict)
             items.append(it_dict)
@@ -922,6 +1104,8 @@ def filter_dataset(
     if base_r_col not in df.columns:
         base_r_col = "adaptive_v2_sized_r" if sizing == "v2" else "adaptive_r"
 
+    df["base_r_val"] = df[base_r_col]
+
     # 6. Apply Progressive Exposure if active
     if progressive != "none":
         df["active_calc_r"] = apply_progressive_exposure(df, base_r_col, progressive)
@@ -1071,6 +1255,8 @@ def api_trades():
                 active_ret = r.get("adaptive_ret_pct", r["return_pct"])
 
         r_val = safe_float(r[r_col], 0.0)
+        base_r_val = safe_float(r.get("base_r_val", r_val), r_val)
+        prog_mult = round(r_val / base_r_val, 2) if abs(base_r_val) > 0.001 else 1.0
         v2_val = safe_float(r.get("v2_breakout", r.get("ml_50", 0.0)), 0.0)
         rs_val = safe_float(r.get("rs_score_breakout", r.get("rs_score", 50.0)), 50.0)
 
@@ -1100,6 +1286,9 @@ def api_trades():
             "sector": r.get("sector", "Unknown"),
             "theme": r.get("theme", "Unknown"),
             "v2_size_mult": safe_float(r.get("v2_size_mult", 1.0), 1.0),
+            "base_r_multiple": round(base_r_val, 2),
+            "prog_mult": prog_mult,
+            "progressive_mode": prog,
             "ml_50": round(v2_val, 3),
             "v2_breakout": round(v2_val, 3),
             "v2_win_prob": round(safe_float(r.get("v2_win_prob", 0.5), 0.5), 3),
@@ -1173,6 +1362,7 @@ def api_trades():
 def api_watchlist():
     """Returns active in-flight trades and coiling setups from the last 20-25 trading days."""
     status_filter = request.args.get("status", "all").strip().lower()
+    tier_filter = request.args.get("tier", "all").strip().lower()
     min_rs = float(request.args.get("min_rs", 0.0))
     sort_by = request.args.get("sort_by", "unrealized_r")
     sort_dir = request.args.get("sort_dir", "desc")
@@ -1184,6 +1374,10 @@ def api_watchlist():
             continue
         if status_filter == "coiling" and it["status"] != "Coiling Setup":
             continue
+        if tier_filter in ["core", "tier2"] and not it.get("is_institutional_core", False):
+            continue
+        if tier_filter in ["tier1", "ultra", "t1"] and not it.get("is_tier1", False):
+            continue
         if min_rs > 0 and it["rs_score"] < min_rs:
             continue
         filtered.append(it)
@@ -1191,15 +1385,17 @@ def api_watchlist():
     asc = (sort_dir.lower() == "asc")
     if sort_by in ["expected_value_r", "ev", "ev_r"]:
         filtered.sort(key=lambda x: safe_float(x.get("expected_value_r", 0.0)), reverse=not asc)
-    elif sort_by in ["unrealized_r", "unrealized_pct", "dist_to_trigger", "rs_score", "gap_pct", "rvol", "trigger_price", "current_price"]:
+    elif sort_by in ["unrealized_r", "unrealized_pct", "dist_to_trigger", "rs_score", "gap_pct", "rvol", "trigger_price", "current_price", "v2_conviction_50", "v2_breakout"]:
         filtered.sort(key=lambda x: safe_float(x.get(sort_by, 0.0)), reverse=not asc)
-    elif sort_by in ["ep_date", "trigger_date", "symbol", "status", "archetype"]:
+    elif sort_by in ["ep_date", "trigger_date", "symbol", "status", "archetype", "tier"]:
         filtered.sort(key=lambda x: str(x.get(sort_by, "")), reverse=not asc)
     else:
         filtered.sort(key=lambda x: safe_float(x.get("expected_value_r", x.get("unrealized_r", 0.0))), reverse=True)
 
     n_active = sum(1 for x in items if x["status"] == "Active Long")
     n_coiling = sum(1 for x in items if x["status"] == "Coiling Setup")
+    n_core = sum(1 for x in items if x.get("is_institutional_core", False))
+    n_tier1 = sum(1 for x in items if x.get("is_tier1", False))
 
     intra_meta = {}
     if INTRADAY_CACHE_PATH.exists():
@@ -1219,6 +1415,9 @@ def api_watchlist():
         "count": len(filtered),
         "total_active": n_active,
         "total_coiling": n_coiling,
+        "total_all": len(items),
+        "total_core": n_core,
+        "total_tier1": n_tier1,
         "intraday_meta": intra_meta,
     })
 
@@ -1853,6 +2052,13 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <!-- Active Watchlist Mode Filters -->
     <div id="filters_watchlist" style="display:none; align-items:center; gap:12px; flex-wrap:wrap;">
       <div class="ctl-group">
+        <span class="ctl-label">PORTFOLIO TIER:</span>
+        <button class="btn-toggle active" id="btn_wl_tier_all" onclick="setWatchlistTier('all')">All Watchlist (<span id="lbl_wl_count_all">66</span>)</button>
+        <button class="btn-toggle" id="btn_wl_tier_core" onclick="setWatchlistTier('core')">🛡️ Institutional Core (<span id="lbl_wl_count_core">21</span>)</button>
+        <button class="btn-toggle" id="btn_wl_tier_1" onclick="setWatchlistTier('tier1')">🎯 Tier 1 Ultra (<span id="lbl_wl_count_t1">4</span>)</button>
+      </div>
+
+      <div class="ctl-group">
         <span class="ctl-label">STATUS:</span>
         <select class="ctl-select" id="sel_wl_status" onchange="loadWatchlistData()">
           <option value="all" selected>All Watchlist Setups</option>
@@ -1954,6 +2160,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             <span class="chart-ticker" id="c_ticker">-</span>
             <span id="c_badge_status" class="badge-status status-active" style="display:none;">Active</span>
             <span id="c_badge_arch" class="badge-arch" style="display:none; font-size:9.5px; padding:2px 5px;">-</span>
+            <span id="c_badge_tier" class="badge-sz" style="display:none; font-size:9.5px; padding:2px 6px; font-weight:700;">-</span>
+            <span id="c_badge_v2" class="badge-sz" style="display:none; font-size:9.5px; padding:2px 6px; font-weight:700;">-</span>
             <span class="chart-sub" id="c_meta" title="">-</span>
           </div>
           <div class="chart-controls-group">
@@ -1983,7 +2191,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           </div>
           <div class="chart-legends-bar">
             <span id="c_trigger_legend" style="color:#22c55e;">── Breakout</span>
-            <span id="c_stop_legend" style="color:#ef4444;">── Stop</span>
+            <span id="c_stop_legend" style="color:#ef4444;">── D1 Low Stop</span>
+            <span id="c_ml_stop_legend" style="color:#f59e0b; display:none;">── 🤖 ML Adaptive Stop</span>
             <span id="c_ma_legend" style="color:#0284c7;">── Trail MA</span>
             <span id="c_climax_legend" style="color:#c084fc; display:none;">── 50% Climax</span>
           </div>
@@ -2027,15 +2236,18 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       <div class="d-card" id="card_exec">
         <div class="d-card-title"><span id="d_card1_title">🛡️ 1. Setup Status &amp; Execution</span><span id="d_r_badge" class="badge-sz sz-15">+0.0R</span></div>
         <div class="d-row"><span class="d-lbl">Trade Type:</span><span class="d-val hl" id="d_trade_type">Trade 1 Base EP Delayed Breakout</span></div>
+        <div class="d-row"><span class="d-lbl">Portfolio Tier:</span><span class="d-val hl" id="d_tier">-</span></div>
         <div class="d-row"><span class="d-lbl">Trader Archetype:</span><span class="d-val hl" id="d_archetype">-</span></div>
         <div class="d-row"><span class="d-lbl" id="d_lbl_entry">Entry (D1 Breakout):</span><span class="d-val hl" id="d_entry">-</span></div>
         <div class="d-row"><span class="d-lbl" id="d_lbl_stop">Stop Loss / Invalidation:</span><span class="d-val" id="d_stop" style="color:var(--red);">-</span></div>
+        <div class="d-row" id="row_ml_stop"><span class="d-lbl" id="d_lbl_ml_stop">🤖 ML Adaptive Stop:</span><span class="d-val hl" id="d_ml_stop" style="color:var(--amber); font-weight:700;">-</span></div>
         <div class="d-row"><span class="d-lbl">Initial Risk %:</span><span class="d-val" id="d_risk_pct">-</span></div>
         <div class="d-row"><span class="d-lbl">Suggested Size:</span><span class="d-val hl" id="d_size_mult">-</span></div>
         <div id="d_size_desc_row" style="background:#0f172a; padding:6px 8px; border-radius:4px; border:1px solid #1e293b; font-size:10px; line-height:1.35; margin-bottom:5px;">
           <div style="font-weight:700; color:var(--accent); margin-bottom:2px;" id="d_size_title">1.00x Base Allocation</div>
           <div id="d_size_desc" style="color:#94a3b8;">Standard institutional EP allocation: 1.0 R risk budget.</div>
         </div>
+        <div class="d-row"><span class="d-lbl" id="d_lbl_v2_card1">V2 Conviction P(+50%):</span><span class="d-val hl" id="d_v2_card1" style="color:#c084fc; font-weight:700;">-</span></div>
         <div class="d-row"><span class="d-lbl" id="d_lbl_ev">Expected Value (EV):</span><span class="d-val hl" id="d_ev" style="color:#c084fc; font-weight:700;">-</span></div>
         <div class="d-row"><span class="d-lbl" id="d_lbl_exit">Current / Exit Price:</span><span class="d-val" id="d_exit">-</span></div>
         <div class="d-row"><span class="d-lbl" id="d_lbl_exit_reason">Unrealized / Exit Result:</span><span class="d-val" id="d_exit_reason" style="color:var(--amber);">-</span></div>
@@ -2132,7 +2344,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     let selectedTrade = null;
     let currentSortBy = 'r_multiple';
     let currentSortDir = 'desc';
-    let chart, candleSeries, volumeSeries, maSeries, triggerLine, stopLine, climaxLine;
+    let chart, candleSeries, volumeSeries, maSeries, triggerLine, stopLine, mlStopLine, climaxLine;
     let ema8Series, ema10Series, ema20Series, ema21Series, sma50Series, sma200Series, volMa20Series;
     let larssonFastSeries, larssonSlowSeries;
     let currentChartData = null;
@@ -2445,6 +2657,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             <th onclick="sortWatchlistTable('unrealized_r')" title="Sort by Gain / Proximity">GAIN / DIST</th>
             <th onclick="sortWatchlistTable('expected_value_r')" style="color:#c084fc; font-weight:700;" title="Sort by Highest Expected Value (EV in R)">EV (R) ⬍</th>
             <th onclick="sortWatchlistTable('rs_score')" title="Sort by RS Score">RS</th>
+            <th onclick="sortWatchlistTable('v2_conviction_50')" style="color:#c084fc; font-weight:700;" title="Sort by V2 Conviction P(+50%)">V2 ⬍</th>
             <th onclick="sortWatchlistTable('ep_date')" style="color:var(--accent);" title="Sort by EP Date">EP DATE ⬍</th>
           </tr>
         `;
@@ -2456,6 +2669,19 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       document.getElementById('btn_tier_all').className = (t === 'all') ? 'btn-toggle active' : 'btn-toggle';
       document.getElementById('btn_tier_1').className = (t === 'tier1') ? 'btn-toggle active-tier1' : 'btn-toggle';
       loadData();
+    }
+
+    let activeWlTier = 'all';
+
+    function setWatchlistTier(t) {
+      activeWlTier = t;
+      const bAll = document.getElementById('btn_wl_tier_all');
+      const bCore = document.getElementById('btn_wl_tier_core');
+      const bT1 = document.getElementById('btn_wl_tier_1');
+      if (bAll) bAll.className = (t === 'all') ? 'btn-toggle active' : 'btn-toggle';
+      if (bCore) bCore.className = (t === 'core') ? 'btn-toggle active' : 'btn-toggle';
+      if (bT1) bT1.className = (t === 'tier1') ? 'btn-toggle active-tier1' : 'btn-toggle';
+      loadWatchlistData();
     }
 
     function onFilterChange() {
@@ -2561,7 +2787,20 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         const res = await fetch('/api/watchlist');
         if (res.ok) {
           const data = await res.json();
-          document.getElementById('btn_wl_count').textContent = data.count || 0;
+          const btnWl = document.getElementById('btn_wl_count');
+          if (btnWl) btnWl.textContent = data.count || 0;
+          if (data.total_all !== undefined) {
+            const lAll = document.getElementById('lbl_wl_count_all');
+            if (lAll) lAll.textContent = data.total_all;
+          }
+          if (data.total_core !== undefined) {
+            const lCore = document.getElementById('lbl_wl_count_core');
+            if (lCore) lCore.textContent = data.total_core;
+          }
+          if (data.total_tier1 !== undefined) {
+            const lT1 = document.getElementById('lbl_wl_count_t1');
+            if (lT1) lT1.textContent = data.total_tier1;
+          }
         }
       } catch (e) {}
     }
@@ -2629,12 +2868,24 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       const minRS = document.getElementById('sel_wl_min_rs').value;
       const stage2Filter = document.getElementById('sel_wl_stage2').value;
 
-      const q = `status=${statusFilter}&min_rs=${minRS}&sort_by=${currentSortBy}&sort_dir=${currentSortDir}`;
+      const q = `status=${statusFilter}&min_rs=${minRS}&tier=${activeWlTier}&sort_by=${currentSortBy}&sort_dir=${currentSortDir}`;
 
       try {
         const res = await fetch(`/api/watchlist?${q}`);
         if (!res.ok) throw new Error(`HTTP ${res.status} from /api/watchlist`);
         const data = await res.json();
+        if (data.total_all !== undefined) {
+          const lAll = document.getElementById('lbl_wl_count_all');
+          if (lAll) lAll.textContent = data.total_all;
+        }
+        if (data.total_core !== undefined) {
+          const lCore = document.getElementById('lbl_wl_count_core');
+          if (lCore) lCore.textContent = data.total_core;
+        }
+        if (data.total_tier1 !== undefined) {
+          const lT1 = document.getElementById('lbl_wl_count_t1');
+          if (lT1) lT1.textContent = data.total_tier1;
+        }
         let items = data.items || [];
         if (stage2Filter === 'stage2') {
           items = items.filter(x => x.stage2);
@@ -2777,12 +3028,23 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         const rsColor = it.rs_score >= 90 ? '#38bdf8' : (it.rs_score >= 80 ? '#22c55e' : '#94a3b8');
         const archBadge = `<span class="badge-arch" style="font-size:9.5px; font-weight:600;">${it.archetype ? it.archetype.replace(/^[^\\s]+[\\s]*/, '') : 'Core'}</span>`;
 
+        let tierBadge = '';
+        if (it.is_tier1) {
+          tierBadge = `<span style="background:rgba(239, 68, 68, 0.2); color:#f87171; border:1px solid #ef4444; border-radius:3px; padding:1px 4px; font-size:8.5px; font-weight:700; margin-left:4px;" title="Tier 1 Ultra-Elite Sniper Setup">🎯 T1</span>`;
+        } else if (it.is_institutional_core) {
+          tierBadge = `<span style="background:rgba(59, 130, 246, 0.2); color:#60a5fa; border:1px solid #3b82f6; border-radius:3px; padding:1px 4px; font-size:8.5px; font-weight:700; margin-left:4px;" title="Institutional Core Strategy Setup">🛡️ CORE</span>`;
+        }
+
         const evVal = it.expected_value_r !== undefined ? it.expected_value_r : 0.0;
         const evColor = evVal >= 5.0 ? '#c084fc' : (evVal >= 2.0 ? '#38bdf8' : (evVal >= 0 ? '#22c55e' : '#ef4444'));
         const evStr = (evVal >= 0 ? '+' : '') + evVal.toFixed(2) + ' R';
 
+        const v2Val = (it.v2_conviction_50 !== undefined && it.v2_conviction_50 !== null) ? it.v2_conviction_50 : (it.v2_breakout || 0);
+        const v2Pct = Math.round(v2Val * 100);
+        const v2Color = v2Val >= 0.20 ? '#34d399' : (v2Val >= 0.10 ? '#818cf8' : '#c084fc');
+
         row.innerHTML = `
-          <td class="tl"><strong style="color:#fff;">${it.symbol}</strong></td>
+          <td class="tl"><strong style="color:#fff;">${it.symbol}</strong>${tierBadge}</td>
           <td class="tl">${archBadge}</td>
           <td class="tl">${statusBadge}</td>
           <td>$${it.trigger_price.toFixed(2)}</td>
@@ -2790,6 +3052,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           <td>${gainCol}</td>
           <td><span style="color:${evColor}; font-weight:700;">${evStr}</span></td>
           <td><span style="color:${rsColor}; font-weight:600;">${it.rs_score}</span></td>
+          <td><span style="color:${v2Color}; font-weight:700;" title="P(+50% Conviction): ${(v2Val * 100).toFixed(1)}%">${v2Pct}%</span></td>
           <td style="color:var(--accent); font-size:10px; font-weight:600;">${it.ep_date}</td>
         `;
         row.onclick = () => selectTrade(it);
@@ -2911,7 +3174,47 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       document.getElementById('c_ticker').textContent = tr.symbol;
       const statusBadge = document.getElementById('c_badge_status');
       const archBadge = document.getElementById('c_badge_arch');
+      const v2Badge = document.getElementById('c_badge_v2');
       const cMeta = document.getElementById('c_meta');
+
+      const v2Val = (tr.v2_conviction_50 !== undefined && tr.v2_conviction_50 !== null) ? tr.v2_conviction_50 : (tr.v2_breakout || tr.ml_50 || 0);
+      const v2Pct = Math.round(v2Val * 100);
+      if (v2Badge) {
+        v2Badge.textContent = `V2 P(+50%): ${v2Pct}%`;
+        v2Badge.style.display = 'inline-block';
+        if (v2Val >= 0.20) {
+          v2Badge.style.background = '#064e3b';
+          v2Badge.style.color = '#34d399';
+          v2Badge.style.border = '1px solid #059669';
+        } else if (v2Val >= 0.10) {
+          v2Badge.style.background = '#1e1b4b';
+          v2Badge.style.color = '#818cf8';
+          v2Badge.style.border = '1px solid #4f46e5';
+        } else {
+          v2Badge.style.background = '#2e1065';
+          v2Badge.style.color = '#c084fc';
+          v2Badge.style.border = '1px solid #7c3aed';
+        }
+      }
+
+      const tierBadge = document.getElementById('c_badge_tier');
+      if (tierBadge) {
+        if (tr.is_tier1) {
+          tierBadge.textContent = '🎯 Tier 1 Ultra';
+          tierBadge.style.display = 'inline-block';
+          tierBadge.style.background = '#450a0a';
+          tierBadge.style.color = '#fca5a5';
+          tierBadge.style.border = '1px solid #ef4444';
+        } else if (tr.is_institutional_core || tr.tier === 'Tier 2: Institutional Core') {
+          tierBadge.textContent = '🛡️ Institutional Core';
+          tierBadge.style.display = 'inline-block';
+          tierBadge.style.background = '#172554';
+          tierBadge.style.color = '#93c5fd';
+          tierBadge.style.border = '1px solid #3b82f6';
+        } else {
+          tierBadge.style.display = 'none';
+        }
+      }
 
       if (isWl) {
         if (statusBadge) {
@@ -2946,22 +3249,54 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
       // Update Trade Classification & Setup Status
       document.getElementById('d_trade_type').textContent = tr.trade_type || 'Trade 1: Base EP Delayed Breakout (Days 2-5)';
+      const dTier = document.getElementById('d_tier');
+      if (dTier) {
+        if (tr.is_tier1) {
+          dTier.textContent = '🎯 Tier 1: Ultra-Elite Sniper';
+          dTier.style.color = '#f87171';
+        } else if (tr.is_institutional_core || tr.tier === 'Tier 2: Institutional Core') {
+          dTier.textContent = '🛡️ Tier 2: Institutional Core';
+          dTier.style.color = '#60a5fa';
+        } else {
+          dTier.textContent = tr.tier || 'Broad Watchlist Setup';
+          dTier.style.color = '#94a3b8';
+        }
+      }
       document.getElementById('d_archetype').textContent = tr.archetype || '👑 Pinnacle Elite';
 
       // Update Dossier Card 1
       const rBadge = document.getElementById('d_r_badge');
-      const sugLabel = tr.suggested_size_label || (tr.v2_size_mult ? `${tr.v2_size_mult}x Allocation` : '1.00x Base Allocation');
-      const sugDesc = tr.suggested_size_desc || (tr.position_management_plan || 'Standard institutional EP allocation: 1.0 R risk budget under institutional rules.');
+      let sugLabel = tr.suggested_size_label || (tr.v2_size_mult ? `${tr.v2_size_mult}x Allocation` : '1.00x Base Allocation');
+      let sugDesc = tr.suggested_size_desc || (tr.position_management_plan || 'Standard institutional EP allocation: 1.0 R risk budget under institutional rules.');
+
+      const hasProgThrottle = (tr.progressive_mode && tr.progressive_mode !== 'none' && tr.prog_mult !== undefined && tr.prog_mult !== 1.0);
+      if (hasProgThrottle) {
+        const netSize = (tr.v2_size_mult * tr.prog_mult).toFixed(2);
+        sugLabel = `${tr.v2_size_mult}x Base → ${netSize}x Net (${tr.prog_mult}x Gov)`;
+        sugDesc = `V2 Conviction sized at ${tr.v2_size_mult}x allocation, throttled to ${netSize}x by ${tr.progressive_mode} progressive exposure governor.`;
+      }
 
       document.getElementById('d_size_mult').textContent = sugLabel;
       document.getElementById('d_size_title').textContent = sugLabel;
       document.getElementById('d_size_desc').textContent = sugDesc;
 
+      const dV2Card1 = document.getElementById('d_v2_card1');
+      if (dV2Card1) {
+        const v2Label = v2Val >= 0.20 ? 'Apex Conviction (≥20%)' : (v2Val >= 0.10 ? 'Baseline Conviction (10-20%)' : 'Defensive Conviction (<10%)');
+        dV2Card1.textContent = `${(v2Val * 100).toFixed(1)}% · ${v2Label}`;
+        dV2Card1.style.color = v2Val >= 0.20 ? '#34d399' : (v2Val >= 0.10 ? '#818cf8' : '#c084fc');
+      }
+
       // Update Expected Value (EV) in Dossier
       const evVal = tr.expected_value_r !== undefined ? tr.expected_value_r : (tr.r_multiple || 0.0);
       const evElem = document.getElementById('d_ev');
       if (evElem) {
-        evElem.textContent = (evVal >= 0 ? '+' : '') + Number(evVal).toFixed(2) + ' R';
+        let evText = (evVal >= 0 ? '+' : '') + Number(evVal).toFixed(2) + ' R';
+        if (hasProgThrottle && tr.base_r_multiple !== undefined) {
+          const baseStr = (tr.base_r_multiple >= 0 ? '+' : '') + Number(tr.base_r_multiple).toFixed(2) + 'R Base';
+          evText += ` (${baseStr} × ${tr.prog_mult}x Gov)`;
+        }
+        evElem.textContent = evText;
         evElem.style.color = evVal >= 5.0 ? '#c084fc' : (evVal >= 2.0 ? '#38bdf8' : (evVal >= 0 ? '#22c55e' : '#ef4444'));
       }
 
@@ -2972,9 +3307,18 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           document.getElementById('d_card1_title').textContent = '🟢 1. Active Long Position';
           document.getElementById('d_lbl_entry').textContent = 'Entry (Breakout):';
           document.getElementById('d_entry').textContent = `$${tr.trigger_price.toFixed(2)} (${tr.trigger_date})`;
-          document.getElementById('d_lbl_stop').textContent = 'Stop Loss:';
+          document.getElementById('d_lbl_stop').textContent = '🛡️ Structural Stop (D1 Low):';
           document.getElementById('d_stop').textContent = `$${tr.stop_price.toFixed(2)} (-${tr.dynamic_stop_loss_pct}%)`;
-          document.getElementById('d_risk_pct').textContent = `${tr.dynamic_stop_loss_pct}%`;
+          const rowMlAct = document.getElementById('row_ml_stop');
+          if (rowMlAct) {
+            if (tr.ml_stop_price) {
+              rowMlAct.style.display = 'flex';
+              document.getElementById('d_ml_stop').textContent = `$${tr.ml_stop_price.toFixed(2)} (-${tr.ml_stop_pct.toFixed(1)}%)`;
+            } else {
+              rowMlAct.style.display = 'none';
+            }
+          }
+          document.getElementById('d_risk_pct').textContent = tr.ml_stop_pct ? `${tr.dynamic_stop_loss_pct}% (Structural) · ${tr.ml_stop_pct.toFixed(1)}% (ML)` : `${tr.dynamic_stop_loss_pct}%`;
           document.getElementById('d_lbl_exit').textContent = 'Current Price:';
           document.getElementById('d_exit').textContent = `$${tr.current_price.toFixed(2)}`;
           document.getElementById('d_lbl_exit_reason').textContent = 'Unrealized Gain:';
@@ -2989,9 +3333,18 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           document.getElementById('d_card1_title').textContent = '⏳ 1. Coiling Breakout Setup';
           document.getElementById('d_lbl_entry').textContent = 'Trigger (D1 High + 0.05):';
           document.getElementById('d_entry').textContent = `$${tr.trigger_price.toFixed(2)}`;
-          document.getElementById('d_lbl_stop').textContent = 'Invalidation (D1 Low):';
+          document.getElementById('d_lbl_stop').textContent = '🛡️ Invalidation (D1 Low):';
           document.getElementById('d_stop').textContent = `$${tr.stop_price.toFixed(2)} (-${tr.dynamic_stop_loss_pct}%)`;
-          document.getElementById('d_risk_pct').textContent = `${tr.dynamic_stop_loss_pct}%`;
+          const rowMlCoil = document.getElementById('row_ml_stop');
+          if (rowMlCoil) {
+            if (tr.ml_stop_price) {
+              rowMlCoil.style.display = 'flex';
+              document.getElementById('d_ml_stop').textContent = `$${tr.ml_stop_price.toFixed(2)} (-${tr.ml_stop_pct.toFixed(1)}%)`;
+            } else {
+              rowMlCoil.style.display = 'none';
+            }
+          }
+          document.getElementById('d_risk_pct').textContent = tr.ml_stop_pct ? `${tr.dynamic_stop_loss_pct}% (Structural) · ${tr.ml_stop_pct.toFixed(1)}% (ML)` : `${tr.dynamic_stop_loss_pct}%`;
           document.getElementById('d_lbl_exit').textContent = 'Current Price:';
           document.getElementById('d_exit').textContent = `$${tr.current_price.toFixed(2)}`;
           document.getElementById('d_lbl_exit_reason').textContent = 'Setup Status:';
@@ -3010,6 +3363,15 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         document.getElementById('d_entry').textContent = `$${tr.entry_price.toFixed(2)} (${tr.entry_date})`;
         document.getElementById('d_lbl_stop').textContent = isMlStop ? 'Stop Loss (🤖 20D MAE):' : 'Stop Loss (🛡️ D1 Low):';
         document.getElementById('d_stop').textContent = `$${tr.stop_price.toFixed(2)} (-${tr.dynamic_stop_loss_pct}%)`;
+        const rowMlClosed = document.getElementById('row_ml_stop');
+        if (rowMlClosed) {
+          if (tr.ml_stop_price) {
+            rowMlClosed.style.display = 'flex';
+            document.getElementById('d_ml_stop').textContent = `$${tr.ml_stop_price.toFixed(2)} (-${tr.ml_stop_pct.toFixed(1)}%)`;
+          } else {
+            rowMlClosed.style.display = 'none';
+          }
+        }
         document.getElementById('d_risk_pct').textContent = `${tr.dynamic_stop_loss_pct}%`;
         document.getElementById('d_lbl_exit').textContent = 'Exit Price & Date:';
         document.getElementById('d_exit').textContent = `$${tr.exit_price.toFixed(2)} (${tr.exit_date})`;
@@ -3212,6 +3574,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       // Price lines
       if (triggerLine) candleSeries.removePriceLine(triggerLine);
       if (stopLine) candleSeries.removePriceLine(stopLine);
+      if (mlStopLine) {
+        candleSeries.removePriceLine(mlStopLine);
+        mlStopLine = null;
+      }
       if (climaxLine) {
         candleSeries.removePriceLine(climaxLine);
         climaxLine = null;
@@ -3221,7 +3587,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       const isMlStop = (!isWl && document.getElementById('sel_stop_mode') && document.getElementById('sel_stop_mode').value === 'ml_adaptive');
       const stopPx = tr.stop_price;
       const stopColor = isMlStop ? '#f59e0b' : '#ef4444';
-      const stopTitle = isWl ? (isActiveLong ? `Stop Loss: $${stopPx.toFixed(2)}` : `Invalidation: $${stopPx.toFixed(2)}`) : (isMlStop ? `🤖 ML 20 MAE Stop: $${stopPx.toFixed(2)} (-${tr.dynamic_stop_loss_pct}%)` : `🛡️ Structural Stop: $${stopPx.toFixed(2)} (-${tr.dynamic_stop_loss_pct}%)`);
+      const stopTitle = isWl ? (isActiveLong ? `🛡️ D1 Low Stop: $${stopPx.toFixed(2)}` : `🛡️ Invalidation (D1 Low): $${stopPx.toFixed(2)}`) : (isMlStop ? `🤖 ML 20 MAE Stop: $${stopPx.toFixed(2)} (-${tr.dynamic_stop_loss_pct}%)` : `🛡️ Structural Stop: $${stopPx.toFixed(2)} (-${tr.dynamic_stop_loss_pct}%)`);
 
       triggerLine = candleSeries.createPriceLine({
         price: triggerPx, color: '#22c55e', lineWidth: 2, lineStyle: 2,
@@ -3232,6 +3598,17 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         price: stopPx, color: stopColor, lineWidth: 2, lineStyle: 2,
         title: stopTitle
       });
+
+      const mlStopLegend = document.getElementById('c_ml_stop_legend');
+      if (isWl && tr.ml_stop_price && Math.abs(tr.ml_stop_price - stopPx) > 0.05) {
+        mlStopLine = candleSeries.createPriceLine({
+          price: tr.ml_stop_price, color: '#f59e0b', lineWidth: 2, lineStyle: 2,
+          title: `🤖 ML Stop: $${tr.ml_stop_price.toFixed(2)} (-${tr.ml_stop_pct.toFixed(1)}%)`
+        });
+        if (mlStopLegend) mlStopLegend.style.display = 'inline';
+      } else {
+        if (mlStopLegend) mlStopLegend.style.display = 'none';
+      }
 
       const climaxLegend = document.getElementById('c_climax_legend');
       if (isWl && isActiveLong && (tr.current_high_exhaustion_pct >= (tr.climax_threshold_pct || 50.0) || tr.is_alert)) {
@@ -3269,7 +3646,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         }
       } else {
         const isStopLoss = (tr.r_multiple < 0 || (tr.exit_reason && tr.exit_reason.toLowerCase().includes('stop')));
-        const exitLabel = isStopLoss ? `STOP HIT @ $${tr.exit_price.toFixed(2)} (${tr.r_multiple.toFixed(2)}R)` : `EXIT (${maName}) @ $${tr.exit_price.toFixed(2)} (+${tr.r_multiple.toFixed(2)}R)`;
+        const hasProgThrottle = (tr.progressive_mode && tr.progressive_mode !== 'none' && tr.prog_mult !== undefined && tr.prog_mult !== 1.0);
+        const govNote = hasProgThrottle ? ` via ${tr.prog_mult}x Gov` : '';
+        const exitLabel = isStopLoss ? `STOP HIT @ $${tr.exit_price.toFixed(2)} (${tr.r_multiple.toFixed(2)}R${govNote})` : `EXIT (${maName}) @ $${tr.exit_price.toFixed(2)} (+${tr.r_multiple.toFixed(2)}R${govNote})`;
         markers = [
           { time: tr.entry_date, position: 'belowBar', color: '#22c55e', shape: 'arrowUp', text: `BUY @ $${tr.entry_price.toFixed(2)} (${tr.v2_size_mult}x)` },
           { time: tr.exit_date, position: 'aboveBar', color: isStopLoss ? '#ef4444' : '#22c55e', shape: 'arrowDown', text: exitLabel }

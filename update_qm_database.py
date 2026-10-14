@@ -24,10 +24,12 @@ from typing import Optional, Tuple
 
 import pandas as pd
 
+import build_qm_strategy_dataset
 import config
 import datastore
 import update_rs_database
 import mine_qm_setups
+import qm_ml_engine
 
 QM_DATASET_PATH = Path("data/simulations/qm_historical_setups.parquet")
 SERVER_URL = "http://127.0.0.1:8785"
@@ -118,9 +120,28 @@ def run_update(force: bool = False, check_only: bool = False, reload_only: bool 
     mine_qm_setups.main()
     print(f"Mining completed in {time.time() - t0:.1f}s.")
 
-    # Step 3: Trigger live reload on serve_qm
+    # Step 3: Run QM Strategy Builder to compute multi-EMA and ML climax exits
     print("\n------------------------------------------------------------------------------")
-    print("Step 3/3: Notifying QM Setup Viewer server (port 8785)...")
+    print("Step 3/4: Building Strategy Execution Dataset & Climax Exhaustion Exits...")
+    print("------------------------------------------------------------------------------")
+    t1 = time.time()
+    strat_trades_df = build_qm_strategy_dataset.build_strategy_trades_dataset()
+    print(f"Strategy dataset build completed in {time.time() - t1:.1f}s.")
+
+    # Step 3b: Enrich setups dataset with ML setup quality tiers
+    print("\n------------------------------------------------------------------------------")
+    print("Step 3b/4: Enriching Historical & Fresh Setups with ML Setup Quality Tiers...")
+    print("------------------------------------------------------------------------------")
+    if QM_DATASET_PATH.exists():
+        t2 = time.time()
+        df_setups = pd.read_parquet(QM_DATASET_PATH)
+        df_enriched = qm_ml_engine.get_qm_ml_engine().enrich_setups_with_ml(df_setups, strat_trades_df)
+        df_enriched.to_parquet(QM_DATASET_PATH, index=False)
+        print(f"Enriched {len(df_enriched)} setups with ML quality tiers in {time.time() - t2:.1f}s.")
+
+    # Step 4: Trigger live reload on serve_qm
+    print("\n------------------------------------------------------------------------------")
+    print("Step 4/4: Notifying QM Setup Viewer server (port 8785)...")
     print("------------------------------------------------------------------------------")
     reload_live_server()
 

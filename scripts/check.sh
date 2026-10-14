@@ -12,7 +12,8 @@ import py_compile, sys
 CORE_MODULES = [
     "serve_ep.py", "serve_ep_tracker.py", "serve_qm.py", "serve_rs.py", "serve_optimized_ep.py", "build_rs_history.py",
     "update_rs_database.py", "update_qm_database.py", "mine_qm_setups.py", "daily_update.py", "trading_calendar.py",
-    "ep_ml_engine.py", "scanner_core.py", "indicators.py", "datastore.py", "labels.py", "thematic_engine.py", "generate_handbook_pdf.py"
+    "ep_ml_engine.py", "qm_ml_engine.py", "build_qm_strategy_dataset.py", "scanner_core.py", "indicators.py",
+    "datastore.py", "labels.py", "thematic_engine.py", "generate_handbook_pdf.py"
 ]
 bad = []
 for f in CORE_MODULES:

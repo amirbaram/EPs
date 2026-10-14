@@ -183,6 +183,37 @@ class TestOptimizedEPViewer(unittest.TestCase):
         self.assertIn("climax_action", first_act)
         self.assertIn("trailing_exit_rule", first_act)
         self.assertIn("position_management_plan", first_act)
+        self.assertIn("is_tier1", first_act)
+        self.assertIn("is_institutional_core", first_act)
+        self.assertIn("tier", first_act)
+        self.assertIn("ml_stop_price", first_act)
+        self.assertIn("ml_stop_pct", first_act)
+        self.assertGreater(first_act["ml_stop_price"], 0.0)
+        self.assertGreater(first_act["ml_stop_pct"], 0.0)
+
+        first_coil = [x for x in data["items"] if x["status"] == "Coiling Setup"][0]
+        self.assertIn("ml_stop_price", first_coil)
+        self.assertIn("ml_stop_pct", first_coil)
+        self.assertGreater(first_coil["ml_stop_price"], 0.0)
+        self.assertGreater(first_coil["ml_stop_pct"], 0.0)
+
+        # Test portfolio tier filtering: core and tier1
+        self.assertIn("total_core", data)
+        self.assertIn("total_tier1", data)
+        self.assertGreater(data["total_core"], 0)
+        self.assertGreater(data["total_tier1"], 0)
+
+        resp_core = self.client.get("/api/watchlist?tier=core")
+        self.assertEqual(resp_core.status_code, 200)
+        self.assertEqual(len(resp_core.json["items"]), data["total_core"])
+        for it in resp_core.json["items"]:
+            self.assertTrue(it["is_institutional_core"])
+
+        resp_t1 = self.client.get("/api/watchlist?tier=tier1")
+        self.assertEqual(resp_t1.status_code, 200)
+        self.assertEqual(len(resp_t1.json["items"]), data["total_tier1"])
+        for it in resp_t1.json["items"]:
+            self.assertTrue(it["is_tier1"])
 
     def test_api_monitor_settings_contract(self):
         """Verifies GET and POST for /api/monitor_settings."""
@@ -253,6 +284,14 @@ class TestOptimizedEPViewer(unittest.TestCase):
         self.assertIn("sel_nav_stock", html)
         self.assertIn("lbl_nav_counter", html)
         self.assertIn("fs_keyboard_hint", html)
+        self.assertIn("btn_wl_tier_all", html)
+        self.assertIn("btn_wl_tier_core", html)
+        self.assertIn("btn_wl_tier_1", html)
+        self.assertIn("c_badge_tier", html)
+        self.assertIn("d_tier", html)
+        self.assertIn("row_ml_stop", html)
+        self.assertIn("d_ml_stop", html)
+        self.assertIn("c_ml_stop_legend", html)
 
 
 if __name__ == "__main__":
