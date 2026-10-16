@@ -2586,6 +2586,16 @@ def _build_nq_intraday_chart_payload(
 
     df_view = df_ind.iloc[-max_bars:] if len(df_ind) > max_bars else df_ind
 
+    if is_wickless:
+        hi_col = "prob_pivot_high_extreme" if "prob_pivot_high_extreme" in df_view.columns else "prob_pivot_high"
+        lo_col = "prob_pivot_low_extreme" if "prob_pivot_low_extreme" in df_view.columns else "prob_pivot_low"
+    else:
+        hi_col = "prob_pivot_high" if "prob_pivot_high" in df_view.columns else "prob_pivot_high_extreme"
+        lo_col = "prob_pivot_low" if "prob_pivot_low" in df_view.columns else "prob_pivot_low_extreme"
+
+    maj_top_col = "prob_major_top_extreme" if "prob_major_top_extreme" in df_view.columns else "prob_maj_ut_top_extreme"
+    maj_bot_col = "prob_major_bottom_extreme" if "prob_major_bottom_extreme" in df_view.columns else "prob_maj_dt_low_extreme"
+
     bars = []
     volume = []
     vol_ma20_data = []
@@ -2633,10 +2643,12 @@ def _build_nq_intraday_chart_payload(
             "state": str(l_state.loc[idx]),
         })
 
-        p_hi_pct = round(float(r.get("prob_pivot_high", 0.0)) * 100.0, 1)
-        p_lo_pct = round(float(r.get("prob_pivot_low", 0.0)) * 100.0, 1)
-        p_hi_ex = round(float(r.get("prob_pivot_high_extreme", 0.0)) * 100.0, 1)
-        p_lo_ex = round(float(r.get("prob_pivot_low_extreme", 0.0)) * 100.0, 1)
+        p_hi_pct = round(float(r.get("prob_pivot_high", r.get(hi_col, 0.0))) * 100.0, 1)
+        p_lo_pct = round(float(r.get("prob_pivot_low", r.get(lo_col, 0.0))) * 100.0, 1)
+        p_hi_ex = round(float(r.get("prob_pivot_high_extreme", r.get(hi_col, 0.0))) * 100.0, 1)
+        p_lo_ex = round(float(r.get("prob_pivot_low_extreme", r.get(lo_col, 0.0))) * 100.0, 1)
+        p_mt_ex = round(float(r.get(maj_top_col, 0.0)) * 100.0, 1) if maj_top_col in r.index else 0.0
+        p_mb_ex = round(float(r.get(maj_bot_col, 0.0)) * 100.0, 1) if maj_bot_col in r.index else 0.0
         s50_v = float(r.get("sma50_px", c))
         reg_bar = "UT" if c >= s50_v else "DT"
         eff_hi = p_hi_ex if is_wickless else p_hi_pct
@@ -2651,8 +2663,8 @@ def _build_nq_intraday_chart_payload(
             "ut_low": eff_lo,
             "dt_high": eff_hi,
             "dt_low": eff_lo,
-            "maj_ut_top": eff_hi,
-            "maj_dt_low": eff_lo,
+            "maj_ut_top": p_mt_ex,
+            "maj_dt_low": p_mb_ex,
             "regime": reg_bar,
         })
 
@@ -2666,13 +2678,6 @@ def _build_nq_intraday_chart_payload(
     ut_low_events: List[Dict[str, Any]] = []
     maj_ut_top_events: List[Dict[str, Any]] = []
     maj_dt_low_events: List[Dict[str, Any]] = []
-
-    if is_wickless:
-        hi_col = "prob_pivot_high_extreme" if "prob_pivot_high_extreme" in df_view.columns else "prob_pivot_high"
-        lo_col = "prob_pivot_low_extreme" if "prob_pivot_low_extreme" in df_view.columns else "prob_pivot_low"
-    else:
-        hi_col = "prob_pivot_high" if "prob_pivot_high" in df_view.columns else "prob_pivot_high_extreme"
-        lo_col = "prob_pivot_low" if "prob_pivot_low" in df_view.columns else "prob_pivot_low_extreme"
 
     hi_arr = (
         np.nan_to_num(df_view[hi_col].to_numpy(dtype=np.float64), nan=0.0) * 100.0
@@ -4887,25 +4892,37 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .chart-title-group {
     display: flex;
     align-items: center;
-    gap: 8px;
+    gap: 6px;
     flex-wrap: nowrap;
     min-width: 0;
     overflow: hidden;
     white-space: nowrap;
+    flex-shrink: 1;
   }
   .chart-main-sym {
-    font-size: 16px;
+    font-size: 15px;
     font-weight: 800;
     color: #fff;
     flex-shrink: 0;
   }
   .chart-main-name {
-    font-size: 12px;
+    font-size: 11px;
     color: #94a3b8;
     font-weight: 500;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+    max-width: 130px;
+    flex-shrink: 1;
+  }
+  #hdr_climax_badge {
+    flex-shrink: 0;
+    white-space: nowrap;
+    font-size: 10px;
+    font-weight: 800;
+    padding: 2px 7px;
+    border-radius: 4px;
+    box-sizing: border-box;
   }
   .ohlc-legend {
     display: none !important;
@@ -4914,9 +4931,21 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .chart-controls-right {
     display: flex;
     align-items: center;
-    gap: 4px;
+    gap: 3px;
     flex-wrap: nowrap;
     flex-shrink: 0;
+  }
+
+  @media (max-width: 1450px) {
+    #tf_5y, #tf_full { display: none !important; }
+    .chart-main-name { max-width: 80px; }
+  }
+  @media (max-width: 1300px) {
+    #tf_6m, #tf_2y { display: none !important; }
+    .chart-main-name { display: none !important; }
+  }
+  @media (max-width: 1100px) {
+    #tf_3m, #tf_1y { display: none !important; }
   }
   .tf-btn {
     background: #121a29;
@@ -5469,6 +5498,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       <svg id="larsson_ribbon_svg"></svg>
       <canvas id="draw_canvas"></canvas>
       <button class="btn" id="btn_stage_fullscreen" onclick="toggleFullscreenChart()" title="Enlarge chart to full width (or press Esc to restore)" style="position:absolute; top:8px; left:10px; z-index:25; padding:3px 8px; font-size:11px; font-weight:800; background:rgba(13,21,36,0.88); border:1px solid rgba(56,189,248,0.5); color:#38bdf8; backdrop-filter:blur(4px);">⛶ Enlarge</button>
+      <div id="stage_ml_hover_badge" style="display:none; position:absolute; top:8px; left:95px; z-index:25; padding:3px 8px; font-size:11px; font-weight:800; background:rgba(13,21,36,0.92); border:1px solid #38bdf8; color:#38bdf8; border-radius:4px; backdrop-filter:blur(4px); pointer-events:none; box-shadow:0 2px 8px rgba(0,0,0,0.5);"></div>
     </div>
     </div> <!-- end chart_view_container -->
 
@@ -7567,7 +7597,9 @@ function initChartEngine() {
   chart.subscribeCrosshairMove(param => {
     const leg = document.getElementById('ohlc_legend');
     const hdrClimax = document.getElementById('hdr_climax_badge');
+    const stageHoverBadge = document.getElementById('stage_ml_hover_badge');
     if (!param || !param.time || !param.seriesData) {
+      if (stageHoverBadge) stageHoverBadge.style.display = 'none';
       // Restore header climax badge to latest bar when cursor leaves
       if (hdrClimax && currentChartData && currentChartData.exhaustion && currentChartData.exhaustion.current_prob_pct !== undefined) {
         const exh = currentChartData.exhaustion;
@@ -7582,28 +7614,43 @@ function initChartEngine() {
         hdrClimax.style.background = bgRgba;
         hdrClimax.style.color = colorHex;
         hdrClimax.style.border = `1px solid ${colorHex}`;
-        hdrClimax.textContent = `🤖 [${reg}] High: ${hiP.toFixed(0)}% | Low: ${loP.toFixed(0)}% (5D Peak: ${max5.toFixed(0)}%)`;
+        hdrClimax.textContent = `🤖 High: ${hiP.toFixed(0)}% | Low: ${loP.toFixed(0)}%`;
       }
       return;
     }
     const b = param.seriesData.get(candleSeries);
     if (!b) return;
-    const timeStr = fmtChartTimeLabel(param.time);
 
-    // Show hovered bar's 4-Model Pivot probabilities in header badge
-    if (hdrClimax && currentChartData && currentChartData.exhaustion && currentChartData.exhaustion._byDate) {
+    // Show hovered bar's 4-Model Pivot probabilities in header badge and canvas stage badge (no date)
+    if (currentChartData && currentChartData.exhaustion && currentChartData.exhaustion._byDate) {
       const pt = currentChartData.exhaustion._byDate[param.time];
       if (pt) {
         const reg = pt.regime || 'UT';
         const hiP = reg === 'UT' ? (pt.ut_high || 0) : (pt.dt_high || 0);
         const loP = reg === 'UT' ? (pt.ut_low || 0) : (pt.dt_low || 0);
-        const maxBar = Math.max(hiP, loP);
+        const mt = Number(pt.maj_ut_top || 0);
+        const mb = Number(pt.maj_dt_low || 0);
+        let majTag = '';
+        if (mt >= 35 || mb >= 35) {
+          majTag = mt >= mb ? ` · Top: ${mt.toFixed(0)}%` : ` · Bot: ${mb.toFixed(0)}%`;
+        }
+        const maxBar = Math.max(hiP, loP, mt, mb);
         const colorHex = maxBar >= 50 ? (hiP >= loP ? '#f43f5e' : '#38bdf8') : (maxBar >= 40 ? '#f59e0b' : '#10b981');
         const bgRgba = maxBar >= 50 ? 'rgba(56,189,248,0.18)' : (maxBar >= 40 ? 'rgba(245,158,11,0.18)' : 'rgba(16,185,129,0.15)');
-        hdrClimax.style.background = bgRgba;
-        hdrClimax.style.color = colorHex;
-        hdrClimax.style.border = `1px solid ${colorHex}`;
-        hdrClimax.textContent = `🤖 [${reg} ${timeStr}] ${reg} High: ${hiP.toFixed(1)}% | ${reg} Low: ${loP.toFixed(1)}%`;
+        const txt = `🤖 High: ${hiP.toFixed(1)}% | Low: ${loP.toFixed(1)}%${majTag}`;
+        if (hdrClimax) {
+          hdrClimax.style.background = bgRgba;
+          hdrClimax.style.color = colorHex;
+          hdrClimax.style.border = `1px solid ${colorHex}`;
+          hdrClimax.textContent = txt;
+        }
+        if (stageHoverBadge) {
+          stageHoverBadge.style.display = 'block';
+          stageHoverBadge.style.background = bgRgba;
+          stageHoverBadge.style.color = colorHex;
+          stageHoverBadge.style.borderColor = colorHex;
+          stageHoverBadge.textContent = txt;
+        }
       }
     }
   });
@@ -8625,7 +8672,7 @@ function renderInfoPanel(data) {
       hdrClimax.style.border = `1px solid ${colorHex}`;
       const hiNow = regShort === 'UT' ? uh : dh;
       const loNow = regShort === 'UT' ? ul : dl;
-      hdrClimax.textContent = `🤖 [${regShort}] High: ${hiNow.toFixed(0)}% | Low: ${loNow.toFixed(0)}% (5D Peak: ${max5.toFixed(0)}%)`;
+      hdrClimax.textContent = `🤖 High: ${hiNow.toFixed(0)}% | Low: ${loNow.toFixed(0)}%`;
     }
 
     const verTag = (exh.model_ver || 'v3').toUpperCase();
