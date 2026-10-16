@@ -833,6 +833,71 @@ class TestWatchlistViewer(unittest.TestCase):
             self.assertIn("prob_pct", ma)
             self.assertTrue(ma["is_wickless"])
 
+    def test_chart_endpoint_5m_futures(self):
+        resp = self.client.get("/api/chart?symbol=NQ=F&interval=5m")
+        self.assertEqual(resp.status_code, 200)
+        data = resp.get_json()
+        self.assertIn("bars", data)
+        self.assertGreater(len(data["bars"]), 50)
+        self.assertEqual(data.get("interval"), "5m")
+        self.assertIn("exhaustion", data)
+        self.assertIn("nq_intraday", data)
+        self.assertIn("active_trade_plan", data)
+        # Verify 5m bars have timestamp spacing and OHLCV
+        first_bar = data["bars"][0]
+        self.assertIn("time", first_bar)
+        self.assertIn("open", first_bar)
+        self.assertIn("close", first_bar)
+
+    def test_auto_trader_email_filter_config(self):
+        import nq_auto_trader
+        # Test config update endpoint
+        update_payload = {
+            "action": "update_config",
+            "pivot_email_tickers": ["GC=F", "NQ=F"],
+            "pivot_email_timeframes": ["5m", "1h"],
+            "pivot_email_alerts_enabled": True
+        }
+        resp = self.client.post("/api/nq_auto_trader",
+                                data=json.dumps(update_payload),
+                                content_type="application/json")
+        self.assertEqual(resp.status_code, 200)
+        data = resp.get_json()
+        self.assertTrue(data.get("ok"))
+        st = data.get("status", {})
+        self.assertEqual(set(st.get("pivot_email_tickers", [])), {"GC=F", "NQ=F"})
+        self.assertEqual(set(st.get("pivot_email_timeframes", [])), {"5m", "1h"})
+
+        # Test notify_new_realtime_pivot_alert filters appropriately
+        cfg = nq_auto_trader.load_auto_trader_config()
+        cfg["pivot_email_alerts_enabled"] = True
+        cfg["pivot_email_tickers"] = ["GC=F", "NQ=F"]
+        cfg["pivot_email_timeframes"] = ["5m", "1h"]
+
+        # Unselected ticker CL=F -> returns None (filtered out)
+        cl_alert = {"symbol": "CL=F", "timeframe": "5m", "pivot_type": "ut_high", "prob_pct": 75.0, "is_wickless": True}
+        res_cl = nq_auto_trader.notify_new_realtime_pivot_alert(cl_alert, cfg, force_test=True)
+        self.assertIsNone(res_cl)
+
+        # Unselected timeframe 15m for NQ=F -> returns None (filtered out)
+        nq_15m_alert = {"symbol": "NQ=F", "timeframe": "15m", "pivot_type": "ut_high", "prob_pct": 75.0, "is_wickless": True}
+        res_nq15 = nq_auto_trader.notify_new_realtime_pivot_alert(nq_15m_alert, cfg, force_test=True)
+        self.assertIsNone(res_nq15)
+
+        # Selected ticker GC=F and selected timeframe 5m -> passes filter, attempts delivery
+        import time
+        gc_5m_alert = {
+            "symbol": "GC=F",
+            "timeframe": "5m",
+            "pivot_type": "ut_high",
+            "prob_pct": 75.0,
+            "is_wickless": True,
+            "bar_time": f"2026-10-16 test_{time.time()}",
+        }
+        res_gc = nq_auto_trader.notify_new_realtime_pivot_alert(gc_5m_alert, cfg, force_test=True)
+        self.assertIsNotNone(res_gc)
+        self.assertIn("GC=F", str(res_gc))
+
 
 if __name__ == "__main__":
     unittest.main()

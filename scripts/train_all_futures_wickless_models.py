@@ -103,7 +103,10 @@ def label_futures_major_reversals_vec(df: pd.DataFrame, tf: str) -> Tuple[np.nda
     adr = np.maximum(1e-6, df["adr20_cont"].to_numpy(dtype=np.float64))
     n = len(df)
 
-    if tf == "15m":
+    if tf == "5m":
+        w_macro, k_rev = 24, 36
+        run_req, rev_req, sust_req = 2.6, 3.0, 2.0
+    elif tf == "15m":
         w_macro, k_rev = 16, 24
         run_req, rev_req, sust_req = 2.6, 3.0, 2.0
     elif tf == "1h":
@@ -236,7 +239,7 @@ def fit_wickless_classifier(
     }
 
 
-def train_single_future(spec: Dict[str, Any]) -> Dict[str, Any]:
+def train_single_future(spec: Dict[str, Any], target_tfs: Optional[List[str]] = None) -> Dict[str, Any]:
     sym = spec["symbol"]
     prefix = spec["prefix"]
     t_start = time.time()
@@ -264,12 +267,15 @@ def train_single_future(spec: Dict[str, Any]) -> Dict[str, Any]:
     }
 
     tf_cfgs = {
+        "5m": {"left": 8, "right": 8, "rev_atr": 1.8},
         "15m": {"left": 6, "right": 6, "rev_atr": 1.6},
         "1h": {"left": 5, "right": 5, "rev_atr": 1.5},
         "4h": {"left": 4, "right": 4, "rev_atr": 1.4},
     }
 
-    for tf, cfg in tf_cfgs.items():
+    active_tfs = {k: v for k, v in tf_cfgs.items() if target_tfs is None or k in target_tfs}
+
+    for tf, cfg in active_tfs.items():
         t0 = time.time()
         print(f"\n  [{sym} {tf}] Processing Wickless At-Extreme (left={cfg['left']}, right={cfg['right']}, rev={cfg['rev_atr']})...")
         bars = nq_ml_engine.resample_nq_with_1m_microstructure(df_1m, tf)
@@ -323,17 +329,29 @@ def train_single_future(spec: Dict[str, Any]) -> Dict[str, Any]:
             spec["cal_start"], spec["train_cutoff"]
         )
 
+        print(f"    Training Wickless Excursion Short (MAE/MFE) for K in (4, 8, 12)...")
+        exc_short = nq_ml_engine._fit_excursion_models_for_direction(cand_hi_tr, "short", high_cols)
+
+        print(f"    Training Wickless Excursion Long (MAE/MFE) for K in (4, 8, 12)...")
+        exc_long = nq_ml_engine._fit_excursion_models_for_direction(cand_lo_tr, "long", low_cols)
+
         all_models[tf] = {
             "pivot_high": m_hi,
             "pivot_low": m_lo,
             "major_top": m_maj_top,
             "major_bottom": m_maj_bot,
+            "excursion_short": exc_short,
+            "excursion_long": exc_long,
             "feature_cols_high": high_cols,
             "feature_cols_low": low_cols,
             "feature_cols_major_top": high_cols,
             "feature_cols_major_bottom": low_cols,
             "config": cfg,
         }
+
+        # Score forward excursion models onto labeled
+        nq_ml_engine.score_excursion_models(labeled, exc_short, "short")
+        nq_ml_engine.score_excursion_models(labeled, exc_long, "long")
 
         # Evaluate OOS metrics
         oos_hi = oos_df[oos_df["is_cand_high"] & (~oos_df["crosses_roll_8b"])].copy()
@@ -393,28 +411,32 @@ def train_single_future(spec: Dict[str, Any]) -> Dict[str, Any]:
         labeled["prob_major_bottom_extreme"] = np.where(mask_lo, p_all_mb, 0.0)
         labeled["prob_maj_ut_top_extreme"] = labeled["prob_major_top_extreme"]
         labeled["prob_maj_dt_low_extreme"] = labeled["prob_major_bottom_extreme"]
+        labeled["prob_pivot_high"] = labeled["prob_pivot_high_extreme"]
+        labeled["prob_pivot_low"] = labeled["prob_pivot_low_extreme"]
 
-        # Update the stored scored cache parquet
+        # Update or create the stored scored cache parquet
         cached_p = nq_ml_engine.SCORED_CACHE_DIR / f"{prefix}_{tf}_scored.parquet"
-        if cached_p.exists():
-            try:
-                cur_df = pd.read_parquet(cached_p)
-                idx_common = cur_df.index.intersection(labeled.index)
-                cur_df.loc[idx_common, "prob_pivot_high_extreme"] = labeled.loc[idx_common, "prob_pivot_high_extreme"].astype("float32")
-                cur_df.loc[idx_common, "prob_pivot_low_extreme"] = labeled.loc[idx_common, "prob_pivot_low_extreme"].astype("float32")
-                cur_df.loc[idx_common, "prob_major_top_extreme"] = labeled.loc[idx_common, "prob_major_top_extreme"].astype("float32")
-                cur_df.loc[idx_common, "prob_major_bottom_extreme"] = labeled.loc[idx_common, "prob_major_bottom_extreme"].astype("float32")
-                cur_df.loc[idx_common, "prob_maj_ut_top_extreme"] = labeled.loc[idx_common, "prob_maj_ut_top_extreme"].astype("float32")
-                cur_df.loc[idx_common, "prob_maj_dt_low_extreme"] = labeled.loc[idx_common, "prob_maj_dt_low_extreme"].astype("float32")
-                nq_ml_engine._atomic_to_parquet(cur_df, cached_p)
-                print(f"    Updated prob_pivot_... and prob_major_... extreme in {cached_p.name}")
-            except Exception as e:
-                print(f"    Notice: could not update existing cache {cached_p.name}: {e}")
+        save_df = labeled.copy()
+        if tf in ("5m", "15m"):
+            save_df = save_df[save_df.index >= pd.Timestamp("2022-01-01")].copy()
+        for fcol in save_df.select_dtypes("float64").columns:
+            save_df[fcol] = save_df[fcol].astype("float32")
+        nq_ml_engine._atomic_to_parquet(save_df, cached_p)
+        print(f"    Saved scored cache {cached_p.name} ({len(save_df):,} bars)")
 
     out_models_p = ROOT / "data" / "models" / f"{prefix}_wickless_intraday_models.pkl"
     out_results_p = ROOT / "data" / "simulations" / f"{prefix}_wickless_intraday_oos_results.json"
     out_models_p.parent.mkdir(parents=True, exist_ok=True)
     out_results_p.parent.mkdir(parents=True, exist_ok=True)
+
+    existing_models = {}
+    if out_models_p.exists():
+        try:
+            existing_models = joblib.load(out_models_p)
+        except Exception:
+            existing_models = {}
+    existing_models.update(all_models)
+    all_models = existing_models
 
     joblib.dump(all_models, out_models_p)
     out_results_p.write_text(json.dumps(report, indent=2), encoding="utf-8")
@@ -423,18 +445,31 @@ def train_single_future(spec: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def main() -> None:
+    import argparse
+    parser = argparse.ArgumentParser(description="Complete Retraining Pipeline for all 5 Futures Tickers with Wickless Pivot Detections")
+    parser.add_argument("--tf", type=str, default="5m", help="Comma-separated timeframes to train (e.g. '5m', '15m', or 'all')")
+    parser.add_argument("--symbols", type=str, default="all", help="Comma-separated symbols to train (e.g. 'NQ=F,GC=F' or 'all')")
+    args = parser.parse_args()
+
     t_global = time.time()
+    tf_arg = args.tf.strip().lower()
+    target_tfs = ["5m", "15m", "1h", "4h"] if tf_arg in ("all", "all_tfs") else [x.strip() for x in tf_arg.split(",") if x.strip()]
+
+    sym_arg = args.symbols.strip().upper()
+    active_specs = FUTURES_SPECS if sym_arg == "ALL" else [s for s in FUTURES_SPECS if s["symbol"].upper() in sym_arg.split(",") or s["prefix"].upper() in sym_arg.split(",")]
+
     print("=" * 80)
-    print("STARTING COMPLETE RETRAINING FOR ALL 5 FUTURES TICKERS (WICKLESS MODELS)")
-    print("  Tickers: NQ=F, GC=F, CL=F, BTC=F, SI=F across 15m, 1h, and 4h")
+    print("STARTING RETRAINING FOR FUTURES TICKERS (WICKLESS MODELS)")
+    print(f"  Tickers: {[s['symbol'] for s in active_specs]}")
+    print(f"  Timeframes: {target_tfs}")
     print("=" * 80)
 
     summary = {}
-    for spec in FUTURES_SPECS:
-        summary[spec["symbol"]] = train_single_future(spec)
+    for spec in active_specs:
+        summary[spec["symbol"]] = train_single_future(spec, target_tfs=target_tfs)
 
     print("\n" + "=" * 80)
-    print(f"✅ COMPLETE RETRAINING FINISHED FOR ALL 5 FUTURES IN {time.time() - t_global:.1f}s")
+    print(f"✅ RETRAINING FINISHED IN {time.time() - t_global:.1f}s")
     for sym, res in summary.items():
         tfs = res.get("timeframes", {})
         line = " | ".join(

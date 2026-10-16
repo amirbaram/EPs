@@ -2523,6 +2523,7 @@ def _build_nq_intraday_chart_payload(
     )
 
     tf_window_map = {
+        "5m": {"3m": 360, "6m": 720, "1y": 1400, "2y": 2400, "5y": 3600, "full": 5000},
         "15m": {"3m": 180, "6m": 380, "1y": 780, "2y": 1400, "5y": 2400, "full": 3600},
         "1h": {"3m": 160, "6m": 360, "1y": 720, "2y": 1400, "5y": 2400, "full": 3600},
         "4h": {"3m": 140, "6m": 300, "1y": 600, "2y": 1200, "5y": 2200, "full": 3600},
@@ -2667,11 +2668,22 @@ def _build_nq_intraday_chart_payload(
     maj_dt_low_events: List[Dict[str, Any]] = []
 
     if is_wickless:
-        hi_arr = np.nan_to_num(df_view["prob_pivot_high_extreme"].to_numpy(dtype=np.float64), nan=0.0) * 100.0
-        lo_arr = np.nan_to_num(df_view["prob_pivot_low_extreme"].to_numpy(dtype=np.float64), nan=0.0) * 100.0
+        hi_col = "prob_pivot_high_extreme" if "prob_pivot_high_extreme" in df_view.columns else "prob_pivot_high"
+        lo_col = "prob_pivot_low_extreme" if "prob_pivot_low_extreme" in df_view.columns else "prob_pivot_low"
     else:
-        hi_arr = np.nan_to_num(df_view["prob_pivot_high"].to_numpy(dtype=np.float64), nan=0.0) * 100.0
-        lo_arr = np.nan_to_num(df_view["prob_pivot_low"].to_numpy(dtype=np.float64), nan=0.0) * 100.0
+        hi_col = "prob_pivot_high" if "prob_pivot_high" in df_view.columns else "prob_pivot_high_extreme"
+        lo_col = "prob_pivot_low" if "prob_pivot_low" in df_view.columns else "prob_pivot_low_extreme"
+
+    hi_arr = (
+        np.nan_to_num(df_view[hi_col].to_numpy(dtype=np.float64), nan=0.0) * 100.0
+        if hi_col in df_view.columns
+        else np.zeros(len(df_view), dtype=np.float64)
+    )
+    lo_arr = (
+        np.nan_to_num(df_view[lo_col].to_numpy(dtype=np.float64), nan=0.0) * 100.0
+        if lo_col in df_view.columns
+        else np.zeros(len(df_view), dtype=np.float64)
+    )
 
     maj_top_col = "prob_major_top_extreme" if "prob_major_top_extreme" in df_view.columns else "prob_maj_ut_top_extreme"
     maj_bot_col = "prob_major_bottom_extreme" if "prob_major_bottom_extreme" in df_view.columns else "prob_maj_dt_low_extreme"
@@ -2807,16 +2819,10 @@ def _build_nq_intraday_chart_payload(
             })
 
     last_r = df_view.iloc[-1]
-    if is_wickless:
-        curr_hi = round(float(last_r.get("prob_pivot_high_extreme", 0.0)) * 100.0, 1)
-        curr_lo = round(float(last_r.get("prob_pivot_low_extreme", 0.0)) * 100.0, 1)
-        peak5_hi = round(float(df_view["prob_pivot_high_extreme"].tail(8).max()) * 100.0, 1)
-        peak5_lo = round(float(df_view["prob_pivot_low_extreme"].tail(8).max()) * 100.0, 1)
-    else:
-        curr_hi = round(float(last_r.get("prob_pivot_high", 0.0)) * 100.0, 1)
-        curr_lo = round(float(last_r.get("prob_pivot_low", 0.0)) * 100.0, 1)
-        peak5_hi = round(float(df_view["prob_pivot_high"].tail(8).max()) * 100.0, 1)
-        peak5_lo = round(float(df_view["prob_pivot_low"].tail(8).max()) * 100.0, 1)
+    curr_hi = round(float(last_r.get(hi_col, 0.0)) * 100.0, 1)
+    curr_lo = round(float(last_r.get(lo_col, 0.0)) * 100.0, 1)
+    peak5_hi = round(float(df_view[hi_col].tail(8).max() if hi_col in df_view.columns else 0.0) * 100.0, 1)
+    peak5_lo = round(float(df_view[lo_col].tail(8).max() if lo_col in df_view.columns else 0.0) * 100.0, 1)
 
     curr_maj_top = round(float(last_r.get("prob_major_top_extreme", last_r.get("prob_maj_ut_top_extreme", 0.0))) * 100.0, 1)
     curr_maj_bot = round(float(last_r.get("prob_major_bottom_extreme", last_r.get("prob_maj_dt_low_extreme", 0.0))) * 100.0, 1)
@@ -2838,10 +2844,10 @@ def _build_nq_intraday_chart_payload(
         "auto_thresholds": dict(DEFAULT_MODEL_THRESHOLDS),
         "default_thresholds": dict(DEFAULT_MODEL_THRESHOLDS),
         "current_prob_pct": max(curr_hi, curr_lo),
-        "at_high_prob_pct": round(float(last_r.get("prob_pivot_high_extreme", 0.0)) * 100.0, 1),
-        "full_bar_prob_pct": round(float(last_r.get("prob_pivot_high", 0.0)) * 100.0, 1),
+        "at_high_prob_pct": round(float(last_r.get("prob_pivot_high_extreme", last_r.get(hi_col, 0.0))) * 100.0, 1),
+        "full_bar_prob_pct": round(float(last_r.get("prob_pivot_high", last_r.get(hi_col, 0.0))) * 100.0, 1),
         "peak_5d_prob_pct": max(peak5_hi, peak5_lo),
-        "peak_20d_prob_pct": round(float((df_view["prob_pivot_high_extreme"] if is_wickless else df_view["prob_pivot_high"]).tail(24).max()) * 100.0, 1),
+        "peak_20d_prob_pct": round(float(df_view[hi_col].tail(24).max() if hi_col in df_view.columns else 0.0) * 100.0, 1),
         "pivots_current": {
             "ut_high": curr_hi,
             "ut_low": curr_lo,
@@ -2963,8 +2969,8 @@ def api_chart():
 
     model_ver = request.args.get("model_ver", "v3").strip().lower()
 
-    # If viewing NQ=F / MNQ=F, GC=F / MGC=F, CL=F / MCL=F, BTC=F / MBT=F, SI=F / SIL=F on an intraday interval (15m, 1h, 4h), serve intraday bars + pivot trade plans
-    if not part_b_id and nq_ml_engine.is_intraday_futures_symbol(part_a_id) and interval in ("15m", "1h", "4h"):
+    # If viewing NQ=F / MNQ=F, GC=F / MGC=F, CL=F / MCL=F, BTC=F / MBT=F, SI=F / SIL=F on an intraday interval (5m, 15m, 1h, 4h), serve intraday bars + pivot trade plans
+    if not part_b_id and nq_ml_engine.is_intraday_futures_symbol(part_a_id) and interval in ("5m", "15m", "1h", "4h"):
         payload, code = _build_nq_intraday_chart_payload(
             part_a_id=part_a_id,
             interval=interval,
@@ -4407,6 +4413,8 @@ def api_nq_auto_trader():
                 "mgc_contracts",
                 "gmail_enabled",
                 "pivot_email_alerts_enabled",
+                "pivot_email_tickers",
+                "pivot_email_timeframes",
                 "gmail_to",
                 "gmail_user",
                 "gmail_app_password",
@@ -5321,12 +5329,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       </div>
 
       <div class="chart-controls-right">
-        <!-- NQ Intraday Interval Switcher (1D / 4H / 1H / 15M) -->
-        <div id="nq_interval_group" style="display:flex; align-items:center; gap:2px; background:#0b111e; border:1px solid rgba(56,189,248,0.45); border-radius:6px; padding:2px;" title="Bar Interval (15m, 1h, and 4h Intraday Pivot & Excursion Models active on NQ=F / MNQ=F)">
+        <!-- NQ/Futures Intraday Interval Switcher (1D / 4H / 1H / 15M / 5M) -->
+        <div id="nq_interval_group" style="display:flex; align-items:center; gap:2px; background:#0b111e; border:1px solid rgba(56,189,248,0.45); border-radius:6px; padding:2px;" title="Bar Interval (5m, 15m, 1h, and 4h Intraday Pivot & Excursion Models active on Futures)">
           <button class="tf-btn active" id="iv_1d" onclick="setChartInterval('1d')" style="padding:2px 6px; font-size:10px;">1D</button>
-          <button class="tf-btn" id="iv_4h" onclick="setChartInterval('4h')" style="padding:2px 6px; font-size:10px;" title="NQ 4-Hour Intraday Pivot & Excursion Model">4H</button>
-          <button class="tf-btn" id="iv_1h" onclick="setChartInterval('1h')" style="padding:2px 6px; font-size:10px;" title="NQ 1-Hour Intraday Pivot & Excursion Model">1H</button>
-          <button class="tf-btn" id="iv_15m" onclick="setChartInterval('15m')" style="padding:2px 6px; font-size:10px;" title="NQ 15-Minute Intraday Pivot & Excursion Model">15M</button>
+          <button class="tf-btn" id="iv_4h" onclick="setChartInterval('4h')" style="padding:2px 6px; font-size:10px;" title="4-Hour Intraday Pivot & Excursion Model">4H</button>
+          <button class="tf-btn" id="iv_1h" onclick="setChartInterval('1h')" style="padding:2px 6px; font-size:10px;" title="1-Hour Intraday Pivot & Excursion Model">1H</button>
+          <button class="tf-btn" id="iv_15m" onclick="setChartInterval('15m')" style="padding:2px 6px; font-size:10px;" title="15-Minute Intraday Pivot & Excursion Model">15M</button>
+          <button class="tf-btn" id="iv_5m" onclick="setChartInterval('5m')" style="padding:2px 6px; font-size:10px;" title="5-Minute Intraday Pivot & Excursion Model">5M</button>
         </div>
 
         <!-- Futures Model Mode Toggle: Current (With Wick) vs ⚡ Wickless (Intrabar Touch) -->
@@ -6182,7 +6191,7 @@ function switchCenterView(view) {
 
 function loadAlertItem(symbol, tf) {
   if (centerView !== 'chart') switchCenterView('chart');
-  if (tf && ['15m', '1h', '4h'].includes(String(tf).toLowerCase())) {
+  if (tf && ['5m', '15m', '1h', '4h'].includes(String(tf).toLowerCase())) {
     partA = symbol;
     isRatioMode = false;
     partB = '';
@@ -6488,7 +6497,7 @@ function applyDevelopingBarToCurrentChart() {
     const bars = currentChartData.bars || [];
     const lastChartBarTime = bars.length ? Number(bars[bars.length - 1].time) : 0;
     const liveCandle = tfInfo && tfInfo.last_bar_ohlcv ? tfInfo.last_bar_ohlcv : null;
-    const stepSec = chartInterval === '15m' ? 900 : (chartInterval === '1h' ? 3600 : 14400);
+    const stepSec = chartInterval === '5m' ? 300 : (chartInterval === '15m' ? 900 : (chartInterval === '1h' ? 3600 : 14400));
 
     if (liveCandle && Number(liveCandle.time) > 0) {
       const liveTs = Number(liveCandle.time);
@@ -6895,7 +6904,7 @@ function renderWatchlistItems() {
     let pivotBadgeHtml = '';
     if (nqIntra && nqIntra.timeframes) {
       const tfBadges = [];
-      ['15m', '1h', '4h'].forEach(tfKey => {
+      ['5m', '15m', '1h', '4h'].forEach(tfKey => {
         const tfObj = nqIntra.timeframes[tfKey];
         if (!tfObj || !tfObj.trade_plan) return;
         const tp = tfObj.trade_plan;
@@ -7297,7 +7306,7 @@ function syncNqIntervalToolbarUI() {
     grp.style.display = isNq ? 'inline-flex' : 'none';
   }
   syncFuturesModelModeUI();
-  ['1d', '4h', '1h', '15m'].forEach(k => {
+  ['1d', '4h', '1h', '15m', '5m'].forEach(k => {
     document.getElementById(`iv_${k}`)?.classList.toggle('active', k === chartInterval);
     document.getElementById(`nq_iv_${k}`)?.classList.toggle('active', k === chartInterval);
   });
@@ -8184,7 +8193,7 @@ function renderNqIntradayTradeCard(data) {
 
   const titleEl = document.getElementById('nq_intraday_card_title');
   if (titleEl) {
-    titleEl.textContent = `⚡ ${symRoot} Intraday (15m / 1h / 4h) Trade Plan${isWickless ? ' · ⚡ WICKLESS (INTRABAR TOUCH)' : ''}`;
+    titleEl.textContent = `⚡ ${symRoot} Intraday (5m / 15m / 1h / 4h) Trade Plan${isWickless ? ' · ⚡ WICKLESS (INTRABAR TOUCH)' : ''}`;
   }
 
   const badge = document.getElementById('nq_intraday_active_badge');
@@ -8205,7 +8214,7 @@ function renderNqIntradayTradeCard(data) {
 
   const stripEl = document.getElementById('nq_intraday_tf_strip');
   if (stripEl) {
-    stripEl.innerHTML = ['15m', '1h', '4h'].map(tf => {
+    stripEl.innerHTML = ['5m', '15m', '1h', '4h'].map(tf => {
       const t = tfs[tf] || {};
       const hi = Number(t.prob_high_pct || 0);
       const lo = Number(t.prob_low_pct || 0);
@@ -8380,6 +8389,37 @@ function renderNqAutoTraderBox(st) {
       }).join('')
     : '<div style="font-size:9px; color:#64748b;">No closed live trades yet — open trade will be logged here on exit.</div>';
 
+  const curTickers = Array.isArray(st.pivot_email_tickers) ? st.pivot_email_tickers : ['NQ=F', 'GC=F', 'CL=F', 'BTC=F', 'SI=F'];
+  const curTfs = Array.isArray(st.pivot_email_timeframes) ? st.pivot_email_timeframes : ['5m', '15m', '1h', '4h'];
+
+  const allFutTickers = [
+    { sym: 'NQ=F', label: 'NQ' },
+    { sym: 'GC=F', label: 'GC' },
+    { sym: 'CL=F', label: 'CL' },
+    { sym: 'BTC=F', label: 'BTC' },
+    { sym: 'SI=F', label: 'SI' }
+  ];
+  const allTfs = [
+    { tf: '5m', label: '5M' },
+    { tf: '15m', label: '15M' },
+    { tf: '1h', label: '1H' },
+    { tf: '4h', label: '4H' }
+  ];
+
+  const allFutTickersHtml = allFutTickers.map(t => {
+    const isSel = curTickers.includes(t.sym) || curTickers.includes(t.label);
+    return `<label style="display:inline-flex; align-items:center; gap:2px; background:${isSel ? 'rgba(192,132,252,0.18)' : '#070b14'}; border:1px solid ${isSel ? '#c084fc' : '#1e293b'}; border-radius:3px; padding:1px 4px; font-size:8.5px; color:${isSel ? '#e9d5ff' : '#64748b'}; cursor:pointer;">
+      <input type="checkbox" value="${t.sym}" onchange="toggleFuturesEmailFilter()" ${isSel ? 'checked' : ''} style="margin:0; width:10px; height:10px; accent-color:#c084fc;"> ${t.label}
+    </label>`;
+  }).join(' ');
+
+  const allTfsHtml = allTfs.map(t => {
+    const isSel = curTfs.includes(t.tf);
+    return `<label style="display:inline-flex; align-items:center; gap:2px; background:${isSel ? 'rgba(56,189,248,0.18)' : '#070b14'}; border:1px solid ${isSel ? '#38bdf8' : '#1e293b'}; border-radius:3px; padding:1px 4px; font-size:8.5px; color:${isSel ? '#bae6fd' : '#64748b'}; cursor:pointer;">
+      <input type="checkbox" value="${t.tf}" onchange="toggleFuturesEmailFilter()" ${isSel ? 'checked' : ''} style="margin:0; width:10px; height:10px; accent-color:#38bdf8;"> ${t.label}
+    </label>`;
+  }).join(' ');
+
   box.innerHTML = `
     <div style="display:flex; justify-content:space-between; align-items:center; gap:6px; border-bottom:1px solid #1e293b; padding-bottom:5px; flex-wrap:wrap;">
       <div>
@@ -8423,6 +8463,20 @@ function renderNqAutoTraderBox(st) {
       </label>
       <span style="font-size:9px; color:#94a3b8;">${st.pivot_email_alerts_enabled !== false ? '🟢 Active' : '⚪ Disabled'}</span>
     </div>
+    <div style="background:#090d16; border:1px solid #1e293b; border-radius:4px; padding:4px 6px; margin-top:2px;">
+      <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:3px; flex-wrap:wrap; gap:3px;">
+        <span style="font-size:8.5px; color:#c084fc; font-weight:800;">🎯 EMAIL TICKERS:</span>
+        <div id="at_email_tickers" style="display:flex; gap:3px; flex-wrap:wrap;">
+          ${allFutTickersHtml}
+        </div>
+      </div>
+      <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:3px;">
+        <span style="font-size:8.5px; color:#38bdf8; font-weight:800;">⏱️ EMAIL TIMEFRAMES:</span>
+        <div id="at_email_tfs" style="display:flex; gap:3px; flex-wrap:wrap;">
+          ${allTfsHtml}
+        </div>
+      </div>
+    </div>
     <div style="display:flex; gap:5px; align-items:center; margin-top:2px; flex-wrap:wrap;">
       <input id="nq_at_gmail_to" type="text" value="${st.gmail_to || 'amir.baram@gmail.com'}" placeholder="Notification Gmail" style="flex:1; min-width:130px; background:#0b111e; border:1px solid #1e293b; color:#e2e8f0; border-radius:4px; padding:3px 6px; font-size:9.5px;" title="Gmail recipient for position-opened alerts" />
       <input id="nq_at_gmail_pass" type="password" value="" placeholder="${st.gmail_password_configured ? 'App Password Saved (•••)' : 'Gmail App Password (optional)'}" style="flex:1; min-width:130px; background:#0b111e; border:1px solid #1e293b; color:#e2e8f0; border-radius:4px; padding:3px 6px; font-size:9.5px;" title="16-char Google App Password for SMTP delivery" />
@@ -8437,6 +8491,25 @@ function renderNqAutoTraderBox(st) {
   if (topCb) {
     topCb.checked = st.pivot_email_alerts_enabled !== false;
   }
+}
+
+function toggleFuturesEmailFilter() {
+  const chosenTickers = Array.from(document.querySelectorAll('#at_email_tickers input[type=checkbox]'))
+    .filter(cb => cb.checked).map(cb => cb.value);
+  const chosenTfs = Array.from(document.querySelectorAll('#at_email_tfs input[type=checkbox]'))
+    .filter(cb => cb.checked).map(cb => cb.value);
+
+  fetch('/api/nq_auto_trader', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      action: 'update_config',
+      pivot_email_tickers: chosenTickers,
+      pivot_email_timeframes: chosenTfs
+    })
+  })
+    .then(r => r.json())
+    .then(res => { if (res && res.status) renderNqAutoTraderBox(res.status); });
 }
 
 function toggleFuturesPivotEmail(enableFlag) {

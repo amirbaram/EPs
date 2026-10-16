@@ -99,6 +99,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "gmail_enabled": True,
     "pivot_email_alerts_enabled": True,
     "pivot_email_min_prob_pct": 50.0,
+    "pivot_email_tickers": ["NQ=F", "GC=F", "CL=F", "BTC=F", "SI=F"],
+    "pivot_email_timeframes": ["5m", "15m", "1h", "4h"],
     "gmail_to": "amir.baram@gmail.com",
     "gmail_user": "amir.baram@gmail.com",
     "gmail_app_password": "",
@@ -131,6 +133,8 @@ def load_auto_trader_config() -> Dict[str, Any]:
     cfg["mgc_contracts"] = int(cfg.get("mgc_contracts") or 2)
     cfg["mgc_enabled"] = bool(cfg.get("mgc_enabled", False))
     cfg["pivot_email_alerts_enabled"] = bool(cfg.get("pivot_email_alerts_enabled", True))
+    cfg["pivot_email_tickers"] = list(cfg.get("pivot_email_tickers") or ["NQ=F", "GC=F", "CL=F", "BTC=F", "SI=F"])
+    cfg["pivot_email_timeframes"] = list(cfg.get("pivot_email_timeframes") or ["5m", "15m", "1h", "4h"])
     cfg["tif"] = "GTC"
     cfg["outside_rth"] = True
     return cfg
@@ -144,6 +148,10 @@ def save_auto_trader_config(updates: Dict[str, Any]) -> Dict[str, Any]:
                 if k == "gmail_app_password" and str(v).strip() == "********":
                     continue
                 cfg[k] = v
+        if "pivot_email_tickers" in updates and isinstance(updates["pivot_email_tickers"], list):
+            cfg["pivot_email_tickers"] = [str(x).strip() for x in updates["pivot_email_tickers"]]
+        if "pivot_email_timeframes" in updates and isinstance(updates["pivot_email_timeframes"], list):
+            cfg["pivot_email_timeframes"] = [str(x).strip().lower() for x in updates["pivot_email_timeframes"]]
         cfg["timeframe"] = "15m"
         cfg["mgc_enabled"] = bool(cfg.get("mgc_enabled", False))
         cfg["pivot_email_alerts_enabled"] = bool(cfg.get("pivot_email_alerts_enabled", True))
@@ -940,8 +948,21 @@ def notify_new_realtime_pivot_alert(
         if not is_wl and not force_test:
             return None
 
+        # Strict Rule 3: Emails only sent for selected future tickers
+        allowed_tickers = [str(x).upper().replace("=F", "") for x in c.get("pivot_email_tickers", ["NQ", "GC", "CL", "BTC", "SI"])]
+        sym_root = sym.replace("=F", "")
+        root_map = {"MNQ": "NQ", "MGC": "GC", "MCL": "CL", "MBT": "BTC", "SIL": "SI"}
+        norm_sym = root_map.get(sym_root, sym_root)
+        if allowed_tickers and norm_sym not in allowed_tickers and sym_root not in allowed_tickers:
+            return None
+
+        # Strict Rule 4: Emails only sent for selected timeframes
+        tf = str(alert_or_plan.get("timeframe") or tp.get("timeframe") or "15m").lower().strip()
+        allowed_tfs = [str(x).lower().strip() for x in c.get("pivot_email_timeframes", ["5m", "15m", "1h", "4h"])]
+        if allowed_tfs and tf not in allowed_tfs:
+            return None
+
         st = load_auto_trader_state()
-        tf = str(alert_or_plan.get("timeframe") or tp.get("timeframe") or "15m").lower()
         b_time = str(alert_or_plan.get("bar_time") or tp.get("bar_time") or alert_or_plan.get("date") or "")
         direction = str(
             alert_or_plan.get("direction")
@@ -988,7 +1009,7 @@ def scan_and_email_realtime_pivots(
         return []
 
     thr = float(cfg.get("pivot_email_min_prob_pct", cfg.get("min_prob_pct", 50.0)))
-    raw_syms = symbols or ["NQ=F", "GC=F", "CL=F", "BTC=F", "SI=F"]
+    raw_syms = symbols or cfg.get("pivot_email_tickers") or ["NQ=F", "GC=F", "CL=F", "BTC=F", "SI=F"]
     # Filter strictly to futures symbols only
     watch_syms = [
         s for s in raw_syms
@@ -1001,6 +1022,7 @@ def scan_and_email_realtime_pivots(
     if first_seed:
         _INITIAL_PIVOT_KEYS_SEEDED = True
 
+    allowed_tfs = [str(x).lower().strip() for x in cfg.get("pivot_email_timeframes", ["5m", "15m", "1h", "4h"])]
     for sym in watch_syms:
         try:
             if sync_live and not first_seed:
@@ -1013,6 +1035,9 @@ def scan_and_email_realtime_pivots(
                 use_wickless=True,
             )
             for al in rt.get("alerts", []):
+                tf_al = str(al.get("timeframe") or "15m").lower().strip()
+                if allowed_tfs and tf_al not in allowed_tfs:
+                    continue
                 plan = al.get("trade_plan") or {}
                 prob_v = float(al.get("prob_pct", plan.get("prob_pct", 0.0)))
                 # Email on any high-conviction pivot even if it does not pass auto-trade hurdles (e.g. ratio < 1.35 or rr < 1.0)
@@ -2198,6 +2223,8 @@ def get_auto_trader_status() -> Dict[str, Any]:
         "gmail_to": cfg.get("gmail_to", "amir.baram@gmail.com"),
         "gmail_password_configured": bool(cfg.get("gmail_app_password")),
         "pivot_email_alerts_enabled": bool(cfg.get("pivot_email_alerts_enabled", True)),
+        "pivot_email_tickers": list(cfg.get("pivot_email_tickers") or ["NQ=F", "GC=F", "CL=F", "BTC=F", "SI=F"]),
+        "pivot_email_timeframes": list(cfg.get("pivot_email_timeframes") or ["5m", "15m", "1h", "4h"]),
         "last_email_status": last_email_status,
         "tws_connected": "OFFLINE" not in str(st.get("watchdog_status", "")) and "OFFLINE" not in str(st.get("mgc_watchdog_status", "")),
         "tws_port": (cfg.get("tws_ports") or [7497])[0],
@@ -2209,6 +2236,8 @@ def get_auto_trader_status() -> Dict[str, Any]:
         "enabled": bool(cfg.get("enabled")),
         "mgc_enabled": bool(cfg.get("mgc_enabled", False)),
         "pivot_email_alerts_enabled": bool(cfg.get("pivot_email_alerts_enabled", True)),
+        "pivot_email_tickers": list(cfg.get("pivot_email_tickers") or ["NQ=F", "GC=F", "CL=F", "BTC=F", "SI=F"]),
+        "pivot_email_timeframes": list(cfg.get("pivot_email_timeframes") or ["5m", "15m", "1h", "4h"]),
         "status": flat_status,
         "live_performance": live_perf,
         "config": safe_cfg,

@@ -97,7 +97,7 @@ CAL_START = "2023-07-15 00:00:00"
 OOS_START = "2024-07-15 00:00:00"
 OOS_END = "2026-07-14 23:59:59"
 
-TIMEFRAMES = ("15m", "1h", "4h")
+TIMEFRAMES = ("5m", "15m", "1h", "4h")
 HORIZONS = (4, 8, 12)
 
 
@@ -408,7 +408,7 @@ def resample_nq_with_1m_microstructure(df_1m: pd.DataFrame, tf: str) -> pd.DataF
     Vectorized resampling of 1-minute NQ bars into `15m`, `1h`, or `4h` bars,
     extracting both OHLCV (raw & seam-adjusted continuous) and 1-minute intrabar microstructure features.
     """
-    freq_map = {"15m": "15min", "1h": "1h", "4h": "4h"}
+    freq_map = {"5m": "5min", "15m": "15min", "1h": "1h", "4h": "4h"}
     freq = freq_map.get(tf, "15min")
 
     bucket_ts = df_1m.index.floor(freq)
@@ -2588,8 +2588,8 @@ _LAST_NQ_INTRADAY_SYNC_TS: float = 0.0
 _LAST_GC_INTRADAY_SYNC_TS: float = 0.0
 _LAST_INTRADAY_SYNC_TS_BY_SYM: Dict[str, float] = {}
 
-TF_MINUTES_MAP: Dict[str, int] = {"15m": 15, "1h": 60, "4h": 240}
-TF_DISPLAY_MAP: Dict[str, str] = {"15m": "15M", "1h": "1H", "4h": "4H"}
+TF_MINUTES_MAP: Dict[str, int] = {"5m": 5, "15m": 15, "1h": 60, "4h": 240}
+TF_DISPLAY_MAP: Dict[str, str] = {"5m": "5M", "15m": "15M", "1h": "1H", "4h": "4H"}
 
 
 def get_cached_nq_scored_df(tf: str, symbol: str = "NQ=F") -> pd.DataFrame:
@@ -3453,7 +3453,7 @@ def _score_live_bar_override_on_tf(
     tail.loc[idx_last, "close"] = c_px
     tail.loc[idx_last, "high"] = new_h
     tail.loc[idx_last, "low"] = new_l
-    if ((live_bar.get("is_intraday_bar") and tf == "15m") or is_test_runner) and abs(o_live - c_px) < max(400.0, c_px * 0.05):
+    if ((live_bar.get("is_intraday_bar") and tf in ("5m", "15m")) or is_test_runner) and abs(o_live - c_px) < max(400.0, c_px * 0.05):
         tail.loc[idx_last, "open"] = max(new_l, min(new_h, o_live))
 
     m1_defaults = {
@@ -3630,12 +3630,12 @@ def evaluate_nq_realtime_multi_tf(
         else:
             curr_row = df_tf.iloc[-1]
 
-        curr_hi_pct = _safe_float(curr_row.get("prob_pivot_high", 0.0), 0.0) * 100.0
+        curr_hi_pct = _safe_float(curr_row.get("prob_pivot_high", curr_row.get("prob_pivot_high_extreme", 0.0)), 0.0) * 100.0
         curr_hi_pct = round(curr_hi_pct, 1)
-        curr_lo_pct = _safe_float(curr_row.get("prob_pivot_low", 0.0), 0.0) * 100.0
+        curr_lo_pct = _safe_float(curr_row.get("prob_pivot_low", curr_row.get("prob_pivot_low_extreme", 0.0)), 0.0) * 100.0
         curr_lo_pct = round(curr_lo_pct, 1)
-        curr_hi_ex_pct = round(_safe_float(curr_row.get("prob_pivot_high_extreme", 0.0), 0.0) * 100.0, 1)
-        curr_lo_ex_pct = round(_safe_float(curr_row.get("prob_pivot_low_extreme", 0.0), 0.0) * 100.0, 1)
+        curr_hi_ex_pct = round(_safe_float(curr_row.get("prob_pivot_high_extreme", curr_row.get("prob_pivot_high", 0.0)), 0.0) * 100.0, 1)
+        curr_lo_ex_pct = round(_safe_float(curr_row.get("prob_pivot_low_extreme", curr_row.get("prob_pivot_low", 0.0)), 0.0) * 100.0, 1)
         curr_maj_top_pct = round(_safe_float(curr_row.get("prob_major_top_extreme", curr_row.get("prob_maj_ut_top_extreme", 0.0)), 0.0) * 100.0, 1)
         curr_maj_bot_pct = round(_safe_float(curr_row.get("prob_major_bottom_extreme", curr_row.get("prob_maj_dt_low_extreme", 0.0)), 0.0) * 100.0, 1)
 
@@ -3663,11 +3663,13 @@ def evaluate_nq_realtime_multi_tf(
         if not is_curr_bar_trig and len(recent_slice) > 1:
             hist_slice = recent_slice.iloc[:-1]
             if use_wickless:
-                hi_probs = np.nan_to_num(hist_slice["prob_pivot_high_extreme"].to_numpy(dtype=np.float64), nan=0.0) * 100.0
-                lo_probs = np.nan_to_num(hist_slice["prob_pivot_low_extreme"].to_numpy(dtype=np.float64), nan=0.0) * 100.0
+                hi_col = "prob_pivot_high_extreme" if "prob_pivot_high_extreme" in hist_slice.columns else "prob_pivot_high"
+                lo_col = "prob_pivot_low_extreme" if "prob_pivot_low_extreme" in hist_slice.columns else "prob_pivot_low"
             else:
-                hi_probs = np.nan_to_num(hist_slice["prob_pivot_high"].to_numpy(dtype=np.float64), nan=0.0) * 100.0
-                lo_probs = np.nan_to_num(hist_slice["prob_pivot_low"].to_numpy(dtype=np.float64), nan=0.0) * 100.0
+                hi_col = "prob_pivot_high" if "prob_pivot_high" in hist_slice.columns else "prob_pivot_high_extreme"
+                lo_col = "prob_pivot_low" if "prob_pivot_low" in hist_slice.columns else "prob_pivot_low_extreme"
+            hi_probs = (np.nan_to_num(hist_slice[hi_col].to_numpy(dtype=np.float64), nan=0.0) * 100.0) if hi_col in hist_slice.columns else np.zeros(len(hist_slice))
+            lo_probs = (np.nan_to_num(hist_slice[lo_col].to_numpy(dtype=np.float64), nan=0.0) * 100.0) if lo_col in hist_slice.columns else np.zeros(len(hist_slice))
             h_hist = hist_slice["high"].to_numpy(dtype=np.float64)
             l_hist = hist_slice["low"].to_numpy(dtype=np.float64)
             c_hi_curr = _safe_float(curr_row.get("high"), 0.0)
