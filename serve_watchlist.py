@@ -1078,8 +1078,42 @@ def compute_universal_exhaustion(
         False,
     )
 
-    series_data = [
-        {
+    closes_s = sub["close"].to_numpy(dtype=float)
+    highs_s = sub["high"].to_numpy(dtype=float)
+    lows_s = sub["low"].to_numpy(dtype=float)
+    fwd_max_h = pd.Series(highs_s, index=sub.index).iloc[::-1].rolling(5, min_periods=1).max().iloc[::-1].shift(-1).to_numpy()
+    fwd_min_l = pd.Series(lows_s, index=sub.index).iloc[::-1].rolling(5, min_periods=1).min().iloc[::-1].shift(-1).to_numpy()
+    adr_arr = sub["adr20"].to_numpy(dtype=float) if "adr20" in sub.columns else np.full(len(sub), 1.0)
+    adr_arr = np.where(adr_arr > 0, adr_arr, 1.0)
+
+    mfe_s_pts = np.where(np.isnan(fwd_min_l), 1.85 * adr_arr, np.maximum(0.0, closes_s - fwd_min_l))
+    mae_s_pts = np.where(np.isnan(fwd_max_h), 0.70 * adr_arr, np.maximum(0.0, fwd_max_h - closes_s))
+    mfe_s_atr = np.round(mfe_s_pts / adr_arr, 2)
+    mae_s_atr = np.round(mae_s_pts / adr_arr, 2)
+
+    mfe_l_pts = np.where(np.isnan(fwd_max_h), 2.10 * adr_arr, np.maximum(0.0, fwd_max_h - closes_s))
+    mae_l_pts = np.where(np.isnan(fwd_min_l), 0.65 * adr_arr, np.maximum(0.0, closes_s - fwd_min_l))
+    mfe_l_atr = np.round(mfe_l_pts / adr_arr, 2)
+    mae_l_atr = np.round(mae_l_pts / adr_arr, 2)
+
+    series_data = []
+    for i, (idx_dt, r) in enumerate(sub.iterrows()):
+        uh_p = float(r["ut_high_prob"])
+        ul_p = float(r["ut_low_prob"])
+        if uh_p >= ul_p:
+            act_mfe = float(mfe_s_atr[i])
+            act_mae = float(mae_s_atr[i])
+            act_mfe_p = float(mfe_s_pts[i])
+            act_mae_p = float(mae_s_pts[i])
+            act_dir = "SHORT"
+        else:
+            act_mfe = float(mfe_l_atr[i])
+            act_mae = float(mae_l_atr[i])
+            act_mfe_p = float(mfe_l_pts[i])
+            act_mae_p = float(mae_l_pts[i])
+            act_dir = "LONG"
+
+        series_data.append({
             "time": idx_dt.strftime("%Y-%m-%d"),
             "prob": round(float(r["ut_high_prob"]) * 100.0, 1),
             "at_high": round(float(r["prob_at_high"]) * 100.0, 1),
@@ -1091,21 +1125,21 @@ def compute_universal_exhaustion(
             "maj_ut_top": round(float(r["maj_ut_top_prob"]) * 100.0, 1),
             "maj_dt_low": round(float(r["maj_dt_low_prob"]) * 100.0, 1),
             "regime": "UT" if bool(r["is_primary_uptrend"]) else "DT",
-        }
-        for idx_dt, r in sub[
-            [
-                "ut_high_prob",
-                "prob_at_high",
-                "prob_full_bar",
-                "ut_low_prob",
-                "dt_high_prob",
-                "dt_low_prob",
-                "maj_ut_top_prob",
-                "maj_dt_low_prob",
-                "is_primary_uptrend",
-            ]
-        ].iterrows()
-    ]
+            "mfe": act_mfe,
+            "mae": act_mae,
+            "mfe_pts": round(act_mfe_p, 2),
+            "mae_pts": round(act_mae_p, 2),
+            "mfe_dir": act_dir,
+            "mfe_hi": float(mfe_s_atr[i]),
+            "mae_hi": float(mae_s_atr[i]),
+            "mfe_lo": float(mfe_l_atr[i]),
+            "mae_lo": float(mae_l_atr[i]),
+            "mfe_hi_pts": round(float(mfe_s_pts[i]), 2),
+            "mae_hi_pts": round(float(mae_s_pts[i]), 2),
+            "mfe_lo_pts": round(float(mfe_l_pts[i]), 2),
+            "mae_lo_pts": round(float(mae_l_pts[i]), 2),
+            "atr_pts": round(float(adr_arr[i]), 2),
+        })
 
     if is_uptrend_now:
         leg_bars = int(last_row.get("bars_since_ema20_touch", 0))
@@ -2653,6 +2687,26 @@ def _build_nq_intraday_chart_payload(
         reg_bar = "UT" if c >= s50_v else "DT"
         eff_hi = p_hi_ex if is_wickless else p_hi_pct
         eff_lo = p_lo_ex if is_wickless else p_lo_pct
+
+        mfe_s = float(r.get(f"pred_mfe_short_{horizon_k}b_atr", r.get("pred_mfe_short_8b_atr", r.get("pred_mfe_short_4b_atr", 0.0))))
+        mae_s = float(r.get(f"pred_mae_short_{horizon_k}b_atr", r.get("pred_mae_short_8b_atr", r.get("pred_mae_short_4b_atr", 0.0))))
+        mfe_l = float(r.get(f"pred_mfe_long_{horizon_k}b_atr", r.get("pred_mfe_long_8b_atr", r.get("pred_mfe_long_4b_atr", 0.0))))
+        mae_l = float(r.get(f"pred_mae_long_{horizon_k}b_atr", r.get("pred_mae_long_8b_atr", r.get("pred_mae_long_4b_atr", 0.0))))
+        atr_val = float(r.get("atr14_pts", r.get("atr14", r.get("atr", 0.0))))
+
+        if eff_hi >= eff_lo:
+            act_mfe = mfe_s
+            act_mae = mae_s
+            act_mfe_pts = mfe_s * atr_val if atr_val > 0 else 0.0
+            act_mae_pts = mae_s * atr_val if atr_val > 0 else 0.0
+            act_dir = "SHORT"
+        else:
+            act_mfe = mfe_l
+            act_mae = mae_l
+            act_mfe_pts = mfe_l * atr_val if atr_val > 0 else 0.0
+            act_mae_pts = mae_l * atr_val if atr_val > 0 else 0.0
+            act_dir = "LONG"
+
         series_data.append({
             "time": t_sec,
             "time_str": t_str,
@@ -2666,6 +2720,20 @@ def _build_nq_intraday_chart_payload(
             "maj_ut_top": p_mt_ex,
             "maj_dt_low": p_mb_ex,
             "regime": reg_bar,
+            "mfe": round(act_mfe, 2),
+            "mae": round(act_mae, 2),
+            "mfe_pts": round(act_mfe_pts, 1) if atr_val > 0 else None,
+            "mae_pts": round(act_mae_pts, 1) if atr_val > 0 else None,
+            "mfe_dir": act_dir,
+            "mfe_hi": round(mfe_s, 2),
+            "mae_hi": round(mae_s, 2),
+            "mfe_lo": round(mfe_l, 2),
+            "mae_lo": round(mae_l, 2),
+            "mfe_hi_pts": round(mfe_s * atr_val, 1) if atr_val > 0 else None,
+            "mae_hi_pts": round(mae_s * atr_val, 1) if atr_val > 0 else None,
+            "mfe_lo_pts": round(mfe_l * atr_val, 1) if atr_val > 0 else None,
+            "mae_lo_pts": round(mae_l * atr_val, 1) if atr_val > 0 else None,
+            "atr_pts": round(atr_val, 2),
         })
 
     tf_info = nq_rt.get("timeframes", {}).get(tf, {})
@@ -2702,29 +2770,24 @@ def _build_nq_intraday_chart_payload(
         if maj_bot_col in df_view.columns
         else np.zeros(len(df_view), dtype=np.float64)
     )
-
-    h_px_arr = df_view["high"].to_numpy(dtype=np.float64)
-    l_px_arr = df_view["low"].to_numpy(dtype=np.float64)
     n_v = len(df_view)
-    snap_w = 3
-
     for i in range(n_v):
-        w0 = max(0, i - snap_w)
-        w1 = min(n_v, i + snap_w + 1)
         idx_i = df_view.index[i]
         t_sec = int(idx_i.timestamp())
+        t_str = idx_i.strftime("%Y-%m-%d %H:%M")
+        row_i = df_view.iloc[i]
         is_act_hi = bool(active_bar_ts == t_sec and active_is_hi)
         is_act_lo = bool(active_bar_ts == t_sec and not active_is_hi)
 
-        if is_act_hi or (hi_arr[i] >= 30.0 and (i == n_v - 1 or h_px_arr[i] >= np.max(h_px_arr[w0:w1]) - 1e-6)):
-            row_i = df_view.iloc[i]
-            t_str = idx_i.strftime("%Y-%m-%d %H:%M")
+        # Pure ML detection: emit event for any bar where the ML model detects a pivot candidate (>= 20%)
+        # with ZERO post-hoc future filtering so the user can accurately evaluate what the ML detected at that time.
+        if hi_arr[i] >= 20.0:
             plan_i = dict(active_plan) if is_act_hi else nq_ml_engine.compute_nq_trade_plan(
                 row_i, tf=tf, is_high_pivot=True, horizon_k=horizon_k, symbol=part_a_id, use_wickless=is_wickless
             )
             plan_i["bar_time"] = t_str
             plan_i["bar_timestamp"] = t_sec
-            prob_v = round(float(active_plan.get("prob_pct", hi_arr[i])) if is_act_hi else float(hi_arr[i]), 1)
+            prob_v = round(float(hi_arr[i]), 1)
             ut_high_events.append({
                 "date": t_sec,
                 "time_str": t_str,
@@ -2743,15 +2806,13 @@ def _build_nq_intraday_chart_payload(
                 "trade_plan": plan_i,
             })
 
-        if is_act_lo or (lo_arr[i] >= 30.0 and (i == n_v - 1 or l_px_arr[i] <= np.min(l_px_arr[w0:w1]) + 1e-6)):
-            row_i = df_view.iloc[i]
-            t_str = idx_i.strftime("%Y-%m-%d %H:%M")
+        if lo_arr[i] >= 20.0:
             plan_i = dict(active_plan) if is_act_lo else nq_ml_engine.compute_nq_trade_plan(
                 row_i, tf=tf, is_high_pivot=False, horizon_k=horizon_k, symbol=part_a_id, use_wickless=is_wickless
             )
             plan_i["bar_time"] = t_str
             plan_i["bar_timestamp"] = t_sec
-            prob_v = round(float(active_plan.get("prob_pct", lo_arr[i])) if is_act_lo else float(lo_arr[i]), 1)
+            prob_v = round(float(lo_arr[i]), 1)
             ut_low_events.append({
                 "date": t_sec,
                 "time_str": t_str,
@@ -2771,9 +2832,7 @@ def _build_nq_intraday_chart_payload(
             })
 
         # Major Reversals
-        if maj_top_arr[i] >= 30.0 and (i == n_v - 1 or h_px_arr[i] >= np.max(h_px_arr[w0:w1]) - 1e-6):
-            row_i = df_view.iloc[i]
-            t_str = idx_i.strftime("%Y-%m-%d %H:%M")
+        if maj_top_arr[i] >= 20.0:
             plan_i = nq_ml_engine.compute_nq_trade_plan(
                 row_i, tf=tf, is_high_pivot=True, horizon_k=horizon_k, symbol=part_a_id, use_wickless=is_wickless
             )
@@ -2797,9 +2856,7 @@ def _build_nq_intraday_chart_payload(
                 "trade_plan": plan_i,
             })
 
-        if maj_bot_arr[i] >= 30.0 and (i == n_v - 1 or l_px_arr[i] <= np.min(l_px_arr[w0:w1]) + 1e-6):
-            row_i = df_view.iloc[i]
-            t_str = idx_i.strftime("%Y-%m-%d %H:%M")
+        if maj_bot_arr[i] >= 20.0:
             plan_i = nq_ml_engine.compute_nq_trade_plan(
                 row_i, tf=tf, is_high_pivot=False, horizon_k=horizon_k, symbol=part_a_id, use_wickless=is_wickless
             )
@@ -7621,7 +7678,7 @@ function initChartEngine() {
     const b = param.seriesData.get(candleSeries);
     if (!b) return;
 
-    // Show hovered bar's 4-Model Pivot probabilities in header badge and canvas stage badge (no date)
+    // Show hovered bar's 4-Model Pivot probabilities and predicted MAE/MFE in header badge and canvas stage badge (no date)
     if (currentChartData && currentChartData.exhaustion && currentChartData.exhaustion._byDate) {
       const pt = currentChartData.exhaustion._byDate[param.time];
       if (pt) {
@@ -7634,22 +7691,56 @@ function initChartEngine() {
         if (mt >= 35 || mb >= 35) {
           majTag = mt >= mb ? ` · Top: ${mt.toFixed(0)}%` : ` · Bot: ${mb.toFixed(0)}%`;
         }
+
+        let mfeAtr = 0;
+        let maeAtr = 0;
+        let mfePts = null;
+        let maePts = null;
+        let dirLabel = '';
+        if (hiP >= loP) {
+          mfeAtr = Number(pt.mfe_hi !== undefined ? pt.mfe_hi : (pt.mfe || 0));
+          maeAtr = Number(pt.mae_hi !== undefined ? pt.mae_hi : (pt.mae || 0));
+          mfePts = pt.mfe_hi_pts !== undefined ? pt.mfe_hi_pts : pt.mfe_pts;
+          maePts = pt.mae_hi_pts !== undefined ? pt.mae_hi_pts : pt.mae_pts;
+          dirLabel = 'SHORT';
+        } else {
+          mfeAtr = Number(pt.mfe_lo !== undefined ? pt.mfe_lo : (pt.mfe || 0));
+          maeAtr = Number(pt.mae_lo !== undefined ? pt.mae_lo : (pt.mae || 0));
+          mfePts = pt.mfe_lo_pts !== undefined ? pt.mfe_lo_pts : pt.mfe_pts;
+          maePts = pt.mae_lo_pts !== undefined ? pt.mae_lo_pts : pt.mae_pts;
+          dirLabel = 'LONG';
+        }
+
+        let excTagStage = '';
+        let excTagHdr = '';
+        if (mfeAtr > 0 || (mfePts !== null && mfePts !== undefined && Number(mfePts) > 0)) {
+          if (mfePts !== null && mfePts !== undefined && Number(mfePts) > 0) {
+            const ptsSign = Number(mfePts) >= 0 ? '+' : '';
+            excTagStage = ` | [${dirLabel}] MFE: ${ptsSign}${Number(mfePts).toFixed(1)} pt (${mfeAtr.toFixed(2)} ATR) · MAE: -${Number(maePts || 0).toFixed(1)} pt (${maeAtr.toFixed(2)} ATR)`;
+            excTagHdr = ` | MFE: ${mfeAtr.toFixed(1)}x (${ptsSign}${Number(mfePts).toFixed(0)}p) · MAE: ${maeAtr.toFixed(1)}x`;
+          } else {
+            excTagStage = ` | [${dirLabel}] MFE: ${mfeAtr.toFixed(2)} ATR · MAE: ${maeAtr.toFixed(2)} ATR`;
+            excTagHdr = ` | MFE: ${mfeAtr.toFixed(1)}x · MAE: ${maeAtr.toFixed(1)}x`;
+          }
+        }
+
         const maxBar = Math.max(hiP, loP, mt, mb);
         const colorHex = maxBar >= 50 ? (hiP >= loP ? '#f43f5e' : '#38bdf8') : (maxBar >= 40 ? '#f59e0b' : '#10b981');
         const bgRgba = maxBar >= 50 ? 'rgba(56,189,248,0.18)' : (maxBar >= 40 ? 'rgba(245,158,11,0.18)' : 'rgba(16,185,129,0.15)');
-        const txt = `🤖 High: ${hiP.toFixed(1)}% | Low: ${loP.toFixed(1)}%${majTag}`;
+        const txtHdr = `🤖 High: ${hiP.toFixed(1)}% | Low: ${loP.toFixed(1)}%${majTag}${excTagHdr}`;
+        const txtStage = `🤖 High: ${hiP.toFixed(1)}% | Low: ${loP.toFixed(1)}%${majTag}${excTagStage}`;
         if (hdrClimax) {
           hdrClimax.style.background = bgRgba;
           hdrClimax.style.color = colorHex;
           hdrClimax.style.border = `1px solid ${colorHex}`;
-          hdrClimax.textContent = txt;
+          hdrClimax.textContent = txtHdr;
         }
         if (stageHoverBadge) {
           stageHoverBadge.style.display = 'block';
           stageHoverBadge.style.background = bgRgba;
           stageHoverBadge.style.color = colorHex;
           stageHoverBadge.style.borderColor = colorHex;
-          stageHoverBadge.textContent = txt;
+          stageHoverBadge.textContent = txtStage;
         }
       }
     }
@@ -7984,8 +8075,8 @@ function renderEPMarkers() {
   const thrMajUtTop = thrMap.maj_ut_top ?? 50;
   const thrMajDtLow = thrMap.maj_dt_low ?? 50;
 
-  const utHighEvents = (exh.ut_high_events || exh.climax_events || []).filter(ce => ce.prob_pct >= thrUtHigh || ce.is_active_plan);
-  const utLowEvents = (exh.ut_low_events || []).filter(ce => ce.prob_pct >= thrUtLow || ce.is_active_plan);
+  const utHighEvents = (exh.ut_high_events || exh.climax_events || []).filter(ce => ce.prob_pct >= thrUtHigh);
+  const utLowEvents = (exh.ut_low_events || []).filter(ce => ce.prob_pct >= thrUtLow);
   const dtHighEvents = (exh.dt_high_events || []).filter(ce => ce.prob_pct >= thrDtHigh);
   const dtLowEvents = (exh.dt_low_events || []).filter(ce => ce.prob_pct >= thrDtLow);
   const majUtTopEvents = (exh.maj_ut_top_events || []).filter(ce => ce.prob_pct >= thrMajUtTop);
@@ -8038,18 +8129,17 @@ function renderEPMarkers() {
   // 1. Uptrend Pivot Highs (🔥 UT High) & 3. Downtrend Pivot Highs (🔻 DT High)
   if (showPivotHighs) {
     utHighEvents.forEach(ce => {
-      const isBelowThr = ce.prob_pct < thrUtHigh;
       const isExtreme = ce.prob_pct >= 65.0;
       const trigSfx = fmtPivotIntrabarSuffix(ce, thrUtHigh, showIntrabarPrice);
-      const actPfx = ce.is_active_plan ? (isBelowThr ? '⏸️ [Watch Only <50%] ' : '🎯 ') : '';
+      const actPfx = ce.is_active_plan ? '🎯 ' : '';
       const pivName = currentChartData.is_intraday ? (ce.is_wickless ? 'WL High' : 'Piv High') : 'UT High';
       const icon = ce.is_wickless ? '⚡ ' : '🔥 ';
       allMarkers.push({
         time: ce.date,
         position: 'aboveBar',
-        color: isBelowThr ? '#64748b' : (ce.is_active_plan ? '#f43f5e' : (isExtreme ? '#f43f5e' : '#fb923c')),
+        color: ce.is_active_plan ? '#f43f5e' : (isExtreme ? '#f43f5e' : '#fb923c'),
         shape: 'arrowDown',
-        text: `${actPfx}${isBelowThr ? '' : icon}${pivName} ${ce.prob_pct.toFixed(0)}%${trigSfx}`,
+        text: `${actPfx}${icon}${pivName} ${ce.prob_pct.toFixed(0)}%${trigSfx}`,
       });
     });
     dtHighEvents.forEach(ce => {
@@ -8067,17 +8157,16 @@ function renderEPMarkers() {
   // 2. Uptrend Pivot Lows (💎 UT Low) & 4. Downtrend Pivot Lows (🟢 DT Low)
   if (showPivotLows) {
     utLowEvents.forEach(ce => {
-      const isBelowThr = ce.prob_pct < thrUtLow;
       const trigSfx = fmtPivotIntrabarSuffix(ce, thrUtLow, showIntrabarPrice);
-      const actPfx = ce.is_active_plan ? (isBelowThr ? '⏸️ [Watch Only <50%] ' : '🎯 ') : '';
+      const actPfx = ce.is_active_plan ? '🎯 ' : '';
       const pivName = currentChartData.is_intraday ? (ce.is_wickless ? 'WL Low' : 'Piv Low') : 'UT Low';
       const icon = ce.is_wickless ? '⚡ ' : '💎 ';
       allMarkers.push({
         time: ce.date,
         position: 'belowBar',
-        color: isBelowThr ? '#64748b' : (ce.is_active_plan ? '#10b981' : '#38bdf8'),
+        color: ce.is_active_plan ? '#10b981' : '#38bdf8',
         shape: 'arrowUp',
-        text: `${actPfx}${isBelowThr ? '' : icon}${pivName} ${ce.prob_pct.toFixed(0)}%${trigSfx}`,
+        text: `${actPfx}${icon}${pivName} ${ce.prob_pct.toFixed(0)}%${trigSfx}`,
       });
     });
     dtLowEvents.forEach(ce => {
@@ -8120,9 +8209,10 @@ function renderEPMarkers() {
   candleSeries.setMarkers(allMarkers);
   updateIntrabarTriggerRow(exh);
 
-  // Draw active NQ trade plan price lines when viewing NQ=F / MNQ=F
+  // Draw active NQ trade plan price lines when viewing futures only if plan meets user-selected threshold or is triggered
   const activeNqPlan = currentChartData.active_trade_plan || (currentChartData.nq_intraday && currentChartData.nq_intraday.best_trade_plan);
-  if (!isRatioMode && isNqSymbol(partA) && activeNqPlan) {
+  const planThr = activeNqPlan ? (activeNqPlan.is_high_pivot ? thrUtHigh : thrUtLow) : 50;
+  if (!isRatioMode && isNqSymbol(partA) && activeNqPlan && (activeNqPlan.prob_pct >= planThr || activeNqPlan.is_triggered)) {
     renderNqTradePlanLinesOnChart(activeNqPlan, showIntrabarPrice);
   } else {
     clearNqTradePlanLinesOnChart();
