@@ -2533,7 +2533,9 @@ def _build_nq_intraday_chart_payload(
 
     # If live developing bar is active, re-score the developing bar and reflect its OHLC + probabilities on df_ind
     if dev_bar and dev_bar.get("close", 0.0) > 0 and not df_ind.empty:
-        scored_last = nq_ml_engine._score_live_bar_override_on_tf(df_tf, tf, dev_bar, symbol=part_a_id)
+        scored_last = nq_ml_engine._score_live_bar_override_on_tf(
+            df_tf, tf, dev_bar, symbol=part_a_id, use_wickless=is_wickless
+        )
         last_idx = df_ind.index[-1]
         for col in scored_last.index:
             if col in df_ind.columns:

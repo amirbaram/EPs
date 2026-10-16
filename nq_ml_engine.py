@@ -3524,16 +3524,30 @@ def _score_live_bar_override_on_tf(
         last_df["prob_major_top_extreme"] = np.nan_to_num(p_mt_ex, nan=0.0, posinf=1.0, neginf=0.0)
         last_df["prob_maj_ut_top_extreme"] = last_df["prob_major_top_extreme"]
     else:
-        last_df["prob_major_top_extreme"] = 0.0
-        last_df["prob_maj_ut_top_extreme"] = 0.0
+        base_wl = get_cached_nq_models(symbol=symbol, use_wickless=True)
+        wl_tf = base_wl.get(tf, {})
+        if "major_top" in wl_tf:
+            _, p_mt_ex, _ = score_nq_pivot_bundle(last_df, wl_tf["major_top"], "is_cand_high")
+            last_df["prob_major_top_extreme"] = np.nan_to_num(p_mt_ex, nan=0.0, posinf=1.0, neginf=0.0)
+            last_df["prob_maj_ut_top_extreme"] = last_df["prob_major_top_extreme"]
+        else:
+            last_df["prob_major_top_extreme"] = 0.0
+            last_df["prob_maj_ut_top_extreme"] = 0.0
 
     if "major_bottom" in tf_bundle:
         _, p_mb_ex, _ = score_nq_pivot_bundle(last_df, tf_bundle["major_bottom"], "is_cand_low")
         last_df["prob_major_bottom_extreme"] = np.nan_to_num(p_mb_ex, nan=0.0, posinf=1.0, neginf=0.0)
         last_df["prob_maj_dt_low_extreme"] = last_df["prob_major_bottom_extreme"]
     else:
-        last_df["prob_major_bottom_extreme"] = 0.0
-        last_df["prob_maj_dt_low_extreme"] = 0.0
+        base_wl = get_cached_nq_models(symbol=symbol, use_wickless=True)
+        wl_tf = base_wl.get(tf, {})
+        if "major_bottom" in wl_tf:
+            _, p_mb_ex, _ = score_nq_pivot_bundle(last_df, wl_tf["major_bottom"], "is_cand_low")
+            last_df["prob_major_bottom_extreme"] = np.nan_to_num(p_mb_ex, nan=0.0, posinf=1.0, neginf=0.0)
+            last_df["prob_maj_dt_low_extreme"] = last_df["prob_major_bottom_extreme"]
+        else:
+            last_df["prob_major_bottom_extreme"] = 0.0
+            last_df["prob_maj_dt_low_extreme"] = 0.0
 
     if "excursion_short" in tf_bundle:
         score_excursion_models(last_df, tf_bundle["excursion_short"], "short")
@@ -3796,6 +3810,95 @@ def evaluate_nq_realtime_multi_tf(
                 "model_mode": "wickless" if use_wickless else "current",
                 "trade_plan": plan,
                 "message": msg,
+            })
+
+        # Major Reversals on developing / recent bar
+        if curr_maj_top_pct >= thr:
+            maj_top_key = f"{prefix}_{tf}_maj_ut_top"
+            maj_top_label = f"👑 {sym_root} [{tf_label}] Major Top (SHORT Breakdown)"
+            plan_maj_top = compute_nq_trade_plan(curr_row, tf=tf, is_high_pivot=True, horizon_k=k, symbol=symbol, use_wickless=use_wickless)
+            triggered_alerts.append({
+                "symbol": symbol,
+                "is_nq_intraday": True,
+                "timeframe": tf,
+                "timeframe_label": tf_label,
+                "bar_time": active_time_str,
+                "model_key": maj_top_key,
+                "pivot_type": "maj_ut_top",
+                "model_label": maj_top_label,
+                "pivot_label": maj_top_label,
+                "color": "#fbbf24",
+                "is_high_pivot": True,
+                "direction": "SHORT",
+                "prob_pct": curr_maj_top_pct,
+                "threshold_pct": thr,
+                "current_price": _safe_float(curr_row.get("close"), 0.0, 2),
+                "extreme_price": plan_maj_top["extreme_price"],
+                "bar_price": plan_maj_top["extreme_price"],
+                "trigger_price": plan_maj_top["entry_price"],
+                "entry_price": plan_maj_top["entry_price"],
+                "entry_px": plan_maj_top["entry_price"],
+                "stop_price": plan_maj_top["stop_price"],
+                "stop_px": plan_maj_top["stop_price"],
+                "target1_price": plan_maj_top["target1_price"],
+                "target1_px": plan_maj_top["target1_price"],
+                "target2_price": plan_maj_top["target2_price"],
+                "target2_px": plan_maj_top["target2_price"],
+                "rr_target1": plan_maj_top["rr_target1"],
+                "rr_target2": plan_maj_top["rr_target2"],
+                "time_exit_label": plan_maj_top["time_exit_label"],
+                "is_wickless": True,
+                "model_mode": "wickless",
+                "trade_plan": plan_maj_top,
+                "message": (
+                    f"👑 {symbol} [{tf_label}] Major Top (Primary Breakdown Risk) "
+                    f"({curr_maj_top_pct:.1f}% ≥ {thr:.0f}%) @ {active_time_str} — "
+                    f"Entry: {plan_maj_top['entry_price']:.2f} | Stop: {plan_maj_top['stop_price']:.2f}"
+                ),
+            })
+
+        if curr_maj_bot_pct >= thr:
+            maj_bot_key = f"{prefix}_{tf}_maj_dt_low"
+            maj_bot_label = f"🚀 {sym_root} [{tf_label}] Major Bottom (LONG Turnaround)"
+            plan_maj_bot = compute_nq_trade_plan(curr_row, tf=tf, is_high_pivot=False, horizon_k=k, symbol=symbol, use_wickless=use_wickless)
+            triggered_alerts.append({
+                "symbol": symbol,
+                "is_nq_intraday": True,
+                "timeframe": tf,
+                "timeframe_label": tf_label,
+                "bar_time": active_time_str,
+                "model_key": maj_bot_key,
+                "pivot_type": "maj_dt_low",
+                "model_label": maj_bot_label,
+                "pivot_label": maj_bot_label,
+                "color": "#10b981",
+                "is_high_pivot": False,
+                "direction": "LONG",
+                "prob_pct": curr_maj_bot_pct,
+                "threshold_pct": thr,
+                "current_price": _safe_float(curr_row.get("close"), 0.0, 2),
+                "extreme_price": plan_maj_bot["extreme_price"],
+                "bar_price": plan_maj_bot["extreme_price"],
+                "trigger_price": plan_maj_bot["entry_price"],
+                "entry_price": plan_maj_bot["entry_price"],
+                "entry_px": plan_maj_bot["entry_price"],
+                "stop_price": plan_maj_bot["stop_price"],
+                "stop_px": plan_maj_bot["stop_price"],
+                "target1_price": plan_maj_bot["target1_price"],
+                "target1_px": plan_maj_bot["target1_price"],
+                "target2_price": plan_maj_bot["target2_price"],
+                "target2_px": plan_maj_bot["target2_price"],
+                "rr_target1": plan_maj_bot["rr_target1"],
+                "rr_target2": plan_maj_bot["rr_target2"],
+                "time_exit_label": plan_maj_bot["time_exit_label"],
+                "is_wickless": True,
+                "model_mode": "wickless",
+                "trade_plan": plan_maj_bot,
+                "message": (
+                    f"🚀 {symbol} [{tf_label}] Major Bottom (Turnaround Rally) "
+                    f"({curr_maj_bot_pct:.1f}% ≥ {thr:.0f}%) @ {active_time_str} — "
+                    f"Entry: {plan_maj_bot['entry_price']:.2f} | Stop: {plan_maj_bot['stop_price']:.2f}"
+                ),
             })
 
     out_payload = _sanitize_json_value({

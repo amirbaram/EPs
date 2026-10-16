@@ -792,6 +792,47 @@ class TestWatchlistViewer(unittest.TestCase):
         self.assertIn("toggleFuturesPivotEmail", html)
         self.assertIn("at_cfg_futures_email", html)
 
+    def test_live_bar_major_reversals_evaluation_and_alerts(self):
+        import nq_ml_engine
+
+        # Verify that a live developing bar correctly scores major_top and major_bottom in real-time
+        dev_bar = {
+            "open": 20500.0,
+            "high": 21200.0,
+            "low": 20450.0,
+            "close": 21180.0,
+            "volume": 15000,
+            "date": "2026-10-16 18:20",
+            "is_intraday_bar": True,
+            "source": "TWS-Live",
+        }
+
+        rt = nq_ml_engine.evaluate_nq_realtime_multi_tf(
+            live_bar=dev_bar,
+            threshold_pct=40.0,
+            horizon_k=8,
+            symbol="NQ=F",
+            use_wickless=True,
+        )
+
+        self.assertIn("timeframes", rt)
+        for tf in ("15m", "1h", "4h"):
+            self.assertIn(tf, rt["timeframes"])
+            tf_data = rt["timeframes"][tf]
+            self.assertIn("curr_major_top_pct", tf_data)
+            self.assertIn("curr_major_bottom_pct", tf_data)
+            self.assertIn("prob_major_top_pct", tf_data)
+            self.assertIn("prob_major_bottom_pct", tf_data)
+
+        # Check alerts generated for live bar
+        alerts = rt.get("alerts", [])
+        maj_alerts = [a for a in alerts if a.get("pivot_type") in ("maj_ut_top", "maj_dt_low")]
+        self.assertGreaterEqual(len(maj_alerts), 1)
+        for ma in maj_alerts:
+            self.assertIn("timeframe", ma)
+            self.assertIn("prob_pct", ma)
+            self.assertTrue(ma["is_wickless"])
+
 
 if __name__ == "__main__":
     unittest.main()
