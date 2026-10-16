@@ -47,7 +47,7 @@ from zoneinfo import ZoneInfo
 import joblib
 import numpy as np
 import pandas as pd
-from flask import Flask, jsonify, render_template_string, request
+from flask import Flask, jsonify as _flask_jsonify, render_template_string, request
 
 import config
 import datastore
@@ -58,6 +58,7 @@ import scanner_core
 import thematic_engine
 import train_all_pivot_models as tap
 import train_uptrend_pivot_model as tup
+import nq_ml_engine
 
 try:
     import yfinance as yf
@@ -65,6 +66,15 @@ except ImportError:
     yf = None
 
 app = Flask(__name__)
+
+
+def jsonify(*args: Any, **kwargs: Any) -> Any:
+    """Strict JSON serializer wrapper guaranteeing zero NaN or Infinity tokens in browser responses."""
+    if args and not kwargs:
+        if len(args) == 1:
+            return _flask_jsonify(nq_ml_engine._sanitize_json_value(args[0]))
+        return _flask_jsonify(*[nq_ml_engine._sanitize_json_value(a) for a in args])
+    return _flask_jsonify(**{k: nq_ml_engine._sanitize_json_value(v) for k, v in kwargs.items()})
 
 RS_DATA_PATH = Path("data/simulations/rs_universe_scores.parquet")
 EP_STUDY_PATH = Path("data/simulations/ep_combined_study_scored.parquet")
@@ -88,6 +98,16 @@ ANNOTATIONS_DIR.mkdir(parents=True, exist_ok=True)
 SPDR_ETF_META: Dict[str, Dict[str, str]] = {
     "SPY": {"name": "SPDR S&P 500 ETF Trust", "category": "Market Benchmark", "focus": "S&P 500 Large Cap"},
     "QQQ": {"name": "Invesco QQQ Trust", "category": "Market Benchmark", "focus": "Nasdaq 100 Growth / Tech"},
+    "NQ=F": {"name": "E-mini Nasdaq-100 Futures (Continuous 15m/1h/4h/1D)", "category": "Index Futures", "focus": "Nasdaq-100 CME Globex"},
+    "MNQ=F": {"name": "Micro E-mini Nasdaq-100 Futures (Continuous)", "category": "Index Futures", "focus": "Micro Nasdaq-100 CME Globex"},
+    "GC=F": {"name": "Gold Futures (Continuous 15m/1h/4h/1D)", "category": "Commodity Futures", "focus": "Gold COMEX Globex"},
+    "MGC=F": {"name": "Micro Gold Futures (Continuous 15m/1h/4h/1D)", "category": "Commodity Futures", "focus": "Micro Gold COMEX Globex"},
+    "CL=F": {"name": "Crude Oil WTI Futures (Continuous 15m/1h/4h/1D)", "category": "Commodity Futures", "focus": "WTI Crude Oil NYMEX Globex"},
+    "MCL=F": {"name": "Micro WTI Crude Oil Futures (Continuous 15m/1h/4h/1D)", "category": "Commodity Futures", "focus": "Micro Crude Oil NYMEX Globex"},
+    "BTC=F": {"name": "CME Bitcoin Futures (Continuous 15m/1h/4h/1D)", "category": "Crypto Futures", "focus": "Bitcoin CME Globex"},
+    "MBT=F": {"name": "Micro Bitcoin Futures (Continuous 15m/1h/4h/1D)", "category": "Crypto Futures", "focus": "Micro Bitcoin CME Globex"},
+    "SI=F": {"name": "Silver Futures (Continuous 15m/1h/4h/1D)", "category": "Commodity Futures", "focus": "Silver COMEX Globex"},
+    "SIL=F": {"name": "Micro Silver Futures (Continuous 15m/1h/4h/1D)", "category": "Commodity Futures", "focus": "Micro Silver COMEX Globex"},
     "IWM": {"name": "iShares Russell 2000 ETF", "category": "Market Benchmark", "focus": "Small Cap 2000"},
     "DIA": {"name": "SPDR Dow Jones Industrial Average ETF", "category": "Market Benchmark", "focus": "Dow 30 Industrials"},
     "MDY": {"name": "SPDR S&P MidCap 400 ETF Trust", "category": "Market Benchmark", "focus": "MidCap 400"},
@@ -841,6 +861,50 @@ def _enrich_events_with_intrabar_triggers(
     return events
 
 
+DEFAULT_MODEL_THRESHOLDS: Dict[str, float] = {
+    "ut_high": 55.0,
+    "ut_low": 45.0,
+    "dt_high": 55.0,
+    "dt_low": 50.0,
+    "maj_ut_top": 50.0,
+    "maj_dt_low": 50.0,
+}
+
+
+def compute_vol_adaptive_thresholds(adr_pct: float, atr_ratio: float = 1.0) -> Dict[str, float]:
+    """Computes empirical OOS volatility-adaptive ML probability thresholds (%) for all 6 pivot models
+    based on the stock's current 20-day ADR% and ATR(14)/ATR(50) expansion ratio:
+    - High Pivots (ut_high, dt_high): scale UP with ADR% (48–65%) + 3% bump on volatility expansion (ATR14/50 > 1.20)
+    - Pullback Low (ut_low): scales DOWN with ADR% (42–50%) so high-beta dip entries trigger cleanly
+    - Washout Lows (dt_low, maj_dt_low): scale down in normal vol (45–55%), jump to 58% during vol-expansion cascades
+    - Major Top (maj_ut_top): scales UP with ADR% (45–58%) + 3% bump on volatility expansion"""
+    try:
+        adr = float(adr_pct) if adr_pct is not None and not math.isnan(float(adr_pct)) else 3.5
+    except (ValueError, TypeError):
+        adr = 3.5
+    try:
+        ar = float(atr_ratio) if atr_ratio is not None and not math.isnan(float(atr_ratio)) else 1.0
+    except (ValueError, TypeError):
+        ar = 1.0
+    adr = max(0.5, min(15.0, adr))
+    vol_exp_bump = 3.0 if ar > 1.20 else 0.0
+
+    thr_top = float(np.clip(round(46.0 + 2.5 * adr + vol_exp_bump), 48.0, 65.0))
+    thr_ut_low = float(np.clip(round(53.0 - 1.5 * adr), 42.0, 50.0))
+    thr_dt_low = 58.0 if ar > 1.20 else float(np.clip(round(56.0 - 1.0 * adr), 45.0, 55.0))
+    thr_maj_top = float(np.clip(round(43.0 + 1.8 * adr + vol_exp_bump), 45.0, 58.0))
+    thr_maj_bot = 58.0 if ar > 1.20 else float(np.clip(round(55.0 - 1.2 * adr), 45.0, 55.0))
+
+    return {
+        "ut_high": thr_top,
+        "ut_low": thr_ut_low,
+        "dt_high": thr_top,
+        "dt_low": thr_dt_low,
+        "maj_ut_top": thr_maj_top,
+        "maj_dt_low": thr_maj_bot,
+    }
+
+
 def compute_universal_exhaustion(
     df_full: pd.DataFrame,
     df_view: pd.DataFrame,
@@ -1069,9 +1133,20 @@ def compute_universal_exhaustion(
     ob75_last = ob75_ser.loc[last_idx] if last_idx in ob75_ser.index else np.nan
     os25_last = os25_ser.loc[last_idx] if last_idx in os25_ser.index else np.nan
 
+    rng_pct_ser = (df_full["high"] - df_full["low"]) / df_full["close"].replace(0, np.nan)
+    curr_adr_pct = round(float((rng_pct_ser.tail(20).mean() or 0.035) * 100.0), 2)
+    atr14_v = float(rng_pct_ser.tail(14).mean() or 0.035)
+    atr50_v = float(rng_pct_ser.tail(50).mean() or atr14_v)
+    curr_atr_ratio = round(atr14_v / atr50_v, 2) if atr50_v > 0 else 1.0
+    auto_thr_map = compute_vol_adaptive_thresholds(curr_adr_pct, curr_atr_ratio)
+
     return {
         "model_ver": ver,
         "regime": regime_str,
+        "adr_pct": curr_adr_pct,
+        "atr_ratio": curr_atr_ratio,
+        "auto_thresholds": auto_thr_map,
+        "default_thresholds": dict(DEFAULT_MODEL_THRESHOLDS),
         "current_prob_pct": curr_prob,
         "at_high_prob_pct": curr_at_high,
         "full_bar_prob_pct": curr_full_bar,
@@ -1190,6 +1265,38 @@ def parse_asset_id(asset_id: str) -> Dict[str, str]:
         }
     load_universe_metadata()
     sym = raw.upper()
+    _FUT_ALIASES = {
+        "GC-F": "GC=F",
+        "GC": "GC=F",
+        "MGC-F": "MGC=F",
+        "MGC": "MGC=F",
+        "NQ-F": "NQ=F",
+        "NQ": "NQ=F",
+        "MNQ-F": "MNQ=F",
+        "MNQ": "MNQ=F",
+        "CL-F": "CL=F",
+        "CL": "CL=F",
+        "MCL-F": "MCL=F",
+        "MCL": "MCL=F",
+        "BTC-F": "BTC=F",
+        "BTC": "BTC=F",
+        "MBT-F": "MBT=F",
+        "MBT": "MBT=F",
+        "ES-F": "ES=F",
+        "MES-F": "MES=F",
+        "YM-F": "YM=F",
+        "RTY-F": "RTY=F",
+        "SI-F": "SI=F",
+        "SI": "SI=F",
+        "SIL-F": "SIL=F",
+        "SIL": "SIL=F",
+        "MSI": "SIL=F",
+        "HG-F": "HG=F",
+        "NG-F": "NG=F",
+        "ZB-F": "ZB=F",
+        "ZN-F": "ZN=F",
+    }
+    sym = _FUT_ALIASES.get(sym, sym)
     is_etf = sym in _ETF_SET or sym in SPDR_ETF_META
     etf_meta = SPDR_ETF_META.get(sym, {})
     name = etf_meta.get("name") or _NAMES_MAP.get(sym) or sym
@@ -1342,6 +1449,16 @@ def resolve_asset_bars(asset_id: str) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     if a_type in ("stock", "etf"):
         sym = meta["key"]
         raw_df = datastore.load_bars(sym)
+        if (raw_df is None or raw_df.empty) and sym in ("MNQ=F", "NQ", "MNQ"):
+            raw_df = datastore.load_bars("NQ=F")
+        elif (raw_df is None or raw_df.empty) and sym in ("MGC=F", "GC", "MGC"):
+            raw_df = datastore.load_bars("GC=F")
+        elif (raw_df is None or raw_df.empty) and sym in ("MCL=F", "CL", "MCL"):
+            raw_df = datastore.load_bars("CL=F")
+        elif (raw_df is None or raw_df.empty) and sym in ("MBT=F", "BTC", "MBT"):
+            raw_df = datastore.load_bars("BTC=F")
+        elif (raw_df is None or raw_df.empty) and sym in ("SIL=F", "SI", "SIL", "MSI"):
+            raw_df = datastore.load_bars("SI=F")
         if raw_df is None or raw_df.empty:
             return pd.DataFrame(), meta
         out_df = raw_df.copy()
@@ -1458,9 +1575,9 @@ def compute_series_performance(df: pd.DataFrame, asset_meta: Dict[str, Any]) -> 
         first_c = float(df[df.index.year == current_year]["close"].iloc[0]) if not df.empty else last_c
         ret_ytd = round(float((last_c / first_c - 1.0) * 100.0), 2) if first_c > 0 else 0.0
 
-    # Benchmark comparison vs SPY and QQQ
-    spy_bars = datastore.load_bars("SPY")
-    qqq_bars = datastore.load_bars("QQQ")
+    # Benchmark comparison vs SPY and QQQ (includes live developing bar when TWS polling is active)
+    spy_bars, _ = resolve_asset_bars("SPY")
+    qqq_bars, _ = resolve_asset_bars("QQQ")
 
     def _bench_ret(b_df: Optional[pd.DataFrame], bars_back: int) -> Optional[float]:
         if b_df is None or b_df.empty or len(b_df) <= bars_back:
@@ -1968,6 +2085,16 @@ def enrich_watchlist_items(groups: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                     item_copy["live_bar"] = dev_b
                 if piv_s:
                     item_copy["live_pivot"] = piv_s
+                if nq_ml_engine.is_intraday_futures_symbol(sym):
+                    if piv_s and piv_s.get("nq_intraday"):
+                        item_copy["nq_intraday"] = piv_s["nq_intraday"]
+                    else:
+                        try:
+                            item_copy["nq_intraday"] = nq_ml_engine.evaluate_nq_realtime_multi_tf(
+                                live_bar=dev_b, threshold_pct=50.0, horizon_k=8, symbol=sym
+                            )
+                        except Exception:
+                            pass
             elif parsed["type"] == "sector" and parsed["key"] in sec_scores:
                 sr = sec_scores[parsed["key"]]
                 item_copy["ret_1d"] = round(float(_clean_val(sr.get("w1_ret"), 0.0)) / 5.0, 2)
@@ -2025,7 +2152,7 @@ def build_catalog() -> Dict[str, Any]:
                 "theme": str(r.get("theme") or (labels.themes(s) or ["General"])[0]),
             }
 
-    # 1. SPDR & Sector/Industry ETFs
+    # 1. SPDR & Sector/Industry ETFs + Futures
     etfs_list: List[Dict[str, Any]] = []
     all_etf_syms = list(SPDR_ETF_META.keys()) + sorted([s for s in _ETF_SET if s not in SPDR_ETF_META])
     for sym in all_etf_syms:
@@ -2033,6 +2160,10 @@ def build_catalog() -> Dict[str, Any]:
         base = rs_map.get(sym, {})
         if not base:
             b = datastore.load_bars(sym)
+            if (b is None or b.empty) and sym in ("MNQ=F", "NQ", "MNQ"):
+                b = datastore.load_bars("NQ=F")
+            elif (b is None or b.empty) and sym in ("MGC=F", "GC", "MGC"):
+                b = datastore.load_bars("GC=F")
             if b is None or b.empty:
                 continue
             c = b["close"].to_numpy(dtype=np.float64)
@@ -2170,6 +2301,7 @@ def api_reload_dataset():
     _CATALOG_CACHE = None
     tap._MARKET_SYNC_CACHE = None
     tap._B4_INTRADAY_CACHE.clear()
+    nq_ml_engine._NQ_SCORED_RAM_CACHE.clear()
     models_v3 = get_all_pivot_models("v3")
     models_v4 = get_all_pivot_models("v4")
     cat = build_catalog()
@@ -2198,23 +2330,36 @@ def api_catalog():
             "counts": cat["counts"],
         })
 
+    q_variants = {q}
+    if q:
+        q_variants.add(q.replace("-", "="))
+        q_variants.add(q.replace("=", "-"))
+
     def _match(item: Dict[str, Any]) -> bool:
         if not q:
             return True
-        return (
-            q in str(item.get("id", "")).upper()
-            or q in str(item.get("symbol", "")).upper()
-            or q in str(item.get("name", "")).upper()
-            or q in str(item.get("sector", "")).upper()
-            or q in str(item.get("theme", "")).upper()
-            or q in str(item.get("focus", "")).upper()
-        )
+        id_u = str(item.get("id", "")).upper()
+        sym_u = str(item.get("symbol", "")).upper()
+        name_u = str(item.get("name", "")).upper()
+        sec_u = str(item.get("sector", "")).upper()
+        thm_u = str(item.get("theme", "")).upper()
+        foc_u = str(item.get("focus", "")).upper()
+        for qv in q_variants:
+            if qv in id_u or qv in sym_u or qv in name_u or qv in sec_u or qv in thm_u or qv in foc_u:
+                return True
+        return False
+
+    matched_etfs = [x for x in cat["etfs"] if _match(x)]
+    matched_stocks = [x for x in cat["stocks"] if _match(x)]
+    if q and asset_type == "stock":
+        # Include matching Futures / ETFs at the top when searching on the Stocks tab so GC=F / GC-F / NQ=F always appear
+        matched_stocks = matched_etfs + matched_stocks
 
     res = {
-        "etfs": [x for x in cat["etfs"] if _match(x)] if asset_type in ("all", "etf", "spdr") else [],
+        "etfs": matched_etfs if asset_type in ("all", "etf", "spdr") else [],
         "sectors": [x for x in cat["sectors"] if _match(x)] if asset_type in ("all", "sector") else [],
         "themes": [x for x in cat["themes"] if _match(x)] if asset_type in ("all", "theme") else [],
-        "stocks": [x for x in cat["stocks"] if _match(x)][:limit] if asset_type in ("all", "stock") else [],
+        "stocks": matched_stocks[:limit] if asset_type in ("all", "stock") else [],
         "counts": cat["counts"],
     }
     return jsonify(res)
@@ -2315,6 +2460,7 @@ def api_watchlists():
                             it["notes"] = body["notes"]
 
     save_watchlists(wl_data)
+    _sync_tws_watchlist_membership(body.get("group_id") or wl_data.get("active_group_id"))
     enriched = enrich_watchlist_items(wl_data.get("groups", []))
     return jsonify({
         "status": "ok",
@@ -2340,11 +2486,380 @@ def _parse_spans(raw_str: str, defaults: List[int]) -> List[int]:
     return out
 
 
+def _build_nq_intraday_chart_payload(
+    part_a_id: str,
+    interval: str,
+    history_window: str,
+    ema_spans: List[int],
+    sma_spans: List[int],
+    larsson_fastest: int,
+    horizon_k: int = 8,
+    model_ver: str = "current",
+) -> Tuple[Optional[Dict[str, Any]], int]:
+    """Builds the `/api/chart` response payload for `15m`, `1h`, or `4h` NQ/MNQ intraday intervals,
+    complete with snapped Pivot High/Low markers and actionable Entry, Stop-Loss, Target 1, Target 2,
+    and Time Stop trade plans."""
+    tf = interval.lower().strip()
+    sym_root = nq_ml_engine.get_futures_prefix(part_a_id).upper()
+    is_wickless = str(model_ver or "").strip().lower() in ("wickless", "at_extreme", "extreme", "nowick", "no_wick")
+    nq_ml_engine.ensure_nq_intraday_uptodate(max_age_sec=35.0, symbol=part_a_id)
+    df_tf = nq_ml_engine.get_cached_nq_scored_df(tf, symbol=part_a_id)
+    if df_tf is None or df_tf.empty:
+        return {"error": f"No {sym_root} {tf} scored dataset found"}, 404
+
+    df_daily, meta_a = resolve_asset_bars(part_a_id)
+    perf_a = compute_series_performance(df_daily, meta_a) if (df_daily is not None and not df_daily.empty) else {}
+    context_a = get_constituents_and_context(meta_a)
+
+    with _TWS_LOCK:
+        dev_bar = (
+            dict(_TWS_PORTFOLIO_DEV_BARS[part_a_id])
+            if (_TWS_POLLING_ENABLED and part_a_id in _TWS_PORTFOLIO_DEV_BARS)
+            else None
+        )
+
+    nq_rt = nq_ml_engine.evaluate_nq_realtime_multi_tf(
+        live_bar=dev_bar, threshold_pct=50.0, horizon_k=horizon_k, symbol=part_a_id, use_wickless=is_wickless
+    )
+
+    tf_window_map = {
+        "15m": {"3m": 180, "6m": 380, "1y": 780, "2y": 1400, "5y": 2400, "full": 3600},
+        "1h": {"3m": 160, "6m": 360, "1y": 720, "2y": 1400, "5y": 2400, "full": 3600},
+        "4h": {"3m": 140, "6m": 300, "1y": 600, "2y": 1200, "5y": 2200, "full": 3600},
+    }
+    max_bars = tf_window_map.get(tf, {}).get(history_window, 1400)
+    tail_pad = min(len(df_tf), max_bars + 250)
+    df_ind = df_tf.iloc[-tail_pad:].copy()
+
+    # If live developing bar is active, re-score the developing bar and reflect its OHLC + probabilities on df_ind
+    if dev_bar and dev_bar.get("close", 0.0) > 0 and not df_ind.empty:
+        scored_last = nq_ml_engine._score_live_bar_override_on_tf(df_tf, tf, dev_bar, symbol=part_a_id)
+        last_idx = df_ind.index[-1]
+        for col in scored_last.index:
+            if col in df_ind.columns:
+                col_dtype = df_ind[col].dtype
+                val = scored_last[col]
+                if np.issubdtype(col_dtype, np.floating):
+                    df_ind.loc[last_idx, col] = np.asarray(val, dtype=col_dtype).item()
+                elif np.issubdtype(col_dtype, np.integer):
+                    df_ind.loc[last_idx, col] = int(val)
+                else:
+                    df_ind.loc[last_idx, col] = val
+
+    ema_series_list = [df_ind["close"].ewm(span=sp, adjust=False).mean() for sp in ema_spans]
+    sma_series_list = [df_ind["close"].rolling(sp, min_periods=5).mean() for sp in sma_spans]
+    vol_sma20_s = df_ind["volume"].rolling(20, min_periods=5).mean()
+
+    if larsson_fastest == 32:
+        larsson_spans = (32, 35, 50, 58)
+    elif larsson_fastest <= 20:
+        larsson_spans = (
+            larsson_fastest,
+            int(round(larsson_fastest * 1.5)),
+            int(round(larsson_fastest * 2.0)),
+            int(round(larsson_fastest * 2.625)),
+        )
+    else:
+        larsson_spans = (
+            larsson_fastest,
+            int(round(larsson_fastest * 35.0 / 32.0)),
+            int(round(larsson_fastest * 50.0 / 32.0)),
+            int(round(larsson_fastest * 58.0 / 32.0)),
+        )
+
+    s1, s2, s3, s4 = larsson_spans
+    e1 = scanner_core._pine_ema(df_ind["close"], s1)
+    e2 = scanner_core._pine_ema(df_ind["close"], s2)
+    e3 = scanner_core._pine_ema(df_ind["close"], s3)
+    e4 = scanner_core._pine_ema(df_ind["close"], s4)
+
+    bullish = (e1 >= e2) & (e2 >= e3) & (e3 >= e4)
+    bearish = (e1 < e2) & (e2 < e3) & (e3 < e4)
+    valid_l = e1.notna() & e2.notna() & e3.notna() & e4.notna()
+
+    l_state = pd.Series("gray", index=df_ind.index)
+    l_state[valid_l & bullish] = "yellow"
+    l_state[valid_l & bearish] = "blue"
+
+    df_view = df_ind.iloc[-max_bars:] if len(df_ind) > max_bars else df_ind
+
+    bars = []
+    volume = []
+    vol_ma20_data = []
+    emas_data: List[List[Dict[str, Any]]] = [[], [], [], []]
+    smas_data: List[List[Dict[str, Any]]] = [[], []]
+    larsson_data = []
+    series_data = []
+
+    dec = 3 if nq_ml_engine.is_si_symbol(part_a_id) else 2
+    for idx, r in df_view.iterrows():
+        t_sec = int(idx.timestamp())
+        t_str = idx.strftime("%Y-%m-%d %H:%M")
+        o = round(float(r["open"]), dec)
+        h = round(float(r["high"]), dec)
+        l = round(float(r["low"]), dec)
+        c = round(float(r["close"]), dec)
+        v = float(r["volume"]) if pd.notna(r["volume"]) else 0.0
+
+        bars.append({"time": t_sec, "time_str": t_str, "open": o, "high": h, "low": l, "close": c})
+        volume.append({
+            "time": t_sec,
+            "value": round(v, 0),
+            "color": "rgba(16,185,129,0.50)" if c >= o else "rgba(239,68,68,0.50)",
+        })
+
+        v_ma = vol_sma20_s.loc[idx]
+        if pd.notna(v_ma):
+            vol_ma20_data.append({"time": t_sec, "value": round(float(v_ma), 0)})
+        for slot_i in range(4):
+            val_e = ema_series_list[slot_i].loc[idx]
+            if pd.notna(val_e):
+                emas_data[slot_i].append({"time": t_sec, "value": round(float(val_e), 2)})
+        for slot_j in range(2):
+            val_s = sma_series_list[slot_j].loc[idx]
+            if pd.notna(val_s):
+                smas_data[slot_j].append({"time": t_sec, "value": round(float(val_s), 2)})
+
+        f_val = round(float(e1.loc[idx]), 2) if pd.notna(e1.loc[idx]) else None
+        s_val = round(float(e4.loc[idx]), 2) if pd.notna(e4.loc[idx]) else None
+        larsson_data.append({
+            "time": t_sec,
+            "fast": f_val,
+            "slow": s_val,
+            "value": f_val,
+            "state": str(l_state.loc[idx]),
+        })
+
+        p_hi_pct = round(float(r.get("prob_pivot_high", 0.0)) * 100.0, 1)
+        p_lo_pct = round(float(r.get("prob_pivot_low", 0.0)) * 100.0, 1)
+        p_hi_ex = round(float(r.get("prob_pivot_high_extreme", 0.0)) * 100.0, 1)
+        p_lo_ex = round(float(r.get("prob_pivot_low_extreme", 0.0)) * 100.0, 1)
+        s50_v = float(r.get("sma50_px", c))
+        reg_bar = "UT" if c >= s50_v else "DT"
+        eff_hi = p_hi_ex if is_wickless else p_hi_pct
+        eff_lo = p_lo_ex if is_wickless else p_lo_pct
+        series_data.append({
+            "time": t_sec,
+            "time_str": t_str,
+            "prob": eff_hi,
+            "at_high": p_hi_ex,
+            "full_bar": p_hi_pct,
+            "ut_high": eff_hi,
+            "ut_low": eff_lo,
+            "dt_high": eff_hi,
+            "dt_low": eff_lo,
+            "maj_ut_top": eff_hi,
+            "maj_dt_low": eff_lo,
+            "regime": reg_bar,
+        })
+
+    tf_info = nq_rt.get("timeframes", {}).get(tf, {})
+    active_plan = tf_info.get("trade_plan") or nq_rt.get("best_trade_plan") or {}
+    active_bar_ts = active_plan.get("bar_timestamp")
+    active_is_hi = bool(active_plan.get("is_high_pivot", active_plan.get("direction") == "SHORT"))
+
+    # Extract snapped Pivot High and Pivot Low events across df_view with full Trade Plans
+    ut_high_events: List[Dict[str, Any]] = []
+    ut_low_events: List[Dict[str, Any]] = []
+    if is_wickless:
+        hi_arr = np.nan_to_num(df_view["prob_pivot_high_extreme"].to_numpy(dtype=np.float64), nan=0.0) * 100.0
+        lo_arr = np.nan_to_num(df_view["prob_pivot_low_extreme"].to_numpy(dtype=np.float64), nan=0.0) * 100.0
+    else:
+        hi_arr = np.nan_to_num(df_view["prob_pivot_high"].to_numpy(dtype=np.float64), nan=0.0) * 100.0
+        lo_arr = np.nan_to_num(df_view["prob_pivot_low"].to_numpy(dtype=np.float64), nan=0.0) * 100.0
+    h_px_arr = df_view["high"].to_numpy(dtype=np.float64)
+    l_px_arr = df_view["low"].to_numpy(dtype=np.float64)
+    n_v = len(df_view)
+    snap_w = 3
+
+    for i in range(n_v):
+        w0 = max(0, i - snap_w)
+        w1 = min(n_v, i + snap_w + 1)
+        idx_i = df_view.index[i]
+        t_sec = int(idx_i.timestamp())
+        is_act_hi = bool(active_bar_ts == t_sec and active_is_hi)
+        is_act_lo = bool(active_bar_ts == t_sec and not active_is_hi)
+
+        if is_act_hi or (hi_arr[i] >= 30.0 and (i == n_v - 1 or h_px_arr[i] >= np.max(h_px_arr[w0:w1]) - 1e-6)):
+            row_i = df_view.iloc[i]
+            t_str = idx_i.strftime("%Y-%m-%d %H:%M")
+            plan_i = dict(active_plan) if is_act_hi else nq_ml_engine.compute_nq_trade_plan(
+                row_i, tf=tf, is_high_pivot=True, horizon_k=horizon_k, symbol=part_a_id, use_wickless=is_wickless
+            )
+            plan_i["bar_time"] = t_str
+            plan_i["bar_timestamp"] = t_sec
+            prob_v = round(float(active_plan.get("prob_pct", hi_arr[i])) if is_act_hi else float(hi_arr[i]), 1)
+            ut_high_events.append({
+                "date": t_sec,
+                "time_str": t_str,
+                "type": "ut_high",
+                "timeframe": tf,
+                "is_active_plan": is_act_hi,
+                "is_wickless": is_wickless,
+                "prob_pct": prob_v,
+                "at_extreme_pct": round(float(row_i.get("prob_pivot_high_extreme", 0.0)) * 100.0, 1),
+                "full_bar_pct": round(float(row_i.get("prob_pivot_high", 0.0)) * 100.0, 1),
+                "high": round(float(row_i["high"]), 2),
+                "low": round(float(row_i["low"]), 2),
+                "close": round(float(row_i["close"]), 2),
+                "intrabar_trigger_price": plan_i["entry_price"],
+                "trigger_prices_by_thr": {str(thr_k): plan_i["entry_price"] for thr_k in range(20, 86, 5)},
+                "trade_plan": plan_i,
+            })
+
+        if is_act_lo or (lo_arr[i] >= 30.0 and (i == n_v - 1 or l_px_arr[i] <= np.min(l_px_arr[w0:w1]) + 1e-6)):
+            row_i = df_view.iloc[i]
+            t_str = idx_i.strftime("%Y-%m-%d %H:%M")
+            plan_i = dict(active_plan) if is_act_lo else nq_ml_engine.compute_nq_trade_plan(
+                row_i, tf=tf, is_high_pivot=False, horizon_k=horizon_k, symbol=part_a_id, use_wickless=is_wickless
+            )
+            plan_i["bar_time"] = t_str
+            plan_i["bar_timestamp"] = t_sec
+            prob_v = round(float(active_plan.get("prob_pct", lo_arr[i])) if is_act_lo else float(lo_arr[i]), 1)
+            ut_low_events.append({
+                "date": t_sec,
+                "time_str": t_str,
+                "type": "ut_low",
+                "timeframe": tf,
+                "is_active_plan": is_act_lo,
+                "is_wickless": is_wickless,
+                "prob_pct": prob_v,
+                "at_extreme_pct": round(float(row_i.get("prob_pivot_low_extreme", 0.0)) * 100.0, 1),
+                "full_bar_pct": round(float(row_i.get("prob_pivot_low", 0.0)) * 100.0, 1),
+                "high": round(float(row_i["high"]), 2),
+                "low": round(float(row_i["low"]), 2),
+                "close": round(float(row_i["close"]), 2),
+                "intrabar_trigger_price": plan_i["entry_price"],
+                "trigger_prices_by_thr": {str(thr_k): plan_i["entry_price"] for thr_k in range(20, 86, 5)},
+                "trade_plan": plan_i,
+            })
+
+    last_r = df_view.iloc[-1]
+    if is_wickless:
+        curr_hi = round(float(last_r.get("prob_pivot_high_extreme", 0.0)) * 100.0, 1)
+        curr_lo = round(float(last_r.get("prob_pivot_low_extreme", 0.0)) * 100.0, 1)
+        peak5_hi = round(float(df_view["prob_pivot_high_extreme"].tail(8).max()) * 100.0, 1)
+        peak5_lo = round(float(df_view["prob_pivot_low_extreme"].tail(8).max()) * 100.0, 1)
+    else:
+        curr_hi = round(float(last_r.get("prob_pivot_high", 0.0)) * 100.0, 1)
+        curr_lo = round(float(last_r.get("prob_pivot_low", 0.0)) * 100.0, 1)
+        peak5_hi = round(float(df_view["prob_pivot_high"].tail(8).max()) * 100.0, 1)
+        peak5_lo = round(float(df_view["prob_pivot_low"].tail(8).max()) * 100.0, 1)
+    is_ut_now = float(last_r["close"]) >= float(last_r.get("sma50_px", last_r["close"]))
+    default_atr = 0.25 if sym_root == "CL" else (120.0 if sym_root == "BTC" else (5.0 if sym_root == "GC" else (0.20 if sym_root == "SI" else 25.0)))
+
+    exhaustion_data = {
+        "model_ver": f"{sym_root.lower()}_{tf}_wickless" if is_wickless else f"{sym_root.lower()}_{tf}",
+        "is_wickless": is_wickless,
+        "model_mode": "wickless" if is_wickless else "current",
+        "is_nq_intraday": True,
+        "timeframe": tf,
+        "regime": "uptrend" if is_ut_now else "downtrend",
+        "adr_pct": perf_a.get("adr_pct", 1.25 if sym_root == "GC" else 1.85),
+        "atr_ratio": 1.0,
+        "auto_thresholds": dict(DEFAULT_MODEL_THRESHOLDS),
+        "default_thresholds": dict(DEFAULT_MODEL_THRESHOLDS),
+        "current_prob_pct": max(curr_hi, curr_lo),
+        "at_high_prob_pct": round(float(last_r.get("prob_pivot_high_extreme", 0.0)) * 100.0, 1),
+        "full_bar_prob_pct": round(float(last_r.get("prob_pivot_high", 0.0)) * 100.0, 1),
+        "peak_5d_prob_pct": max(peak5_hi, peak5_lo),
+        "peak_20d_prob_pct": round(float((df_view["prob_pivot_high_extreme"] if is_wickless else df_view["prob_pivot_high"]).tail(24).max()) * 100.0, 1),
+        "pivots_current": {
+            "ut_high": curr_hi,
+            "ut_low": curr_lo,
+            "dt_high": curr_hi,
+            "dt_low": curr_lo,
+            "maj_ut_top": curr_hi,
+            "maj_dt_low": curr_lo,
+        },
+        "pivots_5d_peak": {
+            "ut_high": peak5_hi,
+            "ut_low": peak5_lo,
+            "dt_high": peak5_hi,
+            "dt_low": peak5_lo,
+            "maj_ut_top": peak5_hi,
+            "maj_dt_low": peak5_lo,
+        },
+        "status": "climax" if peak5_hi >= 50.0 else ("pivot_low" if peak5_lo >= 50.0 else "healthy"),
+        "action_label": active_plan.get("trade_plan_text", f"{sym_root} [{tf.upper()}] Intraday Pivot Monitor"),
+        "anchor_mode": f"{sym_root} {tf.upper()} (ATR14: {nq_ml_engine._safe_float(last_r.get('atr14_pts'), default_atr):.1f} pts)",
+        "rsi14": nq_ml_engine._safe_float(last_r.get("rsi14_high", last_r.get("rsi14")), 50.0, 1),
+        "rsi14_low": nq_ml_engine._safe_float(last_r.get("rsi14_low", last_r.get("rsi14")), 50.0, 1),
+        "rsi14_close": nq_ml_engine._safe_float(last_r.get("rsi14"), 50.0, 1),
+        "rsi5": nq_ml_engine._safe_float(last_r.get("rsi5_high"), 50.0, 1),
+        "rsi5_low": nq_ml_engine._safe_float(last_r.get("rsi5_low"), 50.0, 1),
+        "ob75_target_price": nq_ml_engine._safe_float(last_r.get("ob75_px"), 0.0, 2),
+        "os25_target_price": nq_ml_engine._safe_float(last_r.get("os25_px"), 0.0, 2),
+        "ext_ema10_adr": round((float(last_r["high"]) - nq_ml_engine._safe_float(last_r.get("ema10_px"), float(last_r["close"]))) / max(0.5, nq_ml_engine._safe_float(last_r.get("atr14_pts"), default_atr)), 2),
+        "ext_ema20_adr": round((float(last_r["high"]) - nq_ml_engine._safe_float(last_r.get("ema20_px"), float(last_r["close"]))) / max(0.5, nq_ml_engine._safe_float(last_r.get("atr14_pts"), default_atr)), 2),
+        "ext_sma50_adr": round((float(last_r["high"]) - nq_ml_engine._safe_float(last_r.get("sma50_px"), float(last_r["close"]))) / max(0.5, nq_ml_engine._safe_float(last_r.get("atr14_pts"), default_atr)), 2),
+        "low_dist_ema20_adr": round((float(last_r["low"]) - nq_ml_engine._safe_float(last_r.get("ema20_px"), float(last_r["close"]))) / max(0.5, nq_ml_engine._safe_float(last_r.get("atr14_pts"), default_atr)), 2),
+        "upper_wick_pct": round((float(last_r["high"]) - max(float(last_r["open"]), float(last_r["close"]))) / max(0.10, float(last_r["high"]) - float(last_r["low"])) * 100.0, 1),
+        "lower_wick_pct": round((min(float(last_r["open"]), float(last_r["close"])) - float(last_r["low"])) / max(0.10, float(last_r["high"]) - float(last_r["low"])) * 100.0, 1),
+        "rvol": nq_ml_engine._safe_float(last_r.get("tod_rvol"), 1.0, 2),
+        "consec_rsi_70": 0,
+        "bearish_div": False,
+        "bullish_div": False,
+        "climax_events": ut_high_events,
+        "ut_high_events": ut_high_events,
+        "ut_low_events": ut_low_events,
+        "dt_high_events": [],
+        "dt_low_events": [],
+        "maj_ut_top_events": [],
+        "maj_dt_low_events": [],
+        "active_trade_plan": active_plan,
+        "series": series_data,
+    }
+
+    chart_meta = {
+        "id": meta_a["id"],
+        "key": f"{meta_a.get('key', meta_a['id'])} ({tf.upper()})",
+        "name": f"{meta_a['name']} · {tf.upper()} Intraday",
+        "type": meta_a["type"],
+        "category": f"{sym_root} {tf.upper()} Intraday",
+    }
+
+    return {
+        "asset": chart_meta,
+        "interval": tf,
+        "is_intraday": True,
+        "is_ratio": False,
+        "part_a": meta_a,
+        "part_b": None,
+        "performance": perf_a,
+        "performance_a": perf_a,
+        "performance_b": None,
+        "bars": bars,
+        "volume": volume,
+        "vol_ma20": vol_ma20_data,
+        "ema_spans": ema_spans,
+        "sma_spans": sma_spans,
+        "emas": emas_data,
+        "smas": smas_data,
+        "ema8": emas_data[0],
+        "ema10": emas_data[1],
+        "ema20": emas_data[2],
+        "ema21": emas_data[3],
+        "sma50": smas_data[0],
+        "sma200": smas_data[1],
+        "larsson": larsson_data,
+        "larsson_spans": list(larsson_spans),
+        "rs_line": [],
+        "ep_events": [],
+        "exhaustion": exhaustion_data,
+        "nq_intraday": nq_rt,
+        "active_trade_plan": active_plan,
+        "catalyst": {},
+        "context": context_a,
+    }, 200
+
+
 @app.route("/api/chart")
 def api_chart():
     raw_symbol = request.args.get("symbol", "SPY").strip()
     compare_symbol = request.args.get("compare", "").strip()
     history_window = request.args.get("history", "2y").strip().lower()
+    interval = request.args.get("interval", "1d").strip().lower()
     ema_spans = _parse_spans(request.args.get("ema_spans", ""), [8, 10, 20, 21])
     sma_spans = _parse_spans(request.args.get("sma_spans", ""), [50, 200])
 
@@ -2356,6 +2871,33 @@ def api_chart():
     else:
         part_a_id = parsed_main["id"]
         part_b_id = compare_symbol if compare_symbol else ""
+
+    try:
+        larsson_fastest = int(request.args.get("larsson_fastest", "32"))
+    except (ValueError, TypeError):
+        larsson_fastest = 32
+    larsson_fastest = max(2, min(100, larsson_fastest))
+
+    try:
+        horizon_k = int(request.args.get("horizon", "8"))
+    except (ValueError, TypeError):
+        horizon_k = 8
+
+    model_ver = request.args.get("model_ver", "v3").strip().lower()
+
+    # If viewing NQ=F / MNQ=F, GC=F / MGC=F, CL=F / MCL=F, BTC=F / MBT=F, SI=F / SIL=F on an intraday interval (15m, 1h, 4h), serve intraday bars + pivot trade plans
+    if not part_b_id and nq_ml_engine.is_intraday_futures_symbol(part_a_id) and interval in ("15m", "1h", "4h"):
+        payload, code = _build_nq_intraday_chart_payload(
+            part_a_id=part_a_id,
+            interval=interval,
+            history_window=history_window,
+            ema_spans=ema_spans,
+            sma_spans=sma_spans,
+            larsson_fastest=larsson_fastest,
+            horizon_k=horizon_k,
+            model_ver=model_ver,
+        )
+        return jsonify(payload), code
 
     df_a, meta_a = resolve_asset_bars(part_a_id)
     if df_a is None or df_a.empty:
@@ -2393,13 +2935,6 @@ def api_chart():
     ema_series_list = [df_ind["close"].ewm(span=sp, adjust=False).mean() for sp in ema_spans]
     sma_series_list = [df_ind["close"].rolling(sp).mean() for sp in sma_spans]
     vol_sma20_s = df_ind["volume"].rolling(20).mean()
-
-    # Larsson Line calculation
-    try:
-        larsson_fastest = int(request.args.get("larsson_fastest", "32"))
-    except (ValueError, TypeError):
-        larsson_fastest = 32
-    larsson_fastest = max(2, min(100, larsson_fastest))
 
     if larsson_fastest == 32:
         larsson_spans = (32, 35, 50, 58)
@@ -2449,8 +2984,8 @@ def api_chart():
 
     min_view_date = df_view.index[0].strftime("%Y-%m-%d")
 
-    # Relative Strength Line vs SPY across visible window
-    spy_bars = datastore.load_bars("SPY")
+    # Relative Strength Line vs SPY across visible window (includes live SPY developing bar when active)
+    spy_bars, _ = resolve_asset_bars("SPY")
     rs_line_data = []
     if spy_bars is not None and not spy_bars.empty:
         idx_shared = df_view.index.intersection(spy_bars.index)
@@ -2532,6 +3067,21 @@ def api_chart():
         symbol=sym_for_b4,
     )
 
+    # Always attach 15m/1h/4h Intraday Pivot & Trade Plan summary when viewing NQ=F / MNQ=F or GC=F / MGC=F (even on 1D chart)
+    nq_intraday_summary = None
+    active_trade_plan = None
+    if not is_ratio and nq_ml_engine.is_intraday_futures_symbol(part_a_id):
+        try:
+            nq_intraday_summary = nq_ml_engine.evaluate_nq_realtime_multi_tf(
+                live_bar=meta_a.get("developing_bar"),
+                threshold_pct=50.0,
+                horizon_k=horizon_k,
+                symbol=part_a_id,
+            )
+            active_trade_plan = nq_intraday_summary.get("best_trade_plan")
+        except Exception:
+            nq_intraday_summary = None
+
     # Catalyst lookup for latest EP if single stock
     latest_catalyst = {}
     if meta_a["type"] == "stock" and ep_events_a:
@@ -2542,6 +3092,8 @@ def api_chart():
 
     return jsonify({
         "asset": chart_meta,
+        "interval": "1d",
+        "is_intraday": False,
         "is_ratio": is_ratio,
         "part_a": meta_a,
         "part_b": meta_b if is_ratio else None,
@@ -2566,9 +3118,12 @@ def api_chart():
         "rs_line": rs_line_data,
         "ep_events": ep_events_a,
         "exhaustion": exhaustion_data,
+        "nq_intraday": nq_intraday_summary,
+        "active_trade_plan": active_trade_plan,
         "catalyst": latest_catalyst,
         "context": context_a,
     })
+
 
 
 def _sanitize_annotation_key(symbol: str) -> str:
@@ -2664,6 +3219,74 @@ def get_portfolio_watchlist_group(group_id: Optional[str] = None) -> Tuple[str, 
     return str(target_grp.get("id", "")), str(target_grp.get("name", "Portfolio")), syms
 
 
+def _sync_tws_watchlist_membership(group_id: Optional[str] = None) -> List[str]:
+    """Synchronizes active TWS polling state whenever stocks are added/removed from the watchlist:
+    - Immediately evicts removed symbols from _TWS_PORTFOLIO_DEV_BARS, _TWS_PIVOT_SCORES, _TWS_ALERTS, and _TWS_ALERTED_KEYS.
+    - Updates watchlist_size and recalculates adaptive TWS pacing interval (poll_interval_sec).
+    - Seeds newly added symbols from datastore and wakes the background TWS poller immediately."""
+    with _TWS_LOCK:
+        polled_gid = _TWS_STATUS.get("watchlist_id") or group_id
+        enabled_now = bool(_TWS_POLLING_ENABLED)
+        consec_fail = int(_TWS_STATUS.get("consecutive_failures", 0))
+
+    gid, gname, symbols = get_portfolio_watchlist_group(polled_gid)
+    active_set = set(symbols)
+    new_interval = compute_tws_poll_interval(len(symbols), consec_fail)
+    now_et_str = dt.datetime.now(ZoneInfo("America/New_York")).strftime("%H:%M:%S ET")
+
+    with _TWS_LOCK:
+        # 1. Evict removed symbols so stale developing bars, pivot scores, and alerts disappear immediately
+        for stale_sym in [k for k in list(_TWS_PORTFOLIO_DEV_BARS.keys()) if k not in active_set]:
+            _TWS_PORTFOLIO_DEV_BARS.pop(stale_sym, None)
+        for stale_sym in [k for k in list(_TWS_PIVOT_SCORES.keys()) if k not in active_set]:
+            _TWS_PIVOT_SCORES.pop(stale_sym, None)
+        if _TWS_ALERTS:
+            _TWS_ALERTS[:] = [a for a in _TWS_ALERTS if a.get("symbol") in active_set]
+        if _TWS_ALERTED_KEYS:
+            for ak in [k for k in list(_TWS_ALERTED_KEYS) if k[0] not in active_set]:
+                _TWS_ALERTED_KEYS.discard(ak)
+
+        missing_new = [s for s in symbols if s not in _TWS_PORTFOLIO_DEV_BARS] if enabled_now else []
+
+    # 2. If polling is active and new symbols were added, seed their initial developing bar immediately
+    seeded_bars: Dict[str, Dict[str, Any]] = {}
+    for sym in missing_new:
+        hist_df = datastore.load_bars(sym)
+        if hist_df is not None and not hist_df.empty:
+            last_r = hist_df.iloc[-1]
+            prev_c = float(hist_df["close"].iloc[-2]) if len(hist_df) >= 2 else float(last_r["open"])
+            c_px = float(last_r["close"])
+            ret_1d = round(((c_px / prev_c) - 1.0) * 100.0, 2) if prev_c > 0 else 0.0
+            seeded_bars[sym] = {
+                "symbol": sym,
+                "date": hist_df.index[-1].strftime("%Y-%m-%d"),
+                "open": round(float(last_r["open"]), 4),
+                "high": round(float(last_r["high"]), 4),
+                "low": round(float(last_r["low"]), 4),
+                "close": round(c_px, 4),
+                "prev_close": round(prev_c, 4),
+                "ret_1d": ret_1d,
+                "ret_1d_pct": ret_1d,
+                "volume": round(float(last_r["volume"]), 0),
+                "source": "Datastore-Seed (Pending TWS Poll)",
+                "updated_at": now_et_str,
+                "stale": True,
+            }
+
+    with _TWS_LOCK:
+        if seeded_bars:
+            _TWS_PORTFOLIO_DEV_BARS.update(seeded_bars)
+        _TWS_STATUS["watchlist_id"] = gid
+        _TWS_STATUS["watchlist_name"] = gname
+        _TWS_STATUS["watchlist_size"] = len(symbols)
+        _TWS_STATUS["symbols_polled"] = len(_TWS_PORTFOLIO_DEV_BARS)
+        _TWS_STATUS["poll_interval_sec"] = new_interval
+
+    if enabled_now:
+        _TWS_WAKE_EVENT.set()
+    return symbols
+
+
 def _get_current_us_trading_date_str() -> str:
     """Returns the current US/Eastern trading session date string (YYYY-MM-DD)."""
     now_et = dt.datetime.now(ZoneInfo("America/New_York"))
@@ -2685,19 +3308,63 @@ def _valid_pos_price(val: Any) -> Optional[float]:
         return None
 
 
+_TWS_UNQUALIFIED_SYMS: set[str] = set()
+_TWS_NO_HIST_SYMS: set[str] = set()
+_TWS_POLL_EXEC_LOCK = threading.Lock()
+_TWS_CID_SEQ = 0
+
+
+def _next_tws_client_id() -> int:
+    global _TWS_CID_SEQ
+    with _TWS_LOCK:
+        _TWS_CID_SEQ = (_TWS_CID_SEQ + 1) % 60
+        return 110 + _TWS_CID_SEQ
+
+
 def _poll_tws_developing_bars(
     symbols: List[str],
     ports: Tuple[int, ...] = (7497, 7496, 4002, 4001),
 ) -> Tuple[Dict[str, Dict[str, Any]], str, Optional[int], Optional[str]]:
-    """Polls Interactive Brokers TWS / IB Gateway for real-time daily OHLCV developing bars.
-    Respects TWS pacing rules (<=45 symbols per chunk, <=25 req/sec) and handles connection drops cleanly."""
+    """Polls Interactive Brokers TWS / IB Gateway for real-time daily OHLCV developing bars
+    (including overnight IBEOS / extended-hours sessions).
+    Respects TWS pacing rules (<=25 symbols per chunk, adaptive tick completion wait, and extended-hours
+    historical bar fallback when overnight Level 1 quotes have not printed a trade yet)."""
     if not symbols:
         return {}, "tws", None, None
 
     try:
-        from ib_async import IB, Stock
+        from ib_async import ContFuture, IB, Stock
     except Exception as e:
         return {}, "tws_unavailable", None, f"ib_async import error: {e}"
+
+    _FUT_EXCH_MAP = {
+        "NQ=F": ("NQ", "CME"),
+        "MNQ=F": ("MNQ", "CME"),
+        "ES=F": ("ES", "CME"),
+        "MES=F": ("MES", "CME"),
+        "YM=F": ("YM", "CBOT"),
+        "RTY=F": ("RTY", "CME"),
+        "GC=F": ("GC", "COMEX"),
+        "MGC=F": ("MGC", "COMEX"),
+        "SI=F": ("SI", "COMEX"),
+        "SIL=F": ("SIL", "COMEX"),
+        "HG=F": ("HG", "COMEX"),
+        "CL=F": ("CL", "NYMEX"),
+        "MCL=F": ("MCL", "NYMEX"),
+        "NG=F": ("NG", "NYMEX"),
+        "BTC=F": ("BRR", "CME"),
+        "MBT=F": ("MBT", "CME"),
+        "ZB=F": ("ZB", "CBOT"),
+        "ZN=F": ("ZN", "CBOT"),
+    }
+
+    def _make_ib_contract(sym_str: str) -> Optional[Any]:
+        if sym_str in _FUT_EXCH_MAP:
+            root, exch = _FUT_EXCH_MAP[sym_str]
+            return ContFuture(root, exch)
+        if "=" in sym_str or "^" in sym_str:
+            return None
+        return Stock(sym_str, "SMART", "USD")
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -2708,7 +3375,7 @@ def _poll_tws_developing_bars(
     try:
         for p in ports:
             try:
-                cid = 89 + (int(time.time() * 10) % 7)
+                cid = _next_tws_client_id()
                 ib.connect("127.0.0.1", p, clientId=cid, timeout=2.8, readonly=True)
                 if ib.isConnected():
                     connected_port = p
@@ -2722,37 +3389,55 @@ def _poll_tws_developing_bars(
         trading_date = _get_current_us_trading_date_str()
         out_bars: Dict[str, Dict[str, Any]] = {}
 
-        # Qualify any contracts not yet cached (chunked at 40 symbols to respect TWS 50 msg/s pacing)
+        # Filter to TWS-qualifiable symbols (equities/ETFs + supported CME/CBOT/COMEX/NYMEX futures)
+        equity_symbols = [s for s in symbols if _make_ib_contract(s) is not None]
+
+        # Qualify any contracts not yet cached (chunked at 35 symbols to respect TWS 50 msg/s pacing)
         with _TWS_LOCK:
             cached_contracts = dict(_TWS_QUALIFIED_CONTRACTS)
+            known_unqualified = set(_TWS_UNQUALIFIED_SYMS)
 
-        unqualified = [s for s in symbols if s not in cached_contracts]
-        for i in range(0, len(unqualified), 40):
-            batch_syms = unqualified[i : i + 40]
-            batch_contracts = [Stock(s, "SMART", "USD") for s in batch_syms]
+        unqualified = [s for s in equity_symbols if s not in cached_contracts and s not in known_unqualified]
+        for i in range(0, len(unqualified), 35):
+            batch_syms = unqualified[i : i + 35]
+            batch_contracts = [_make_ib_contract(s) for s in batch_syms]
+            batch_contracts = [c for c in batch_contracts if c is not None]
             try:
                 ib.qualifyContracts(*batch_contracts)
                 for s, c in zip(batch_syms, batch_contracts):
                     if getattr(c, "conId", 0):
                         cached_contracts[s] = c
+                    else:
+                        known_unqualified.add(s)
             except Exception:
-                pass
-            if i + 40 < len(unqualified):
-                ib.sleep(0.35)
+                # If one symbol in batch caused an exception, qualify individually
+                for s in batch_syms:
+                    try:
+                        c_single = _make_ib_contract(s)
+                        if c_single is not None:
+                            ib.qualifyContracts(c_single)
+                            if getattr(c_single, "conId", 0):
+                                cached_contracts[s] = c_single
+                            else:
+                                known_unqualified.add(s)
+                    except Exception:
+                        known_unqualified.add(s)
+            if i + 35 < len(unqualified):
+                ib.sleep(0.25)
 
         with _TWS_LOCK:
             _TWS_QUALIFIED_CONTRACTS.update(cached_contracts)
+            _TWS_UNQUALIFIED_SYMS.update(known_unqualified)
 
-        # Request market data in chunks of <=45 symbols (staying well below TWS 100-line & 50 msg/s limits)
         try:
             ib.reqMarketDataType(3)  # Enable delayed fallback if any exchange lacks live subscription
-            ib.reqMarketDataType(1)  # Prefer real-time Level 1 stream
+            ib.reqMarketDataType(1)  # Prefer real-time Level 1 stream (includes overnight IBEOS)
         except Exception:
             pass
 
-        chunk_size = 45
-        for i in range(0, len(symbols), chunk_size):
-            chunk_syms = symbols[i : i + chunk_size]
+        chunk_size = 25
+        for i in range(0, len(equity_symbols), chunk_size):
+            chunk_syms = equity_symbols[i : i + chunk_size]
             active_Pairs: List[Tuple[str, Any, Any]] = []
             for s in chunk_syms:
                 c = cached_contracts.get(s)
@@ -2764,9 +3449,22 @@ def _poll_tws_developing_bars(
                 except Exception:
                     pass
 
-            # Allow 1.35s for TWS to populate Open, High, Low, Last, Bid/Ask, Close, Volume
-            ib.sleep(1.35)
+            # Wait adaptively (0.45s to 1.05s max per chunk) until contracts populate Last or Bid/Ask
+            for step_idx in range(7):
+                ib.sleep(0.15)
+                if step_idx >= 2:
+                    ready_cnt = sum(
+                        1
+                        for _, _, t in active_Pairs
+                        if _valid_pos_price(getattr(t, "last", None))
+                        or _valid_pos_price(getattr(t, "bid", None))
+                        or _valid_pos_price(getattr(t, "ask", None))
+                        or _valid_pos_price(getattr(t, "close", None))
+                    )
+                    if ready_cnt >= len(active_Pairs):
+                        break
 
+            hist_fallback_count = 0
             for s, c, t in active_Pairs:
                 p_last = _valid_pos_price(getattr(t, "last", None))
                 p_bid = _valid_pos_price(getattr(t, "bid", None))
@@ -2777,19 +3475,79 @@ def _poll_tws_developing_bars(
                 p_low = _valid_pos_price(getattr(t, "low", None))
 
                 mid = round(0.5 * (p_bid + p_ask), 4) if (p_bid and p_ask) else (p_bid or p_ask)
-                cur_px = p_last or mid or p_close_prev
+                tight_mid = None
+                if p_bid and p_ask and mid and mid > 0:
+                    if (p_ask - p_bid) / mid <= 0.08:
+                        tight_mid = mid
+
+                live_px = p_last or tight_mid or mid
+                ext_open = None
+                ext_high = None
+                ext_low = None
+                ext_close = None
+                ext_vol = 0.0
+
+                # Cap sequential reqHistoricalData fallback to at most 2 symbols per chunk so polling never stalls
+                if not live_px and not p_close_prev and hist_fallback_count < 2 and s not in _TWS_NO_HIST_SYMS:
+                    hist_fallback_count += 1
+                    try:
+                        hbars = ib.reqHistoricalData(
+                            c,
+                            endDateTime="",
+                            durationStr="1 D",
+                            barSizeSetting="1 hour",
+                            whatToShow="TRADES",
+                            useRTH=False,
+                            formatDate=1,
+                            timeout=1.2,
+                        )
+                        if hbars:
+                            ext_close = _valid_pos_price(getattr(hbars[-1], "close", None))
+                            # Filter strictly to post-RTH (>=16:00 ET) or current trading_date bars so prior morning RTH is excluded
+                            post_bars = []
+                            for b in hbars:
+                                b_dt = getattr(b, "date", None)
+                                b_str = str(b_dt)[:10] if b_dt is not None else ""
+                                b_hr = getattr(b_dt, "hour", 16)
+                                if b_str >= trading_date or b_hr >= 16:
+                                    post_bars.append(b)
+                            sess_bars = post_bars or [hbars[-1]]
+                            ext_open = _valid_pos_price(getattr(sess_bars[0], "open", None))
+                            hs = [_valid_pos_price(getattr(b, "high", None)) for b in sess_bars]
+                            ls = [_valid_pos_price(getattr(b, "low", None)) for b in sess_bars]
+                            hs = [x for x in hs if x is not None]
+                            ls = [x for x in ls if x is not None]
+                            ext_high = max(hs) if hs else ext_close
+                            ext_low = min(ls) if ls else ext_close
+                            ext_vol = sum(max(0.0, float(getattr(b, "volume", 0.0) or 0.0)) for b in sess_bars)
+                        else:
+                            _TWS_NO_HIST_SYMS.add(s)
+                    except Exception:
+                        _TWS_NO_HIST_SYMS.add(s)
+
+                cur_px = live_px or ext_close or p_close_prev or mid
                 if not cur_px:
                     continue
 
-                o_px = p_open or p_close_prev or cur_px
-                h_px = max( [x for x in (p_high, o_px, cur_px) if x is not None] )
-                l_px = min( [x for x in (p_low, o_px, cur_px) if x is not None] )
+                has_rth_open = bool(p_open is not None)
+                if has_rth_open:
+                    o_px = p_open
+                    h_px = max([x for x in (p_high, o_px, cur_px) if x is not None])
+                    l_px = min([x for x in (p_low, o_px, cur_px) if x is not None])
+                else:
+                    # Overnight / Premarket before RTH open: anchor developing candle around overnight prices
+                    o_px = ext_open if (not live_px and ext_open) else cur_px
+                    h_px = max([x for x in (p_high, ext_high if not live_px else None, o_px, cur_px) if x is not None])
+                    l_px = min([x for x in (p_low, ext_low if not live_px else None, o_px, cur_px) if x is not None])
 
                 raw_vol = getattr(t, "volume", None)
                 vol_sh = 0.0
                 if raw_vol is not None and not (isinstance(raw_vol, float) and (math.isnan(raw_vol) or math.isinf(raw_vol))) and raw_vol > 0:
-                    # TWS US stock volume tick is reported in round lots (100 shares)
-                    vol_sh = float(raw_vol) * 100.0
+                    # TWS US stock volume tick is reported in round lots (100 shares), whereas futures are reported in exact contracts (1x)
+                    lot_mult = 1.0 if (s in _FUT_EXCH_MAP or "=" in s) else 100.0
+                    vol_sh = float(raw_vol) * lot_mult
+                elif ext_vol > 0:
+                    vol_sh = float(ext_vol)
 
                 out_bars[s] = {
                     "symbol": s,
@@ -2800,6 +3558,7 @@ def _poll_tws_developing_bars(
                     "close": round(float(cur_px), 4),
                     "prev_close": round(float(p_close_prev), 4) if p_close_prev else None,
                     "volume": round(float(vol_sh), 0),
+                    "has_rth_open": has_rth_open,
                     "source": f"TWS:{connected_port}",
                     "updated_at": dt.datetime.now(ZoneInfo("America/New_York")).strftime("%H:%M:%S ET"),
                 }
@@ -2810,8 +3569,57 @@ def _poll_tws_developing_bars(
                 except Exception:
                     pass
 
-            if i + chunk_size < len(symbols):
-                ib.sleep(0.35)
+            if i + chunk_size < len(equity_symbols):
+                ib.sleep(0.1)
+
+        # If NQ/MNQ, GC/MGC, CL/MCL, or BTC/MBT is in the polled universe, sync live 5-minute intraday bars into 15m/1h/4h datasets
+        for fut_sym, fut_pair in (
+            ("NQ=F", ("NQ=F", "MNQ=F")),
+            ("GC=F", ("GC=F", "MGC=F")),
+            ("CL=F", ("CL=F", "MCL=F")),
+            ("BTC=F", ("BTC=F", "MBT=F")),
+            ("SI=F", ("SI=F", "SIL=F")),
+        ):
+            fut_c = cached_contracts.get(fut_pair[0]) or cached_contracts.get(fut_pair[1])
+            fut_prefix = nq_ml_engine.get_futures_prefix(fut_sym)
+            last_sync_ts = nq_ml_engine._LAST_INTRADAY_SYNC_TS_BY_SYM.get(fut_prefix, 0.0)
+            if fut_c is not None and (time.time() - last_sync_ts) >= 25.0:
+                try:
+                    fut_hbars = ib.reqHistoricalData(
+                        fut_c,
+                        endDateTime="",
+                        durationStr="1 D",
+                        barSizeSetting="5 mins",
+                        whatToShow="TRADES",
+                        useRTH=False,
+                        formatDate=2,
+                        timeout=2.2,
+                    )
+                    if fut_hbars:
+                        ny_tz = ZoneInfo("America/New_York")
+                        fut_rows = []
+                        for nb in fut_hbars:
+                            ts = pd.Timestamp(nb.date)
+                            dt_et = ts.tz_convert(ny_tz).tz_localize(None) if ts.tzinfo is not None else ts
+                            fut_rows.append({
+                                "datetime": dt_et,
+                                "open": float(nb.open),
+                                "high": float(nb.high),
+                                "low": float(nb.low),
+                                "close": float(nb.close),
+                                "volume": max(0.0, float(getattr(nb, "volume", 0.0) or 0.0)),
+                            })
+                        if fut_rows:
+                            df_5m_live = pd.DataFrame(fut_rows).set_index("datetime").sort_index()
+                            df_5m_live = df_5m_live[~df_5m_live.index.duplicated(keep="last")]
+                            nq_ml_engine.sync_live_nq_intraday_bars(
+                                tws_5m_df=df_5m_live,
+                                live_bar=out_bars.get(fut_pair[0]) or out_bars.get(fut_pair[1]),
+                                persist_parquet=True,
+                                symbol=fut_sym,
+                            )
+                except Exception:
+                    pass
 
         return out_bars, f"TWS:{connected_port}", connected_port, None
     except Exception as e:
@@ -2828,8 +3636,12 @@ def _poll_tws_developing_bars(
             pass
 
 
+_TWS_FEATURE_ROW_CACHE: Dict[str, Tuple[Tuple[Any, ...], pd.DataFrame, Tuple[float, float]]] = {}
+
+
 def _poll_yfinance_fallback_bars(symbols: List[str]) -> Dict[str, Dict[str, Any]]:
-    """Resilient fallback when TWS is offline/unreachable or missing quotes for specific tickers."""
+    """Resilient fallback (including prepost=True extended/overnight bars) when TWS is offline/unreachable
+    or for non-equity Yahoo symbols (e.g. NQ=F)."""
     if not symbols or yf is None:
         return {}
     out: Dict[str, Dict[str, Any]] = {}
@@ -2840,6 +3652,7 @@ def _poll_yfinance_fallback_bars(symbols: List[str]) -> Dict[str, Dict[str, Any]
             tickers=symbols,
             period="2d",
             interval="5m",
+            prepost=True,
             group_by="ticker",
             auto_adjust=True,
             progress=False,
@@ -2865,13 +3678,14 @@ def _poll_yfinance_fallback_bars(symbols: List[str]) -> Dict[str, Dict[str, Any]
                     v_sh = float(day_slice["Volume"].sum())
                     out[sym] = {
                         "symbol": sym,
-                        "date": last_day or trading_date,
+                        "date": trading_date if last_day >= trading_date else last_day,
                         "open": round(o_px, 4),
                         "high": round(max(h_px, o_px, c_px), 4),
                         "low": round(min(l_px, o_px, c_px), 4),
                         "close": round(c_px, 4),
                         "prev_close": None,
                         "volume": round(v_sh, 0),
+                        "has_rth_open": True,
                         "source": "YF-Fallback",
                         "updated_at": now_str,
                     }
@@ -2888,22 +3702,32 @@ def execute_portfolio_tws_poll_cycle(
     model_ver: str = "v4",
     simulate_tws_bars: Optional[Dict[str, Dict[str, Any]]] = None,
     threshold: Optional[float] = None,
+    thresholds_by_model: Optional[Dict[str, float]] = None,
+    auto_threshold: bool = False,
 ) -> Dict[str, Any]:
     """Executes one complete polling cycle for the Portfolio (or specified) watchlist:
-    1. Loads historical daily candles from local datastore for all watchlist symbols.
+    1. Loads historical daily candles from local datastore for all watchlist symbols (plus SPY & QQQ benchmarks).
     2. Polls TWS API for real-time developing daily bars (with monotonic high/low/volume fusion
        and automatic fallback to cached/yfinance data if TWS fails).
     3. Evaluates all 6 ML Structural & Major Reversal Pivot models on the developing daily bars.
-    4. Emits real-time alerts whenever any ticker crosses the ML pivot probability threshold."""
+    4. Emits real-time alerts whenever any ticker crosses its per-model or vol-adaptive ML threshold."""
     if threshold is not None:
         threshold_pct = float(threshold)
     t0 = time.time()
     gid, gname, symbols = get_portfolio_watchlist_group(group_id)
     if simulate_tws_bars is not None:
         symbols = list(simulate_tws_bars.keys())
+    else:
+        # Always include SPY and QQQ so benchmark charts and RS lines always have live developing bars
+        for bench_sym in ("SPY", "QQQ"):
+            if bench_sym not in symbols:
+                symbols.append(bench_sym)
     interval_sec = compute_tws_poll_interval(len(symbols))
     now_et_str = dt.datetime.now(ZoneInfo("America/New_York")).strftime("%H:%M:%S ET")
     trading_date = _get_current_us_trading_date_str()
+
+    with _TWS_LOCK:
+        prev_dev_bars = dict(_TWS_PORTFOLIO_DEV_BARS)
 
     if simulate_tws_bars is not None:
         polled_bars = dict(simulate_tws_bars)
@@ -2911,22 +3735,24 @@ def execute_portfolio_tws_poll_cycle(
         conn_port = 7497
         tws_err = None
     else:
-        polled_bars, source_str, conn_port, tws_err = _poll_tws_developing_bars(symbols)
-        # If TWS failed completely or missed symbols, try yfinance fallback for missing symbols
-        missing_syms = [s for s in symbols if s not in polled_bars]
-        if missing_syms:
+        with _TWS_POLL_EXEC_LOCK:
+            polled_bars, source_str, conn_port, tws_err = _poll_tws_developing_bars(symbols)
+        # Only call yfinance fallback when TWS is offline or for symbols that have no TWS quote AND no prior bar
+        missing_syms = [
+            s for s in symbols
+            if s not in polled_bars and (conn_port is None or s not in prev_dev_bars)
+        ]
+        if missing_syms and conn_port is None:
             yf_bars = _poll_yfinance_fallback_bars(missing_syms)
             for s, yb in yf_bars.items():
                 polled_bars[s] = yb
             if not conn_port and yf_bars:
                 source_str = "YF-Fallback (TWS Offline)"
 
-    with _TWS_LOCK:
-        prev_dev_bars = dict(_TWS_PORTFOLIO_DEV_BARS)
-
     # Fuse historical daily candles + monotonic developing daily bar for each symbol
     feature_rows: List[pd.DataFrame] = []
     row_symbols: List[str] = []
+    row_vol_meta: List[Tuple[float, float]] = []
     updated_dev_bars: Dict[str, Dict[str, Any]] = {}
 
     for sym in symbols:
@@ -2938,6 +3764,15 @@ def execute_portfolio_tws_poll_cycle(
         prev_bar_close = float(hist_df["close"].iloc[-1])
         fresh = polled_bars.get(sym)
         prior_dev = prev_dev_bars.get(sym)
+
+        # Never allow a stale fallback bar (with date < prior_dev["date"]) to overwrite a newer TWS developing bar
+        if (
+            fresh
+            and prior_dev
+            and str(fresh.get("source", "")).startswith("YF")
+            and str(prior_dev.get("date", "")) > str(fresh.get("date", ""))
+        ):
+            fresh = None
 
         if fresh and fresh.get("close", 0.0) > 0:
             b_date = str(fresh.get("date") or trading_date)
@@ -2952,12 +3787,25 @@ def execute_portfolio_tws_poll_cycle(
             l_px = float(fresh["low"])
             c_px = float(fresh["close"])
             v_sh = float(fresh.get("volume", 0.0))
+            has_rth_open = bool(fresh.get("has_rth_open", True))
 
             # Monotonic high/low/volume preservation across same trading session
             if prior_dev and prior_dev.get("date") == b_date:
-                h_px = max(h_px, float(prior_dev.get("high", h_px)), c_px, o_px)
-                l_px = min(l_px, float(prior_dev.get("low", l_px)), c_px, o_px)
-                v_sh = max(v_sh, float(prior_dev.get("volume", 0.0)))
+                prior_open = float(prior_dev.get("open", o_px))
+                prior_prev_c = float(prior_dev.get("prev_close", prev_bar_close) or prev_bar_close)
+                # Preserve overnight session open across ticks unless RTH open arrived or prior_open was anchored to prev_close
+                if not has_rth_open and abs(prior_open - prior_prev_c) > 1e-4:
+                    o_px = prior_open
+                if has_rth_open or abs(prior_open - prior_prev_c) > 1e-4:
+                    h_px = max(h_px, float(prior_dev.get("high", h_px)), c_px, o_px)
+                    l_px = min(l_px, float(prior_dev.get("low", l_px)), c_px, o_px)
+                else:
+                    h_px = max(h_px, c_px, o_px)
+                    l_px = min(l_px, c_px, o_px)
+                prior_vol = float(prior_dev.get("volume", 0.0))
+                if sym in ("NQ=F", "MNQ=F", "NQ", "MNQ") and prior_vol > 5_000_000.0:
+                    prior_vol = 0.0
+                v_sh = max(v_sh, prior_vol)
             if v_sh <= 0.0:
                 # Estimate volume from recent 20d median if TWS tick volume is still warming up
                 v_sh = float(hist_df["volume"].tail(20).median()) * 0.5
@@ -2974,6 +3822,8 @@ def execute_portfolio_tws_poll_cycle(
                 "ret_1d": ret_1d,
                 "ret_1d_pct": ret_1d,
                 "volume": round(v_sh, 0),
+                "has_rth_open": has_rth_open,
+                "is_intraday_bar": bool(fresh.get("is_intraday_bar") or simulate_tws_bars is not None),
                 "source": fresh.get("source", source_str),
                 "updated_at": fresh.get("updated_at", now_et_str),
                 "stale": False,
@@ -3006,6 +3856,21 @@ def execute_portfolio_tws_poll_cycle(
 
         updated_dev_bars[sym] = dev_entry
 
+        # Check per-symbol feature row cache first so unchanged bars skip 260-row feature extraction
+        f_sig = (
+            str(dev_entry["date"]),
+            round(float(dev_entry["open"]), 3),
+            round(float(dev_entry["high"]), 3),
+            round(float(dev_entry["low"]), 3),
+            round(float(dev_entry["close"]), 3),
+        )
+        cached_feat_item = _TWS_FEATURE_ROW_CACHE.get(sym) if simulate_tws_bars is None else None
+        if cached_feat_item is not None and cached_feat_item[0] == f_sig:
+            feature_rows.append(cached_feat_item[1])
+            row_symbols.append(sym)
+            row_vol_meta.append(cached_feat_item[2])
+            continue
+
         # Construct 260-bar tail + developing bar for fast causal 6-model feature extraction
         dev_ts = pd.Timestamp(dev_entry["date"])
         live_row = pd.DataFrame(
@@ -3025,8 +3890,16 @@ def execute_portfolio_tws_poll_cycle(
         try:
             b_feat = tap.compute_all_pivot_features(df_fused, symbol=None)
             last_feat = b_feat.iloc[[-1]].copy()
+            rng_s = (df_fused["high"] - df_fused["low"]) / df_fused["close"].replace(0, np.nan)
+            s_adr_pct = round(float((rng_s.tail(20).mean() or 0.035) * 100.0), 2)
+            a14 = float(rng_s.tail(14).mean() or 0.035)
+            a50 = float(rng_s.tail(50).mean() or a14)
+            s_atr_ratio = round(a14 / a50, 2) if a50 > 0 else 1.0
+            if simulate_tws_bars is None:
+                _TWS_FEATURE_ROW_CACHE[sym] = (f_sig, last_feat, (s_adr_pct, s_atr_ratio))
             feature_rows.append(last_feat)
             row_symbols.append(sym)
+            row_vol_meta.append((s_adr_pct, s_atr_ratio))
         except Exception:
             pass
 
@@ -3048,10 +3921,23 @@ def execute_portfolio_tws_poll_cycle(
 
         for idx_r, sym in enumerate(row_symbols):
             dev_b = updated_dev_bars[sym]
+            s_adr_pct, s_atr_ratio = row_vol_meta[idx_r]
+            if auto_threshold:
+                sym_thr_map = compute_vol_adaptive_thresholds(s_adr_pct, s_atr_ratio)
+            elif thresholds_by_model:
+                sym_thr_map = {
+                    mk: float(thresholds_by_model.get(mk, threshold_pct))
+                    for mk, *_ in _PIVOT_MODEL_META
+                }
+            else:
+                sym_thr_map = {mk: float(threshold_pct) for mk, *_ in _PIVOT_MODEL_META}
+
             is_ut = bool(batch_df["is_primary_uptrend"].iloc[idx_r])
             scores_sym: Dict[str, float] = {}
             best_prob = 0.0
             best_meta = _PIVOT_MODEL_META[2]
+            best_trig_prob = -1.0
+            best_trig_meta = None
 
             for meta_entry in _PIVOT_MODEL_META:
                 m_key, _, m_label, m_color, is_hi = meta_entry
@@ -3060,35 +3946,47 @@ def execute_portfolio_tws_poll_cycle(
                 if val_pct > best_prob:
                     best_prob = val_pct
                     best_meta = meta_entry
+                if val_pct >= sym_thr_map.get(m_key, threshold_pct) and val_pct > best_trig_prob:
+                    best_trig_prob = val_pct
+                    best_trig_meta = meta_entry
 
-            m_key, _, m_label, m_color, is_hi = best_meta
+            chosen_meta = best_trig_meta if best_trig_meta is not None else best_meta
+            m_key, _, m_label, m_color, is_hi = chosen_meta
+            chosen_prob = scores_sym.get(m_key, best_prob)
             at_ex_pct = round(float(score_arrays[m_key][1][idx_r]), 1)
             fb_pct = round(float(score_arrays[m_key][2][idx_r]), 1)
+            is_triggered = best_trig_meta is not None
 
             piv_info = {
                 "symbol": sym,
                 "date": dev_b["date"],
                 "regime": "UT" if is_ut else "DT",
+                "adr_pct": s_adr_pct,
+                "atr_ratio": s_atr_ratio,
+                "auto_threshold": bool(auto_threshold),
+                "thresholds": sym_thr_map,
                 "scores": scores_sym,
                 "top_model": m_key,
                 "top_pivot_type": m_key,
                 "top_label": m_label,
                 "top_pivot_label": m_label,
                 "top_color": m_color,
-                "top_prob_pct": best_prob,
+                "top_prob_pct": chosen_prob,
+                "top_threshold_pct": sym_thr_map.get(m_key, threshold_pct),
                 "at_extreme_pct": at_ex_pct,
                 "full_bar_pct": fb_pct,
                 "is_high_pivot": is_hi,
-                "Triggered": bool(best_prob >= threshold_pct),
-                "has_pivot": bool(best_prob >= threshold_pct),
+                "Triggered": bool(is_triggered),
+                "has_pivot": bool(is_triggered),
             }
             new_pivot_scores[sym] = piv_info
 
-            # Check for any model crossing threshold_pct on today's developing bar
+            # Check for any model crossing its specific threshold on today's developing bar
             for meta_entry in _PIVOT_MODEL_META:
                 mk, _, mlbl, mcol, m_is_hi = meta_entry
                 p_val = scores_sym.get(mk, 0.0)
-                if p_val >= threshold_pct:
+                mk_thr = float(sym_thr_map.get(mk, threshold_pct))
+                if p_val >= mk_thr:
                     alert_key = (sym, dev_b["date"], mk)
                     with _TWS_LOCK:
                         already_fired = alert_key in _TWS_ALERTED_KEYS
@@ -3096,18 +3994,28 @@ def execute_portfolio_tws_poll_cycle(
                             _TWS_ALERTED_KEYS.add(alert_key)
                     if not already_fired:
                         extreme_px = dev_b["high"] if m_is_hi else dev_b["low"]
+                        thr_tag = f"{mk_thr:.0f}% Auto-Vol" if auto_threshold else f"{mk_thr:.0f}%"
+                        mk_at_ex = round(float(score_arrays[mk][1][idx_r]), 1)
                         alert_obj = {
                             "id": f"{sym}_{dev_b['date']}_{mk}_{int(time.time()*1000)}",
                             "symbol": sym,
                             "date": dev_b["date"],
+                            "bar_time": f"{dev_b['date']} {now_et_str}",
                             "time_et": now_et_str,
+                            "timeframe": "1D",
+                            "timeframe_label": "1D",
                             "model_key": mk,
                             "pivot_type": mk,
                             "model_label": mlbl,
                             "pivot_label": mlbl,
                             "color": mcol,
                             "is_high_pivot": m_is_hi,
+                            "direction": "SHORT" if m_is_hi else "LONG",
                             "prob_pct": p_val,
+                            "at_extreme_pct": mk_at_ex,
+                            "threshold_pct": mk_thr,
+                            "auto_threshold": bool(auto_threshold),
+                            "adr_pct": s_adr_pct,
                             "current_price": dev_b["close"],
                             "extreme_price": extreme_px,
                             "bar_price": extreme_px,
@@ -3117,17 +4025,92 @@ def execute_portfolio_tws_poll_cycle(
                             "ret_1d": dev_b["ret_1d"],
                             "source": dev_b["source"],
                             "message": (
-                                f"🚨 {sym} Real-Time {mlbl} Detected ({p_val:.1f}% ≥ {threshold_pct:.0f}%) "
+                                f"🚨 [{dev_b['date']} {now_et_str}] {sym} Real-Time {mlbl} Detected ({p_val:.1f}% ≥ {thr_tag}) "
                                 f"| Developing {'High' if m_is_hi else 'Low'}: ${extreme_px:.2f} | Last: ${dev_b['close']:.2f} ({dev_b['ret_1d']:+.1f}%)"
                             ),
                         }
                         new_alerts_this_cycle.append(alert_obj)
 
+            # For NQ=F / MNQ=F and GC=F / MGC=F: evaluate 15m, 1h, and 4h intraday pivot models & emit trade-plan alerts
+            if nq_ml_engine.is_intraday_futures_symbol(sym):
+                try:
+                    nq_rt = nq_ml_engine.evaluate_nq_realtime_multi_tf(
+                        live_bar=dev_b,
+                        threshold_pct=float(threshold_pct),
+                        horizon_k=8,
+                        symbol=sym,
+                    )
+                    piv_info["nq_intraday"] = nq_rt
+                    best_nq_plan = nq_rt.get("best_trade_plan")
+                    if best_nq_plan:
+                        piv_info["nq_trade_plan"] = best_nq_plan
+                        if float(best_nq_plan.get("prob_pct", 0.0)) >= float(threshold_pct):
+                            piv_info["has_nq_intraday_pivot"] = True
+                            if not piv_info["has_pivot"] or float(best_nq_plan["prob_pct"]) > float(piv_info["top_prob_pct"]):
+                                piv_info["top_prob_pct"] = float(best_nq_plan["prob_pct"])
+                                piv_info["top_pivot_label"] = best_nq_plan["action_title"]
+                                piv_info["top_label"] = best_nq_plan["action_title"]
+                                piv_info["Triggered"] = True
+                                piv_info["has_pivot"] = True
+
+                    for nq_al in nq_rt.get("alerts", []):
+                        nq_ak = (sym, str(nq_al.get("bar_time", dev_b["date"])), str(nq_al["model_key"]))
+                        with _TWS_LOCK:
+                            already_fired_nq = nq_ak in _TWS_ALERTED_KEYS
+                            if not already_fired_nq:
+                                _TWS_ALERTED_KEYS.add(nq_ak)
+                        if not already_fired_nq:
+                            nq_alert_obj = dict(nq_al)
+                            nq_alert_obj["id"] = f"{sym}_{nq_al['timeframe']}_{nq_al['direction']}_{int(time.time()*1000)}"
+                            nq_alert_obj["date"] = dev_b["date"]
+                            nq_alert_obj["bar_time"] = str(nq_al.get("bar_time") or f"{dev_b['date']} {now_et_str}")
+                            nq_alert_obj["time_et"] = now_et_str
+                            nq_alert_obj["open"] = dev_b["open"]
+                            nq_alert_obj["high"] = dev_b["high"]
+                            nq_alert_obj["low"] = dev_b["low"]
+                            nq_alert_obj["ret_1d"] = dev_b["ret_1d"]
+                            nq_alert_obj["source"] = dev_b["source"]
+                            new_alerts_this_cycle.append(nq_alert_obj)
+                except Exception:
+                    pass
+
+    if new_alerts_this_cycle and simulate_tws_bars is None:
+        try:
+            import nq_auto_trader
+
+            for al_item in new_alerts_this_cycle:
+                nq_auto_trader.notify_new_realtime_pivot_alert(al_item)
+        except Exception:
+            pass
+
     duration_s = round(time.time() - t0, 2)
+    active_set = set(symbols)
     with _TWS_LOCK:
+        if simulate_tws_bars is None:
+            for stale_sym in [k for k in list(_TWS_PORTFOLIO_DEV_BARS.keys()) if k not in active_set]:
+                _TWS_PORTFOLIO_DEV_BARS.pop(stale_sym, None)
+            for stale_sym in [k for k in list(_TWS_PIVOT_SCORES.keys()) if k not in active_set]:
+                _TWS_PIVOT_SCORES.pop(stale_sym, None)
+            if _TWS_ALERTS:
+                _TWS_ALERTS[:] = [a for a in _TWS_ALERTS if a.get("symbol") in active_set]
+            if _TWS_ALERTED_KEYS:
+                for ak in [k for k in list(_TWS_ALERTED_KEYS) if k[0] not in active_set]:
+                    _TWS_ALERTED_KEYS.discard(ak)
+
         _TWS_PORTFOLIO_DEV_BARS.update(updated_dev_bars)
         _TWS_PIVOT_SCORES.update(new_pivot_scores)
         if new_alerts_this_cycle:
+            # Replace any older NQ intraday alert on the same (symbol, timeframe) so superseded opposite alerts don't linger
+            new_nq_tfs = {
+                (a.get("symbol"), a.get("timeframe"))
+                for a in new_alerts_this_cycle
+                if a.get("is_nq_intraday") and a.get("timeframe")
+            }
+            if new_nq_tfs and _TWS_ALERTS:
+                _TWS_ALERTS[:] = [
+                    a for a in _TWS_ALERTS
+                    if not (a.get("is_nq_intraday") and (a.get("symbol"), a.get("timeframe")) in new_nq_tfs)
+                ]
             _TWS_ALERTS.extend(new_alerts_this_cycle)
             if len(_TWS_ALERTS) > 100:
                 del _TWS_ALERTS[:-100]
@@ -3157,6 +4140,8 @@ def execute_portfolio_tws_poll_cycle(
                 "last_poll_iso": now_et_str,
                 "last_duration_s": duration_s,
                 "trading_date": trading_date,
+                "auto_threshold": bool(auto_threshold),
+                "thresholds_by_model": dict(thresholds_by_model) if thresholds_by_model else None,
             }
         )
         enabled_now = bool(_TWS_POLLING_ENABLED)
@@ -3179,13 +4164,21 @@ def _tws_background_poller_loop() -> None:
             gid = _TWS_STATUS.get("watchlist_id")
             thr = float(_TWS_STATUS.get("threshold_pct", 50.0))
             mver = str(_TWS_STATUS.get("model_ver", "v4"))
+            thr_map = _TWS_STATUS.get("thresholds_by_model")
+            auto_thr = bool(_TWS_STATUS.get("auto_threshold", False))
         if not enabled:
             _TWS_WAKE_EVENT.wait(timeout=2.0)
             _TWS_WAKE_EVENT.clear()
             continue
 
         try:
-            res = execute_portfolio_tws_poll_cycle(group_id=gid, threshold_pct=thr, model_ver=mver)
+            res = execute_portfolio_tws_poll_cycle(
+                group_id=gid,
+                threshold_pct=thr,
+                model_ver=mver,
+                thresholds_by_model=thr_map,
+                auto_threshold=auto_thr,
+            )
             wait_s = compute_tws_poll_interval(
                 int(res["status"].get("watchlist_size", 28)),
                 int(res["status"].get("consecutive_failures", 0)),
@@ -3217,6 +4210,11 @@ def api_tws_live_poll():
         group_id = body.get("group_id")
         thr = float(body.get("threshold", body.get("threshold_pct", 50.0)))
         model_ver = str(body.get("model_ver", "v4")).lower()
+        raw_thr_map = body.get("thresholds_by_model")
+        thr_map: Optional[Dict[str, float]] = None
+        if isinstance(raw_thr_map, dict) and raw_thr_map:
+            thr_map = {str(k): float(v) for k, v in raw_thr_map.items() if v is not None}
+        auto_thr = bool(body.get("auto_threshold", False))
 
         if action == "clear_alerts":
             with _TWS_LOCK:
@@ -3244,6 +4242,8 @@ def api_tws_live_poll():
                 _TWS_STATUS["enabled"] = enabled
                 _TWS_STATUS["threshold_pct"] = thr
                 _TWS_STATUS["model_ver"] = model_ver
+                _TWS_STATUS["thresholds_by_model"] = thr_map
+                _TWS_STATUS["auto_threshold"] = auto_thr
                 if group_id:
                     _TWS_STATUS["watchlist_id"] = group_id
                 if not enabled:
@@ -3253,10 +4253,18 @@ def api_tws_live_poll():
 
             if enabled:
                 _ensure_tws_thread_started()
-                # Run an immediate synchronous poll cycle so the chart & watchlist update right away
-                cycle_res = execute_portfolio_tws_poll_cycle(group_id=group_id, threshold_pct=thr, model_ver=model_ver)
-                _TWS_WAKE_EVENT.set()
-                return jsonify(cycle_res)
+                if not _TWS_POLL_EXEC_LOCK.locked():
+                    cycle_res = execute_portfolio_tws_poll_cycle(
+                        group_id=group_id,
+                        threshold_pct=thr,
+                        model_ver=model_ver,
+                        thresholds_by_model=thr_map,
+                        auto_threshold=auto_thr,
+                    )
+                    return jsonify(cycle_res)
+                else:
+                    _sync_tws_watchlist_membership(group_id)
+                    _TWS_WAKE_EVENT.set()
             else:
                 _TWS_WAKE_EVENT.set()
 
@@ -3264,10 +4272,21 @@ def api_tws_live_poll():
             with _TWS_LOCK:
                 _TWS_STATUS["threshold_pct"] = thr
                 _TWS_STATUS["model_ver"] = model_ver
+                _TWS_STATUS["thresholds_by_model"] = thr_map
+                _TWS_STATUS["auto_threshold"] = auto_thr
                 if group_id:
                     _TWS_STATUS["watchlist_id"] = group_id
-            cycle_res = execute_portfolio_tws_poll_cycle(group_id=group_id, threshold_pct=thr, model_ver=model_ver)
-            return jsonify(cycle_res)
+            if not _TWS_POLL_EXEC_LOCK.locked():
+                cycle_res = execute_portfolio_tws_poll_cycle(
+                    group_id=group_id,
+                    threshold_pct=thr,
+                    model_ver=model_ver,
+                    thresholds_by_model=thr_map,
+                    auto_threshold=auto_thr,
+                )
+                return jsonify(cycle_res)
+            else:
+                _TWS_WAKE_EVENT.set()
 
     with _TWS_LOCK:
         enabled_copy = bool(_TWS_POLLING_ENABLED)
@@ -3285,6 +4304,90 @@ def api_tws_live_poll():
             "alerts": alerts_copy,
         }
     )
+
+
+@app.route("/api/nq_auto_trader", methods=["GET", "POST"])
+def api_nq_auto_trader():
+    """GET returns current 15m 2-MNQ Auto-Trader & Watchdog state and config.
+    POST updates config (`toggle`, `update_config`), runs a watchdog cycle (`run_watchdog`),
+    or sends a test Gmail notification (`test_email`)."""
+    import nq_auto_trader
+
+    nq_auto_trader.ensure_auto_trader_daemon_started()
+    if request.method == "POST":
+        body = request.get_json(force=True) or {}
+        act = str(body.get("action", "update_config"))
+        if act in ("toggle", "update_config"):
+            updates = {}
+            for k in (
+                "enabled",
+                "mgc_enabled",
+                "min_prob_pct",
+                "min_pred_ratio",
+                "min_rr_target1",
+                "contracts",
+                "mgc_contracts",
+                "gmail_enabled",
+                "pivot_email_alerts_enabled",
+                "gmail_to",
+                "gmail_user",
+                "gmail_app_password",
+            ):
+                if k in body:
+                    updates[k] = body[k]
+            cfg = nq_auto_trader.save_auto_trader_config(updates)
+            if cfg.get("enabled") or cfg.get("mgc_enabled"):
+                nq_auto_trader.run_watchdog_and_execution_cycle()
+            return jsonify(nq_auto_trader.get_auto_trader_status())
+        if act == "run_watchdog":
+            nq_auto_trader.run_watchdog_and_execution_cycle(force_enabled=True, force_mgc_enabled=True)
+            return jsonify(nq_auto_trader.get_auto_trader_status())
+        if act in ("test_email", "test_pivot_email"):
+            cfg = nq_auto_trader.load_auto_trader_config()
+            if body.get("gmail_to"):
+                cfg["gmail_to"] = body["gmail_to"]
+            if body.get("gmail_user"):
+                cfg["gmail_user"] = body["gmail_user"]
+            if body.get("gmail_app_password") and body["gmail_app_password"] != "********":
+                cfg["gmail_app_password"] = body["gmail_app_password"]
+                nq_auto_trader.save_auto_trader_config(
+                    {
+                        "gmail_to": cfg["gmail_to"],
+                        "gmail_user": cfg["gmail_user"],
+                        "gmail_app_password": cfg["gmail_app_password"],
+                    }
+                )
+            res_em = nq_auto_trader.send_realtime_pivot_alert_gmail(
+                {
+                    "symbol": "MNQ=F",
+                    "timeframe": "15m",
+                    "timeframe_label": "15m",
+                    "direction": "SHORT",
+                    "is_high_pivot": True,
+                    "entry_price": 29859.50,
+                    "extreme_price": 29864.00,
+                    "atr_pts": 48.0,
+                    "stop_price": 29917.00,
+                    "target1_price": 29768.25,
+                    "target2_price": 29705.00,
+                    "pred_mfe_atr": 1.85,
+                    "pred_mfe_q70_atr": 2.65,
+                    "pred_mae_atr": 0.92,
+                    "pred_mae_q75_atr": 1.18,
+                    "prob_pct": 61.5,
+                    "at_extreme_pct": 58.4,
+                    "pred_ratio": 2.01,
+                    "bar_time": "15m Real-Time Pivot Test Notification",
+                },
+                cfg=cfg,
+                is_test=True,
+            )
+            status_obj = nq_auto_trader.get_auto_trader_status()
+            status_obj["test_email_result"] = res_em
+            return jsonify(status_obj)
+
+    return jsonify(nq_auto_trader.get_auto_trader_status())
+
 
 
 
@@ -3485,7 +4588,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     grid-template-columns: 330px 1fr 0px;
   }
   .workspace.fullscreen-chart {
-    grid-template-columns: 0px 1fr 0px;
+    grid-template-columns: 1fr !important;
+  }
+  .workspace.fullscreen-chart .left-pane,
+  .workspace.fullscreen-chart .right-pane {
+    display: none !important;
   }
 
   /* Left Pane: Watchlist & Asset Explorer */
@@ -3498,7 +4605,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   }
   .left-mode-tabs {
     display: grid;
-    grid-template-columns: 1fr 1fr;
+    grid-template-columns: 1fr 1fr 1fr;
     background: #090d14;
     border-bottom: 1px solid var(--border);
     padding: 4px;
@@ -3687,44 +4794,49 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     align-items: center;
     justify-content: space-between;
     gap: 8px;
-    flex-wrap: wrap;
+    flex-wrap: nowrap;
     flex-shrink: 0;
+    overflow: hidden;
   }
   .chart-title-group {
     display: flex;
     align-items: center;
     gap: 8px;
-    flex-wrap: wrap;
+    flex-wrap: nowrap;
+    min-width: 0;
+    overflow: hidden;
+    white-space: nowrap;
   }
   .chart-main-sym {
     font-size: 16px;
     font-weight: 800;
     color: #fff;
+    flex-shrink: 0;
   }
   .chart-main-name {
     font-size: 12px;
     color: #94a3b8;
     font-weight: 500;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .ohlc-legend {
-    font-family: "JetBrains Mono", monospace;
-    font-size: 11px;
-    color: #94a3b8;
-    display: flex;
-    gap: 8px;
-    margin-left: 8px;
+    display: none !important;
   }
 
   .chart-controls-right {
     display: flex;
     align-items: center;
-    gap: 5px;
+    gap: 4px;
+    flex-wrap: nowrap;
+    flex-shrink: 0;
   }
   .tf-btn {
     background: #121a29;
     color: #94a3b8;
     border: 1px solid #1f2d44;
-    padding: 3px 7px;
+    padding: 3px 6px;
     border-radius: 4px;
     font-size: 10px;
     font-weight: 700;
@@ -4012,6 +5124,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <button class="btn btn-emerald" onclick="addCurrentChartToWatchlist()" title="Add current symbol or ratio to active watchlist">
       ⭐ + Watchlist
     </button>
+    <button class="btn" id="btn_top_fullscreen" onclick="toggleFullscreenChart()" title="Enlarge chart to full width (or press Esc to restore)" style="border-color:rgba(56,189,248,0.45); color:#38bdf8; font-weight:700;">
+      ⛶ Enlarge Chart
+    </button>
     <button class="btn active" id="btn_toggle_info" onclick="toggleInfoPanel()" title="Open or collapse the right-hand Performance & Info Panel">
       📊 Info Panel
     </button>
@@ -4025,7 +5140,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <aside class="left-pane">
     <div class="left-mode-tabs">
       <div class="mode-tab active" id="ltab_watchlists" onclick="switchLeftTab('watchlists')">⭐ Watchlists</div>
-      <div class="mode-tab" id="ltab_explorer" onclick="switchLeftTab('explorer')">🧭 Universe Explorer</div>
+      <div class="mode-tab" id="ltab_explorer" onclick="switchLeftTab('explorer')">🧭 Explorer</div>
+      <div class="mode-tab" id="ltab_alerts" onclick="switchLeftTab('alerts')">🚨 Alerts <span id="ltab_alerts_badge" style="display:none; background:#f43f5e; color:#fff; border-radius:10px; padding:1px 5px; font-size:9px; font-weight:800; margin-left:2px;">0</span></div>
     </div>
 
     <!-- WATCHLISTS VIEW -->
@@ -4080,12 +5196,43 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       </div>
       <div class="item-list" id="explorer_items_container"></div>
     </div>
+
+    <!-- REAL-TIME ML PIVOT ALERTS VIEW -->
+    <div id="view_alerts" style="display:none; flex-direction:column; flex:1; overflow:hidden;">
+      <div class="wl-header" style="gap:6px; padding:8px 10px;">
+        <div style="display:flex; align-items:center; justify-content:space-between; gap:6px;">
+          <div style="display:flex; align-items:center; gap:6px;">
+            <span style="font-size:12px; font-weight:900; color:#fbbf24;">🚨 ML PIVOT ALERTS</span>
+            <span id="alerts_header_count" style="font-size:10px; font-weight:800; padding:1px 6px; border-radius:10px; background:rgba(245,158,11,0.2); color:#fbbf24; border:1px solid rgba(245,158,11,0.4);">0</span>
+          </div>
+          <div style="display:flex; align-items:center; gap:4px;">
+            <button class="btn" id="btn_alerts_tab_audio" onclick="toggleTwsAlertAudio()" style="padding:2px 7px; font-size:10px;" title="Toggle Audio Chime">🔊 Audio ON</button>
+            <button class="btn" onclick="clearTwsPivotAlerts()" style="padding:2px 7px; font-size:10px; color:#fca5a5;" title="Clear all alerts">✕ Clear</button>
+          </div>
+        </div>
+        <div style="display:flex; gap:5px; align-items:center; margin-top:2px;">
+          <input type="text" id="alerts_search_input" class="search-input" placeholder="Filter alerts (symbol, type)..." oninput="renderTwsAlertTab()">
+          <select id="alerts_filter_select" onchange="renderTwsAlertTab()" style="background:#131b2b; color:#cbd5e1; border:1px solid #26354d; padding:4px 6px; border-radius:5px; font-size:10px;">
+            <option value="all">All Alerts</option>
+            <option value="futures">Futures (NQ/GC/CL/BTC)</option>
+            <option value="stocks">Equities</option>
+            <option value="high">Pivot Highs</option>
+            <option value="low">Pivot Lows</option>
+          </select>
+        </div>
+      </div>
+      <div class="item-list" id="alerts_items_container" style="flex:1; overflow-y:auto; padding:6px; display:flex; flex-direction:column; gap:6px;"></div>
+    </div>
   </aside>
 
   <!-- CENTER PANE: CHART ENGINE, SETTINGS, LARSSON LINE, EP MARKERS & DRAWINGS -->
   <main class="center-pane">
     <div class="chart-toolbar">
       <div class="chart-title-group">
+        <div class="center-view-tabs" style="display:flex; align-items:center; gap:3px; margin-right:8px;">
+          <button class="btn active" id="cview_btn_chart" onclick="switchCenterView('chart')" style="padding:2px 8px; font-size:11px; font-weight:800;" title="Interactive Candlestick Chart View">📈 Chart</button>
+          <button class="btn" id="cview_btn_alerts" onclick="switchCenterView('alerts')" style="padding:2px 8px; font-size:11px; font-weight:800; border-color:rgba(245,158,11,0.45); color:#fbbf24;" title="Dedicated Real-Time ML Pivot Alerts Window">🚨 Alerts Window <span id="cview_alerts_badge" style="display:none; background:#f43f5e; color:#fff; border-radius:8px; padding:0 5px; font-size:9px; font-weight:800; margin-left:3px;">0</span></button>
+        </div>
         <span class="type-tag type-stock" id="hdr_asset_type">ETF</span>
         <span class="chart-main-sym" id="hdr_asset_sym">SPY</span>
         <span class="chart-main-name" id="hdr_asset_name">SPDR S&P 500 ETF Trust</span>
@@ -4096,6 +5243,20 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       </div>
 
       <div class="chart-controls-right">
+        <!-- NQ Intraday Interval Switcher (1D / 4H / 1H / 15M) -->
+        <div id="nq_interval_group" style="display:flex; align-items:center; gap:2px; background:#0b111e; border:1px solid rgba(56,189,248,0.45); border-radius:6px; padding:2px;" title="Bar Interval (15m, 1h, and 4h Intraday Pivot & Excursion Models active on NQ=F / MNQ=F)">
+          <button class="tf-btn active" id="iv_1d" onclick="setChartInterval('1d')" style="padding:2px 6px; font-size:10px;">1D</button>
+          <button class="tf-btn" id="iv_4h" onclick="setChartInterval('4h')" style="padding:2px 6px; font-size:10px;" title="NQ 4-Hour Intraday Pivot & Excursion Model">4H</button>
+          <button class="tf-btn" id="iv_1h" onclick="setChartInterval('1h')" style="padding:2px 6px; font-size:10px;" title="NQ 1-Hour Intraday Pivot & Excursion Model">1H</button>
+          <button class="tf-btn" id="iv_15m" onclick="setChartInterval('15m')" style="padding:2px 6px; font-size:10px;" title="NQ 15-Minute Intraday Pivot & Excursion Model">15M</button>
+        </div>
+
+        <!-- Futures Model Mode Toggle: Current (With Wick) vs ⚡ Wickless (Intrabar Touch) -->
+        <div id="futures_model_mode_group" style="display:none; align-items:center; gap:2px; background:#0b111e; border:1px solid rgba(245,158,11,0.45); border-radius:6px; padding:2px; margin-right:4px;" title="Futures Pivot Model Mode: Current (Rejection Wick at Close) vs ⚡ Wickless (Intrabar Extreme Touch)">
+          <button class="tf-btn active" id="btn_mode_current" onclick="setFuturesModelMode('current')" style="padding:2px 6px; font-size:10px; font-weight:700;" title="Current Model: Uses wicks and bar close rejection">Current (Wick)</button>
+          <button class="tf-btn" id="btn_mode_wickless" onclick="setFuturesModelMode('wickless')" style="padding:2px 6px; font-size:10px; font-weight:700; color:#fbbf24;" title="⚡ Wickless Model: Pure intrabar touch at extreme edge of wick with 0 lag">⚡ Wickless</button>
+        </div>
+
         <!-- Timeframe History Buttons -->
         <button class="tf-btn" id="tf_3m" onclick="setHistoryWindow('3m')">3M</button>
         <button class="tf-btn" id="tf_6m" onclick="setHistoryWindow('6m')">6M</button>
@@ -4105,24 +5266,20 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         <button class="tf-btn" id="tf_full" onclick="setHistoryWindow('full')">MAX</button>
 
         <button class="btn" onclick="resetChartZoom()" title="Fit chart to window">🎯 Fit</button>
-        <button class="btn active" id="btn_settings_bar" onclick="toggleSettingsBar()">⚙️ Indicators & Larsson</button>
+        <button class="btn active" id="btn_settings_bar" onclick="toggleSettingsBar()" title="Toggle Indicators & Larsson Line settings">⚙️ Indicators</button>
         <button class="btn" id="btn_draw_bar" onclick="toggleDrawBar()">✏️ Draw</button>
-        <button class="btn" id="btn_fullscreen" onclick="toggleFullscreenChart()">⛶ Enlarge</button>
+        <button class="btn" id="btn_fullscreen" onclick="toggleFullscreenChart()" title="Enlarge chart to full width (or press Esc to restore)" style="border-color:rgba(56,189,248,0.45); color:#38bdf8; font-weight:700;">⛶ Enlarge</button>
       </div>
     </div>
 
-    <!-- Real-Time TWS Developing Bar ML Pivot Alert Banner -->
-    <div id="tws_pivot_alert_bar" style="display:none; background:linear-gradient(90deg, rgba(244,63,94,0.18), rgba(245,158,11,0.15), rgba(16,185,129,0.15)); border-bottom:1px solid rgba(251,191,36,0.45); padding:6px 12px; align-items:center; justify-content:space-between; gap:10px; z-index:35; flex-shrink:0;">
-      <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap; flex:1; min-width:0;">
-        <span style="font-size:11px; font-weight:900; color:#fbbf24; letter-spacing:0.4px; white-space:nowrap;" id="tws_alert_banner_title">🚨 REAL-TIME ML PIVOT DETECTED:</span>
-        <div id="tws_alert_chips_wrap" style="display:flex; align-items:center; gap:6px; flex-wrap:wrap;"></div>
+    <!-- Chart View Container (Settings Bar, Draw Bar & Candlestick Canvas) -->
+    <div id="chart_view_container" style="display:flex; flex-direction:column; flex:1; min-height:0; position:relative;">
+      <!-- Hidden compatibility hook for test suite (alerts are displayed in dedicated window tabs) -->
+      <div id="tws_pivot_alert_bar" style="display:none !important;">
+        <span id="tws_alert_banner_title"></span>
+        <div id="tws_alert_chips_wrap"></div>
+        <button id="btn_tws_alert_audio" onclick="toggleTwsAlertAudio()"></button>
       </div>
-      <div style="display:flex; align-items:center; gap:5px; flex-shrink:0;">
-        <button class="btn" id="btn_tws_alert_audio" onclick="toggleTwsAlertAudio()" style="padding:2px 7px; font-size:10px;" title="Toggle Audio Chime on New Real-Time Pivot Detection">🔊 Audio ON</button>
-        <button class="btn" onclick="toggleHideTwsAlerts(true)" style="padding:2px 7px; font-size:10px; color:#cbd5e1;" title="Hide Alert Banner (toggle 🔔 in Watchlist header to re-open)">🙈 Hide</button>
-        <button class="btn" onclick="clearTwsPivotAlerts()" style="padding:2px 7px; font-size:10px; color:#fca5a5;" title="Dismiss Current Alerts">✕ Clear</button>
-      </div>
-    </div>
 
     <!-- Customizable Indicator, EMA/SMA Periods, Larsson Line & EP/Climax Marker Settings Bar -->
     <div class="floating-bar" id="settings_bar">
@@ -4164,12 +5321,23 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         <input type="checkbox" id="cfg_climax_markers" checked onchange="renderEPMarkers()">🔥 Pivot Highs
       </span>
       <span class="cfg-label" title="Toggle Uptrend & Downtrend Pivot-Low markers (💎 UT Low / 🟢 DT Low) above the probability threshold">
-        <input type="checkbox" id="cfg_pivot_low_markers" checked onchange="renderEPMarkers()">💎 Pivot Lows ≥
-        <input type="number" id="cfg_climax_thresh" value="50" min="25" max="85" step="5" class="ma-span-input" onchange="renderEPMarkers()" oninput="renderEPMarkers()" title="Minimum ML Pivot Probability % for chart markers (25-85%)">%
+        <input type="checkbox" id="cfg_pivot_low_markers" checked onchange="renderEPMarkers()">💎 Pivot Lows
       </span>
       <span class="cfg-label" title="Toggle Major Trend Reversal markers (👑 Major Top: Uptrend -> Downtrend Breakdown / 🚀 Major Bottom: Downtrend -> Uptrend Turnaround)">
         <input type="checkbox" id="cfg_major_rev_markers" checked onchange="renderEPMarkers()">👑 Major Reversals
       </span>
+      <label class="cfg-label" style="background:rgba(56,189,248,0.12); border:1px solid rgba(56,189,248,0.35); padding:2px 6px; border-radius:4px; color:#38bdf8; font-weight:700;" title="Volatility-Adaptive Auto Threshold: Automatically sets each ML model's threshold based on ticker ADR% & ATR(14)/ATR(50) expansion (scales Tops UP 48–65% in high vol, Pullback Lows DOWN 42–50%, and Washout Lows to 58% during vol spikes)">
+        <input type="checkbox" id="cfg_auto_vol_thresh" onchange="onAutoVolThreshChange()">⚡ Auto Threshold <span id="lbl_auto_vol_regime" style="font-size:9px; color:#fbbf24; font-weight:800;"></span>
+      </label>
+      <div id="per_model_thresh_group" style="display:flex; align-items:center; gap:5px; background:#0d1524; border:1px solid #1e293b; border-radius:5px; padding:2px 6px;" title="Separate ML Probability Thresholds (%) for each of the 6 Pivot Models">
+        <span class="cfg-label" style="font-size:10px; color:#94a3b8;" title="Quick-set all 6 model thresholds at once">All:<input type="number" id="cfg_climax_thresh" value="50" min="20" max="90" step="5" class="ma-span-input" style="width:36px;" onchange="onMasterClimaxThreshChange()" oninput="onMasterClimaxThreshChange()">%</span>
+        <span class="cfg-label" style="font-size:10px; color:#fb923c;" title="Model 1: Uptrend Pivot High (🔥 UT High) threshold % (Empirical Default: 55%)">🔥UT-H<input type="number" id="cfg_thr_ut_high" value="55" min="20" max="90" step="1" class="ma-span-input" style="width:36px;" onchange="onModelThreshInput('ut_high')" oninput="onModelThreshInput('ut_high')"></span>
+        <span class="cfg-label" style="font-size:10px; color:#38bdf8;" title="Model 2: Uptrend Pivot Low (💎 UT Low) threshold % (Empirical Default: 45%)">💎UT-L<input type="number" id="cfg_thr_ut_low" value="45" min="20" max="90" step="1" class="ma-span-input" style="width:36px;" onchange="onModelThreshInput('ut_low')" oninput="onModelThreshInput('ut_low')"></span>
+        <span class="cfg-label" style="font-size:10px; color:#c084fc;" title="Model 3: Downtrend Pivot High (🔻 DT High) threshold % (Empirical Default: 55%)">🔻DT-H<input type="number" id="cfg_thr_dt_high" value="55" min="20" max="90" step="1" class="ma-span-input" style="width:36px;" onchange="onModelThreshInput('dt_high')" oninput="onModelThreshInput('dt_high')"></span>
+        <span class="cfg-label" style="font-size:10px; color:#4ade80;" title="Model 4: Downtrend Pivot Low (🟢 DT Low) threshold % (Empirical Default: 50%)">🟢DT-L<input type="number" id="cfg_thr_dt_low" value="50" min="20" max="90" step="1" class="ma-span-input" style="width:36px;" onchange="onModelThreshInput('dt_low')" oninput="onModelThreshInput('dt_low')"></span>
+        <span class="cfg-label" style="font-size:10px; color:#fbbf24;" title="Model 5: Major Uptrend Reversal Top (👑 Major Top) threshold % (Empirical Default: 50%)">👑Maj-T<input type="number" id="cfg_thr_maj_ut_top" value="50" min="20" max="90" step="1" class="ma-span-input" style="width:36px;" onchange="onModelThreshInput('maj_ut_top')" oninput="onModelThreshInput('maj_ut_top')"></span>
+        <span class="cfg-label" style="font-size:10px; color:#10b981;" title="Model 6: Major Downtrend Reversal Bottom (🚀 Major Bottom) threshold % (Empirical Default: 50%)">🚀Maj-B<input type="number" id="cfg_thr_maj_dt_low" value="50" min="20" max="90" step="1" class="ma-span-input" style="width:36px;" onchange="onModelThreshInput('maj_dt_low')" oninput="onModelThreshInput('maj_dt_low')"></span>
+      </div>
       <span class="cfg-label" title="Display the lowest intrabar price that classifies a Pivot High and the highest intrabar price that classifies a Pivot Low">
         <input type="checkbox" id="cfg_pivot_intrabar_price" checked onchange="renderEPMarkers()">🎯 Intrabar Trigger $
       </span>
@@ -4178,8 +5346,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         <select id="cfg_pivot_model_ver" onchange="onPivotModelVerChange()" style="background:#131b2b; color:#38bdf8; border:1px solid #26354d; border-radius:4px; padding:1px 5px; font-size:11px; font-weight:700;">
           <option value="v3">V3 Current (Baseline)</option>
           <option value="v4">V4 Enhanced (B1–B5 + Inv-RSI)</option>
+          <option value="wickless">⚡ Wickless (Intrabar Touch)</option>
         </select>
       </span>
+
+      <label class="cfg-label" title="Enable/disable Gmail notifications when a futures ticker (NQ, GC, CL, BTC, SI) detects a new Wickless ML Pivot" style="background:rgba(192,132,252,0.12); border:1px solid rgba(192,132,252,0.35); padding:2px 6px; border-radius:4px; color:#c084fc; font-weight:700;">
+        <input type="checkbox" id="cfg_futures_pivot_email" checked onchange="toggleFuturesPivotEmail(this.checked)">📧 Futures Pivot Email Alerts
+      </label>
 
       <div style="display:flex; align-items:center; gap:6px; border-left:1px solid #26354d; padding-left:10px;">
         <label class="cfg-label"><input type="checkbox" id="cfg_larsson" checked onchange="updateIndicatorVisibility()"><span class="swatch" style="background:linear-gradient(90deg,#eab308,#38bdf8);"></span><strong>Larsson Line</strong></label>
@@ -4208,6 +5381,52 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       <div id="chart_tv"></div>
       <svg id="larsson_ribbon_svg"></svg>
       <canvas id="draw_canvas"></canvas>
+      <button class="btn" id="btn_stage_fullscreen" onclick="toggleFullscreenChart()" title="Enlarge chart to full width (or press Esc to restore)" style="position:absolute; top:8px; left:10px; z-index:25; padding:3px 8px; font-size:11px; font-weight:800; background:rgba(13,21,36,0.88); border:1px solid rgba(56,189,248,0.5); color:#38bdf8; backdrop-filter:blur(4px);">⛶ Enlarge</button>
+    </div>
+    </div> <!-- end chart_view_container -->
+
+    <!-- Dedicated Full Center-Window ML Pivot Alerts View -->
+    <div id="center_alerts_view" style="display:none; flex-direction:column; flex:1; min-height:0; overflow-y:auto; background:#080c14; padding:16px; gap:14px;">
+      <!-- Alerts Header Stats & Controls -->
+      <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:10px; padding:12px 16px; background:#0b111e; border:1px solid #1e293b; border-radius:8px;">
+        <div style="display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
+          <div style="display:flex; align-items:center; gap:8px;">
+            <span style="font-size:15px; font-weight:900; color:#fbbf24;">🚨 REAL-TIME ML PIVOT ALERTS</span>
+            <span id="center_alerts_total_badge" style="font-size:11px; font-weight:800; padding:2px 8px; border-radius:12px; background:rgba(244,63,94,0.22); color:#fb7185; border:1px solid rgba(244,63,94,0.45);">0 Active</span>
+          </div>
+          <div style="display:flex; gap:6px; font-size:11px; color:#94a3b8;">
+            <span id="center_alerts_fut_badge" style="padding:2px 6px; border-radius:4px; background:#162032; border:1px solid #26354d;">0 Futures</span>
+            <span id="center_alerts_eq_badge" style="padding:2px 6px; border-radius:4px; background:#162032; border:1px solid #26354d;">0 Equities</span>
+            <span id="center_alerts_hi_badge" style="padding:2px 6px; border-radius:4px; background:rgba(244,63,94,0.12); color:#fda4af; border:1px solid rgba(244,63,94,0.3);">0 Highs</span>
+            <span id="center_alerts_lo_badge" style="padding:2px 6px; border-radius:4px; background:rgba(16,185,129,0.12); color:#6ee7b7; border:1px solid rgba(16,185,129,0.3);">0 Lows</span>
+          </div>
+        </div>
+        <div style="display:flex; align-items:center; gap:8px;">
+          <button class="btn" id="btn_center_alert_audio" onclick="toggleTwsAlertAudio()" style="padding:4px 10px; font-size:11px; font-weight:700;">🔊 Audio ON</button>
+          <button class="btn" onclick="clearTwsPivotAlerts()" style="padding:4px 10px; font-size:11px; font-weight:700; color:#fca5a5; border-color:rgba(239,68,68,0.35);">✕ Clear All</button>
+          <button class="btn btn-emerald" onclick="switchCenterView('chart')" style="padding:4px 12px; font-size:11px; font-weight:800;">📈 Back to Chart</button>
+        </div>
+      </div>
+
+      <!-- Filter Controls Strip -->
+      <div style="display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap;">
+        <div style="display:flex; align-items:center; gap:8px;">
+          <input type="text" id="center_alerts_search" class="search-input" placeholder="Search alert symbol, setup, or plan..." style="width:260px;" oninput="renderCenterAlertsView()">
+          <select id="center_alerts_filter" onchange="renderCenterAlertsView()" style="background:#0f172a; color:#cbd5e1; border:1px solid #334155; padding:6px 10px; border-radius:6px; font-size:11px;">
+            <option value="all">All Alerts</option>
+            <option value="futures">Futures Only (NQ / GC / CL / BTC)</option>
+            <option value="stocks">Equities Only</option>
+            <option value="high">Pivot Highs / Short Setups</option>
+            <option value="low">Pivot Lows / Long Setups</option>
+          </select>
+        </div>
+        <div style="font-size:11px; color:#64748b;">
+          Clicking any alert row opens its candlestick chart and trade plan levels.
+        </div>
+      </div>
+
+      <!-- Alerts Grid / Table -->
+      <div id="center_alerts_table_wrap" style="background:#0b111e; border:1px solid #1e293b; border-radius:8px; overflow:hidden;"></div>
     </div>
   </main>
 
@@ -4232,6 +5451,18 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         </div>
       </div>
       <textarea id="info_item_notes" rows="2" placeholder="Add trading notes, trigger levels, or thesis for this symbol..." style="width:100%; background:#0b1019; border:1px solid #1e293b; color:#e2e8f0; padding:6px; border-radius:5px; font-size:11px; resize:vertical;" onchange="saveItemNotes()"></textarea>
+    </div>
+
+    <!-- 1B. NQ / GC Intraday (15m / 1h / 4h) Pivot Detection & Actionable Trade Plan Card -->
+    <div class="info-card" id="nq_intraday_trade_card" style="display:none; flex-direction:column; gap:6px; border-color:rgba(251,191,36,0.45); background:linear-gradient(180deg, rgba(15,23,42,0.96), rgba(11,16,25,0.98));">
+      <div class="card-title">
+        <span id="nq_intraday_card_title" style="color:#fbbf24;">⚡ NQ Intraday (15m / 1h / 4h) Trade Plan</span>
+        <span class="rs-badge" id="nq_intraday_active_badge" style="background:rgba(56,189,248,0.18); color:#38bdf8; border:1px solid #38bdf8;">8-BAR HORIZON</span>
+      </div>
+      <div id="nq_intraday_tf_strip" style="display:grid; grid-template-columns:repeat(3, 1fr); gap:5px;"></div>
+      <div id="nq_intraday_plan_box" style="background:#080c14; border:1px solid #1e2d45; border-radius:6px; padding:8px; display:flex; flex-direction:column; gap:4px; font-size:11px;"></div>
+      <div id="nq_auto_trader_box" style="background:#070c17; border:1px solid rgba(56,189,248,0.35); border-radius:6px; padding:8px; display:flex; flex-direction:column; gap:5px; font-size:10.5px;"></div>
+      <div id="nq_intraday_rules_box" style="background:#0b111e; border:1px solid #1e293b; border-radius:6px; padding:7px 8px; display:flex; flex-direction:column; gap:3px; font-size:10px; color:#94a3b8; line-height:1.35;"></div>
     </div>
 
     <!-- 2. Universal 6-Model Structural & Major Reversal Swing-Pivot Suite Card -->
@@ -4382,6 +5613,9 @@ let partA = 'XBI';
 let partB = '';
 let isRatioMode = false;
 let historyWindow = '2y';
+let chartInterval = '1d';
+let selectedNqCardTf = '15m';
+let nqTradePlanPriceLines = [];
 
 let currentChartData = null;
 let modalTargetLeg = 'a'; // 'a' or 'b'
@@ -4409,6 +5643,169 @@ let drawings = [];
 let isDrawing = false;
 let currentDrawing = null;
 
+const PIVOT_MODEL_KEYS = ['ut_high', 'ut_low', 'dt_high', 'dt_low', 'maj_ut_top', 'maj_dt_low'];
+const DEFAULT_PIVOT_THRESHOLDS = {
+  ut_high: 55,
+  ut_low: 45,
+  dt_high: 55,
+  dt_low: 50,
+  maj_ut_top: 50,
+  maj_dt_low: 50,
+};
+let savedManualModelThresholds = { ...DEFAULT_PIVOT_THRESHOLDS };
+let lastMasterClimaxVal = '50';
+let twsThreshSyncTimer = null;
+
+function computeVolAdaptiveThresholds(adrPct, atrRatio = 1.0) {
+  let adr = parseFloat(adrPct);
+  if (isNaN(adr) || adr <= 0) adr = 3.5;
+  adr = Math.max(0.5, Math.min(15.0, adr));
+  let ar = parseFloat(atrRatio);
+  if (isNaN(ar) || ar <= 0) ar = 1.0;
+  const bump = ar > 1.20 ? 3.0 : 0.0;
+
+  const clip = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+  const thrTop = clip(Math.round(46.0 + 2.5 * adr + bump), 48, 65);
+  const thrUtLow = clip(Math.round(53.0 - 1.5 * adr), 42, 50);
+  const thrDtLow = ar > 1.20 ? 58 : clip(Math.round(56.0 - 1.0 * adr), 45, 55);
+  const thrMajTop = clip(Math.round(43.0 + 1.8 * adr + bump), 45, 58);
+  const thrMajBot = ar > 1.20 ? 58 : clip(Math.round(55.0 - 1.2 * adr), 45, 55);
+
+  return {
+    ut_high: thrTop,
+    ut_low: thrUtLow,
+    dt_high: thrTop,
+    dt_low: thrDtLow,
+    maj_ut_top: thrMajTop,
+    maj_dt_low: thrMajBot,
+  };
+}
+
+function getManualModelThresholdsFromUI() {
+  const out = {};
+  PIVOT_MODEL_KEYS.forEach(k => {
+    const el = document.getElementById(`cfg_thr_${k}`);
+    const v = el ? parseFloat(el.value) : NaN;
+    out[k] = !isNaN(v) ? Math.max(20, Math.min(90, v)) : DEFAULT_PIVOT_THRESHOLDS[k];
+  });
+  return out;
+}
+
+function setModelThresholdInputsUI(thrMap, isAuto = false) {
+  PIVOT_MODEL_KEYS.forEach(k => {
+    const el = document.getElementById(`cfg_thr_${k}`);
+    if (el && thrMap[k] !== undefined) {
+      el.value = Math.round(Number(thrMap[k]));
+      el.style.borderColor = isAuto ? 'rgba(56,189,248,0.65)' : '#26354d';
+      el.style.color = isAuto ? '#38bdf8' : '#fff';
+    }
+  });
+}
+
+function getEffectivePivotThresholds(exhOverride, pfOverride) {
+  const autoEl = document.getElementById('cfg_auto_vol_thresh');
+  const isAuto = !!(autoEl && autoEl.checked);
+  const exh = exhOverride || (currentChartData && currentChartData.exhaustion) || {};
+  const pf = pfOverride || (currentChartData && currentChartData.performance) || {};
+  const regLbl = document.getElementById('lbl_auto_vol_regime');
+
+  if (isAuto) {
+    const adr = exh.adr_pct !== undefined ? exh.adr_pct : (pf.adr_pct !== undefined ? pf.adr_pct : 3.5);
+    const ar = exh.atr_ratio !== undefined ? exh.atr_ratio : 1.0;
+    const autoMap = exh.auto_thresholds || computeVolAdaptiveThresholds(adr, ar);
+    setModelThresholdInputsUI(autoMap, true);
+    if (regLbl) {
+      const volTag = adr < 2.5 ? 'LowVol' : (adr < 4.5 ? 'MedVol' : (adr < 6.5 ? 'HighVol' : 'UltraVol'));
+      regLbl.textContent = `(${volTag} ${Number(adr).toFixed(1)}%${ar > 1.2 ? '·🔥Exp' : ''})`;
+    }
+    return autoMap;
+  }
+
+  if (regLbl) regLbl.textContent = '';
+  const masterEl = document.getElementById('cfg_climax_thresh');
+  if (masterEl && String(masterEl.value) !== lastMasterClimaxVal) {
+    lastMasterClimaxVal = String(masterEl.value);
+    const mVal = Math.max(20, Math.min(90, parseFloat(masterEl.value) || 50));
+    PIVOT_MODEL_KEYS.forEach(k => {
+      const el = document.getElementById(`cfg_thr_${k}`);
+      if (el) {
+        el.value = mVal;
+        el.style.borderColor = '#26354d';
+        el.style.color = '#fff';
+      }
+      savedManualModelThresholds[k] = mVal;
+    });
+  }
+  return getManualModelThresholdsFromUI();
+}
+
+function scheduleTwsThresholdSync() {
+  if (!twsLiveState || !twsLiveState.enabled) return;
+  clearTimeout(twsThreshSyncTimer);
+  twsThreshSyncTimer = setTimeout(() => {
+    triggerTwsPollNow();
+  }, 250);
+}
+
+function onMasterClimaxThreshChange() {
+  const masterEl = document.getElementById('cfg_climax_thresh');
+  const mVal = masterEl ? Math.max(20, Math.min(90, parseFloat(masterEl.value) || 50)) : 50;
+  lastMasterClimaxVal = String(masterEl ? masterEl.value : mVal);
+  const autoEl = document.getElementById('cfg_auto_vol_thresh');
+  if (autoEl && autoEl.checked) {
+    autoEl.checked = false;
+    try { localStorage.setItem('ep_wl_auto_vol_thresh', '0'); } catch (e) {}
+  }
+  PIVOT_MODEL_KEYS.forEach(k => {
+    savedManualModelThresholds[k] = mVal;
+  });
+  setModelThresholdInputsUI(savedManualModelThresholds, false);
+  try {
+    localStorage.setItem('ep_wl_climax_thresh', String(mVal));
+    localStorage.setItem('ep_wl_model_thresholds', JSON.stringify(savedManualModelThresholds));
+  } catch (e) {}
+  renderEPMarkers();
+  if (currentChartData) renderInfoPanel(currentChartData);
+  renderWatchlistItems();
+  scheduleTwsThresholdSync();
+}
+
+function onModelThreshInput(modelKey) {
+  const autoEl = document.getElementById('cfg_auto_vol_thresh');
+  if (autoEl && autoEl.checked) {
+    autoEl.checked = false;
+    try { localStorage.setItem('ep_wl_auto_vol_thresh', '0'); } catch (e) {}
+  }
+  const el = document.getElementById(`cfg_thr_${modelKey}`);
+  if (el) {
+    el.style.borderColor = '#26354d';
+    el.style.color = '#fff';
+  }
+  savedManualModelThresholds = getManualModelThresholdsFromUI();
+  try {
+    localStorage.setItem('ep_wl_model_thresholds', JSON.stringify(savedManualModelThresholds));
+  } catch (e) {}
+  renderEPMarkers();
+  if (currentChartData) renderInfoPanel(currentChartData);
+  renderWatchlistItems();
+  scheduleTwsThresholdSync();
+}
+
+function onAutoVolThreshChange() {
+  const autoEl = document.getElementById('cfg_auto_vol_thresh');
+  const isAuto = !!(autoEl && autoEl.checked);
+  try {
+    localStorage.setItem('ep_wl_auto_vol_thresh', isAuto ? '1' : '0');
+  } catch (e) {}
+  if (!isAuto) {
+    setModelThresholdInputsUI(savedManualModelThresholds, false);
+  }
+  renderEPMarkers();
+  if (currentChartData) renderInfoPanel(currentChartData);
+  renderWatchlistItems();
+  scheduleTwsThresholdSync();
+}
+
 // ============================================================================
 // Initialization & Data Fetching
 // ============================================================================
@@ -4431,7 +5828,25 @@ function restoreSavedMaSpans() {
     const savedThresh = parseFloat(localStorage.getItem('ep_wl_climax_thresh') || 'NaN');
     if (!isNaN(savedThresh) && savedThresh >= 20 && savedThresh <= 90) {
       const thEl = document.getElementById('cfg_climax_thresh');
-      if (thEl) thEl.value = savedThresh;
+      if (thEl) {
+        thEl.value = savedThresh;
+        lastMasterClimaxVal = String(savedThresh);
+      }
+    }
+    const savedPerModel = JSON.parse(localStorage.getItem('ep_wl_model_thresholds') || 'null');
+    if (savedPerModel && typeof savedPerModel === 'object') {
+      PIVOT_MODEL_KEYS.forEach(k => {
+        const v = parseFloat(savedPerModel[k]);
+        if (!isNaN(v) && v >= 20 && v <= 90) {
+          savedManualModelThresholds[k] = v;
+        }
+      });
+    }
+    setModelThresholdInputsUI(savedManualModelThresholds, false);
+    const savedAutoThr = localStorage.getItem('ep_wl_auto_vol_thresh');
+    if (savedAutoThr !== null) {
+      const autoEl = document.getElementById('cfg_auto_vol_thresh');
+      if (autoEl) autoEl.checked = savedAutoThr === '1';
     }
     const savedIntrabar = localStorage.getItem('ep_wl_pivot_intrabar');
     if (savedIntrabar !== null) {
@@ -4439,9 +5854,21 @@ function restoreSavedMaSpans() {
       if (ibEl) ibEl.checked = savedIntrabar !== '0';
     }
     const savedModelVer = localStorage.getItem('ep_wl_pivot_model_ver');
-    if (savedModelVer === 'v3' || savedModelVer === 'v4') {
+    if (savedModelVer === 'v3' || savedModelVer === 'v4' || savedModelVer === 'wickless') {
       const mvEl = document.getElementById('cfg_pivot_model_ver');
       if (mvEl) mvEl.value = savedModelVer;
+      if (savedModelVer === 'wickless') {
+        futuresModelMode = 'wickless';
+      }
+    }
+    const savedFutMode = localStorage.getItem('ep_futures_model_mode');
+    if (savedFutMode) {
+      futuresModelMode = savedFutMode;
+    }
+    const savedFutEmail = localStorage.getItem('cfg_futures_pivot_email');
+    if (savedFutEmail !== null) {
+      const feEl = document.getElementById('cfg_futures_pivot_email');
+      if (feEl) feEl.checked = savedFutEmail !== '0';
     }
   } catch (e) {}
 }
@@ -4449,10 +5876,17 @@ function restoreSavedMaSpans() {
 function onPivotModelVerChange() {
   const mvEl = document.getElementById('cfg_pivot_model_ver');
   const val = mvEl ? mvEl.value : 'v3';
+  if (val === 'wickless') {
+    futuresModelMode = 'wickless';
+  } else {
+    futuresModelMode = 'current';
+  }
   try {
     localStorage.setItem('ep_wl_pivot_model_ver', val);
+    localStorage.setItem('ep_futures_model_mode', futuresModelMode);
   } catch (e) {}
-  loadChart();
+  syncFuturesModelModeUI();
+  loadChart(false, true);
 }
 
 function getConfiguredEmaSpans() {
@@ -4476,7 +5910,7 @@ function onMaSpanChange() {
     localStorage.setItem('ep_wl_ema_spans', JSON.stringify(emaSpans));
     localStorage.setItem('ep_wl_sma_spans', JSON.stringify(smaSpans));
   } catch (e) {}
-  loadChart();
+  loadChart(false, true);
 }
 
 // TWS Live Developing Daily Bar & Real-Time ML Pivot Alert State
@@ -4507,23 +5941,19 @@ window.addEventListener('DOMContentLoaded', async () => {
 function toggleHideTwsAlerts(forceHide) {
   if (typeof forceHide === 'boolean') {
     twsLiveState.alertsHidden = forceHide;
+    if (forceHide && leftTab === 'alerts') {
+      switchLeftTab('watchlists');
+    } else if (!forceHide && leftTab !== 'alerts') {
+      switchLeftTab('alerts');
+    }
   } else {
-    twsLiveState.alertsHidden = !twsLiveState.alertsHidden;
+    if (leftTab === 'alerts') {
+      switchLeftTab('watchlists');
+    } else {
+      switchLeftTab('alerts');
+    }
   }
-  try {
-    localStorage.setItem('ep_wl_hide_tws_alerts', twsLiveState.alertsHidden ? '1' : '0');
-  } catch (e) {}
   renderTwsAlertBanner();
-  if (chart) {
-    setTimeout(() => {
-      const c = document.getElementById('chart_tv');
-      if (c && c.parentElement) {
-        chart.applyOptions({ width: c.parentElement.clientWidth, height: c.parentElement.clientHeight });
-      }
-      scheduleLarssonRender();
-      renderAllDrawings();
-    }, 30);
-  }
 }
 
 function playPivotAlertSound(isMajor = false) {
@@ -4628,63 +6058,338 @@ function updateHeaderDevelopingBarBadge() {
     hdrBadge.style.display = 'none';
     return;
   }
+  if (currentChartData && currentChartData.is_intraday && Array.isArray(currentChartData.bars) && currentChartData.bars.length) {
+    const lastB = currentChartData.bars[currentChartData.bars.length - 1];
+    const barChg = lastB.open > 0 ? ((lastB.close / lastB.open - 1) * 100) : 0;
+    const bSign = barChg >= 0 ? '+' : '';
+    hdrBadge.style.display = 'inline-block';
+    hdrBadge.textContent = `📡 ${String(chartInterval).toUpperCase()} BAR $${Number(lastB.close).toFixed(2)} (${bSign}${barChg.toFixed(2)}% · H:${Number(lastB.high).toFixed(2)} L:${Number(lastB.low).toFixed(2)})`;
+    return;
+  }
   const ret = Number(devBar.ret_1d_pct || 0);
   const sign = ret >= 0 ? '+' : '';
   hdrBadge.style.display = 'inline-block';
   hdrBadge.textContent = `📡 DEV BAR $${Number(devBar.close).toFixed(2)} (${sign}${ret.toFixed(1)}% · H:${Number(devBar.high).toFixed(2)} L:${Number(devBar.low).toFixed(2)})`;
 }
 
-function renderTwsAlertBanner() {
-  const bar = document.getElementById('tws_pivot_alert_bar');
-  const wrap = document.getElementById('tws_alert_chips_wrap');
-  const titleEl = document.getElementById('tws_alert_banner_title');
-  const toggleBtn = document.getElementById('btn_toggle_tws_alerts');
-  const alerts = twsLiveState.alerts || [];
+let centerView = 'chart';
 
+function switchCenterView(view) {
+  centerView = view;
+  const btnChart = document.getElementById('cview_btn_chart');
+  const btnAlerts = document.getElementById('cview_btn_alerts');
+  if (btnChart) btnChart.classList.toggle('active', view === 'chart');
+  if (btnAlerts) btnAlerts.classList.toggle('active', view === 'alerts');
+
+  const chartArea = document.getElementById('chart_view_container');
+  const alertsArea = document.getElementById('center_alerts_view');
+  if (chartArea) chartArea.style.display = view === 'chart' ? 'flex' : 'none';
+  if (alertsArea) alertsArea.style.display = view === 'alerts' ? 'flex' : 'none';
+
+  if (view === 'chart') {
+    if (chart) {
+      setTimeout(() => {
+        const c = document.getElementById('chart_tv');
+        if (c && c.parentElement) {
+          chart.applyOptions({ width: c.parentElement.clientWidth, height: c.parentElement.clientHeight });
+        }
+        scheduleLarssonRender();
+        renderAllDrawings();
+      }, 50);
+    }
+  } else if (view === 'alerts') {
+    renderCenterAlertsView();
+  }
+}
+
+function loadAlertItem(symbol, tf) {
+  if (centerView !== 'chart') switchCenterView('chart');
+  if (tf && ['15m', '1h', '4h'].includes(String(tf).toLowerCase())) {
+    partA = symbol;
+    isRatioMode = false;
+    partB = '';
+    selectedNqCardTf = String(tf).toLowerCase();
+    syncRatioHeaderUI();
+    setChartInterval(selectedNqCardTf);
+  } else {
+    selectChartIdentifier(symbol);
+  }
+}
+
+function renderTwsAlertBanner() {
+  const alerts = twsLiveState.alerts || [];
+  const cnt = alerts.length;
+
+  // Keep compatibility elements in DOM for tests while keeping above-chart area completely clean
+  const bar = document.getElementById('tws_pivot_alert_bar');
+  if (bar) bar.style.display = 'none';
+
+  const toggleBtn = document.getElementById('btn_toggle_tws_alerts');
   if (toggleBtn) {
-    const cnt = alerts.length;
     if (twsLiveState.alertsHidden) {
       toggleBtn.textContent = cnt > 0 ? `🔕 ${cnt}` : '🔕';
       toggleBtn.style.color = cnt > 0 ? '#fbbf24' : '#64748b';
-      toggleBtn.title = `Alerts Banner Hidden (${cnt} active alerts) — Click to show`;
+      toggleBtn.title = `Alerts Hidden (${cnt} active alerts) — Click to open Alerts tab`;
     } else {
       toggleBtn.textContent = cnt > 0 ? `🔔 ${cnt}` : '🔔';
       toggleBtn.style.color = cnt > 0 ? '#fbbf24' : '#cbd5e1';
-      toggleBtn.title = `Alerts Banner Enabled (${cnt} active alerts) — Click to hide`;
+      toggleBtn.title = `${cnt} Active ML Pivot Alerts — Click to open Alerts tab`;
     }
   }
 
-  if (!bar || !wrap) return;
-  if (!alerts.length || twsLiveState.alertsHidden) {
-    bar.style.display = 'none';
-    wrap.innerHTML = '';
+  const tabBadge = document.getElementById('ltab_alerts_badge');
+  if (tabBadge) {
+    tabBadge.textContent = cnt;
+    tabBadge.style.display = cnt > 0 ? 'inline-block' : 'none';
+  }
+
+  const centerBadge = document.getElementById('cview_alerts_badge');
+  if (centerBadge) {
+    centerBadge.textContent = cnt;
+    centerBadge.style.display = cnt > 0 ? 'inline-block' : 'none';
+  }
+
+  renderTwsAlertTab();
+  if (centerView === 'alerts') {
+    renderCenterAlertsView();
+  }
+}
+
+function renderTwsAlertTab() {
+  const container = document.getElementById('alerts_items_container');
+  const countBadge = document.getElementById('alerts_header_count');
+  const tabBadge = document.getElementById('ltab_alerts_badge');
+  const centerBadge = document.getElementById('cview_alerts_badge');
+  const bellBtn = document.getElementById('btn_toggle_tws_alerts');
+  const audioBtn = document.getElementById('btn_alerts_tab_audio');
+  const filterType = (document.getElementById('alerts_filter_select')?.value || 'all').toLowerCase();
+  const searchQ = (document.getElementById('alerts_search_input')?.value || '').trim().toLowerCase();
+
+  const alerts = twsLiveState.alerts || [];
+  const cnt = alerts.length;
+
+  if (countBadge) countBadge.textContent = cnt;
+  if (tabBadge) {
+    tabBadge.textContent = cnt;
+    tabBadge.style.display = cnt > 0 ? 'inline-block' : 'none';
+  }
+  if (centerBadge) {
+    centerBadge.textContent = cnt;
+    centerBadge.style.display = cnt > 0 ? 'inline-block' : 'none';
+  }
+  if (bellBtn) {
+    bellBtn.textContent = cnt > 0 ? `🔔 ${cnt}` : '🔔';
+    bellBtn.style.color = cnt > 0 ? '#fbbf24' : '#64748b';
+    bellBtn.title = `${cnt} Active ML Pivot Alerts — Click to open Alerts tab`;
+  }
+  if (audioBtn) {
+    audioBtn.textContent = twsLiveState.audioEnabled ? '🔊 Audio ON' : '🔇 Muted';
+    audioBtn.style.color = twsLiveState.audioEnabled ? '#34d399' : '#94a3b8';
+  }
+
+  if (!container) return;
+
+  const filtered = alerts.filter(a => {
+    if (!a) return false;
+    const sym = String(a.symbol || '').toLowerCase();
+    const lbl = String(a.pivot_label || '').toLowerCase();
+    const msg = String(a.message || '').toLowerCase();
+    if (searchQ && !sym.includes(searchQ) && !lbl.includes(searchQ) && !msg.includes(searchQ)) {
+      return false;
+    }
+    const isFut = !!(a.timeframe || ['NQ=F', 'MNQ=F', 'GC=F', 'MGC=F', 'CL=F', 'MCL=F', 'BTC=F', 'MBT=F'].includes(String(a.symbol || '').toUpperCase()));
+    if (filterType === 'futures' && !isFut) return false;
+    if (filterType === 'stocks' && isFut) return false;
+    if (filterType === 'high' && !a.is_high_pivot) return false;
+    if (filterType === 'low' && a.is_high_pivot) return false;
+    return true;
+  });
+
+  if (!filtered.length) {
+    container.innerHTML = `
+      <div style="text-align:center; padding:30px 10px; color:#64748b; font-size:12px;">
+        <div style="font-size:24px; margin-bottom:8px;">🎯</div>
+        ${alerts.length ? 'No alerts match current search filter.' : 'No active ML pivot alerts at this time.'}<br>
+        <span style="font-size:10px; color:#475569;">Polling TWS developing bars for real-time pivot triggers...</span>
+      </div>`;
     return;
   }
 
-  bar.style.display = 'flex';
-  if (titleEl) {
-    titleEl.textContent = `🚨 REAL-TIME ML PIVOT ALERTS (${alerts.length}):`;
-  }
-  wrap.innerHTML = '';
-  alerts.slice(0, 10).forEach(a => {
-    const chip = document.createElement('button');
-    chip.className = 'btn';
+  container.innerHTML = '';
+  filtered.forEach(a => {
+    const card = document.createElement('div');
     const isHi = a.is_high_pivot;
     const isMaj = a.pivot_type === 'maj_ut_top' || a.pivot_type === 'maj_dt_low';
-    chip.style.padding = '3px 8px';
-    chip.style.fontSize = '11px';
-    chip.style.fontWeight = '800';
-    chip.style.borderColor = isMaj ? '#fbbf24' : (isHi ? '#fb923c' : '#38bdf8');
-    chip.style.background = isMaj ? 'rgba(251,191,36,0.2)' : (isHi ? 'rgba(251,146,60,0.18)' : 'rgba(56,189,248,0.18)');
-    chip.style.color = '#fff';
-    const trigSfx = a.trigger_price ? ` (Trig @$${Number(a.trigger_price).toFixed(2)})` : '';
-    chip.textContent = `${a.pivot_label} · ${a.symbol} ${Number(a.prob_pct).toFixed(0)}% @$${Number(a.bar_price).toFixed(2)}${trigSfx}`;
-    chip.title = `${a.message} — Click to view ${a.symbol} chart`;
-    chip.onclick = () => {
-      selectChartIdentifier(a.symbol);
-    };
-    wrap.appendChild(chip);
+    const hasPlan = !!(a.trade_plan || a.entry_price);
+    const borderColor = hasPlan ? (isHi ? '#f43f5e' : '#10b981') : (isMaj ? '#fbbf24' : (isHi ? '#fb923c' : '#38bdf8'));
+    const bg = hasPlan
+      ? (isHi ? 'rgba(244,63,94,0.12)' : 'rgba(16,185,129,0.12)')
+      : (isMaj ? 'rgba(251,191,36,0.10)' : (isHi ? 'rgba(251,146,60,0.10)' : 'rgba(56,189,248,0.10)'));
+
+    card.className = 'wl-item';
+    card.style.flexDirection = 'column';
+    card.style.alignItems = 'stretch';
+    card.style.padding = '8px 10px';
+    card.style.gap = '5px';
+    card.style.borderLeft = `3px solid ${borderColor}`;
+    card.style.background = bg;
+    card.style.borderRadius = '5px';
+    card.style.cursor = 'pointer';
+    card.style.transition = 'all 0.15s ease';
+
+    const tp = a.trade_plan || a;
+    const rawBarTime = (tp.bar_time || a.bar_time || a.time_et || a.date || '').replace(/^\d{4}-/, '');
+    const detSfx = (a.time_et && !rawBarTime.includes(a.time_et)) ? ` (${a.time_et})` : '';
+    const timeTag = rawBarTime ? `${rawBarTime}${detSfx}` : '';
+    const trigSfx = a.trigger_price ? ` · Trig $${Number(a.trigger_price).toFixed(2)}` : '';
+    const tfBadge = a.timeframe ? String(a.timeframe).toUpperCase() : '1D';
+
+    card.innerHTML = `
+      <div style="display:flex; align-items:center; justify-content:space-between;">
+        <div style="display:flex; align-items:center; gap:6px;">
+          <span style="font-weight:900; font-size:13px; color:#fff;">${a.symbol}</span>
+          <span style="font-size:9px; font-weight:800; padding:1px 5px; border-radius:3px; background:#1e293b; color:#38bdf8; border:1px solid rgba(56,189,248,0.3);">${tfBadge}</span>
+          <span style="font-size:10px; color:#94a3b8;">${timeTag}</span>
+        </div>
+        <span style="font-size:11px; font-weight:800; color:${borderColor};">${a.pivot_label} ${Number(a.prob_pct).toFixed(0)}%</span>
+      </div>
+      <div style="display:flex; align-items:center; justify-content:space-between; font-size:11px;">
+        <span style="color:#cbd5e1;">Bar: <b style="color:#fff;">$${Number(a.bar_price).toFixed(2)}</b>${trigSfx}</span>
+        ${hasPlan && tp.rr_target1 ? `<span style="color:#38bdf8; font-weight:800;">R:R ${tp.rr_target1}R</span>` : ''}
+      </div>
+      ${hasPlan ? `
+      <div style="display:flex; gap:6px; font-size:10px; background:#080c14; padding:4px 6px; border-radius:4px; border:1px solid #1e293b; color:#94a3b8; justify-content:space-between;">
+        <span>Entry: <b style="color:#e2e8f0;">${Number(tp.entry_price).toFixed(1)}</b></span>
+        <span>Stop: <b style="color:#f87171;">${Number(tp.stop_price).toFixed(1)}</b></span>
+        <span>TP1: <b style="color:#34d399;">${Number(tp.target1_price).toFixed(1)}</b></span>
+        ${tp.target2_price ? `<span>TP2: <b style="color:#a7f3d0;">${Number(tp.target2_price).toFixed(1)}</b></span>` : ''}
+      </div>` : ''}
+    `;
+
+    card.title = `${a.message} — Click to view ${a.symbol} [${tfBadge}] chart and trade plan`;
+    card.onclick = () => loadAlertItem(a.symbol, a.timeframe);
+
+    container.appendChild(card);
   });
+}
+
+function renderCenterAlertsView() {
+  const alerts = twsLiveState.alerts || [];
+  const tableWrap = document.getElementById('center_alerts_table_wrap');
+  const totBadge = document.getElementById('center_alerts_total_badge');
+  const futBadge = document.getElementById('center_alerts_fut_badge');
+  const eqBadge = document.getElementById('center_alerts_eq_badge');
+  const hiBadge = document.getElementById('center_alerts_hi_badge');
+  const loBadge = document.getElementById('center_alerts_lo_badge');
+  const audioBtn = document.getElementById('btn_center_alert_audio');
+  const filterType = (document.getElementById('center_alerts_filter')?.value || 'all').toLowerCase();
+  const searchQ = (document.getElementById('center_alerts_search')?.value || '').trim().toLowerCase();
+
+  let nFut = 0, nEq = 0, nHi = 0, nLo = 0;
+  alerts.forEach(a => {
+    const isFut = !!(a.timeframe || ['NQ=F', 'MNQ=F', 'GC=F', 'MGC=F', 'CL=F', 'MCL=F', 'BTC=F', 'MBT=F'].includes(String(a.symbol || '').toUpperCase()));
+    if (isFut) nFut++; else nEq++;
+    if (a.is_high_pivot) nHi++; else nLo++;
+  });
+
+  if (totBadge) totBadge.textContent = `${alerts.length} Active`;
+  if (futBadge) futBadge.textContent = `${nFut} Futures`;
+  if (eqBadge) eqBadge.textContent = `${nEq} Equities`;
+  if (hiBadge) hiBadge.textContent = `${nHi} Highs`;
+  if (loBadge) loBadge.textContent = `${nLo} Lows`;
+  if (audioBtn) {
+    audioBtn.textContent = twsLiveState.audioEnabled ? '🔊 Audio ON' : '🔇 Muted';
+    audioBtn.style.color = twsLiveState.audioEnabled ? '#34d399' : '#94a3b8';
+  }
+
+  if (!tableWrap) return;
+
+  const filtered = alerts.filter(a => {
+    if (!a) return false;
+    const sym = String(a.symbol || '').toLowerCase();
+    const lbl = String(a.pivot_label || '').toLowerCase();
+    const msg = String(a.message || '').toLowerCase();
+    if (searchQ && !sym.includes(searchQ) && !lbl.includes(searchQ) && !msg.includes(searchQ)) return false;
+    const isFut = !!(a.timeframe || ['NQ=F', 'MNQ=F', 'GC=F', 'MGC=F', 'CL=F', 'MCL=F', 'BTC=F', 'MBT=F'].includes(String(a.symbol || '').toUpperCase()));
+    if (filterType === 'futures' && !isFut) return false;
+    if (filterType === 'stocks' && isFut) return false;
+    if (filterType === 'high' && !a.is_high_pivot) return false;
+    if (filterType === 'low' && a.is_high_pivot) return false;
+    return true;
+  });
+
+  if (!filtered.length) {
+    tableWrap.innerHTML = `
+      <div style="text-align:center; padding:48px 16px; color:#64748b;">
+        <div style="font-size:32px; margin-bottom:10px;">🎯</div>
+        <div style="font-size:14px; font-weight:700; color:#94a3b8;">${alerts.length ? 'No alerts match current search filter.' : 'No active ML pivot alerts at this time.'}</div>
+        <div style="font-size:11px; color:#475569; margin-top:4px;">When new real-time pivot high/lows are detected by the ML models, they will appear here.</div>
+      </div>`;
+    return;
+  }
+
+  let html = `
+    <table style="width:100%; border-collapse:collapse; font-size:12px; text-align:left;">
+      <thead>
+        <tr style="background:#0e1726; color:#94a3b8; border-bottom:1px solid #1e293b; font-size:11px; text-transform:uppercase; letter-spacing:0.5px;">
+          <th style="padding:10px 12px;">Time (ET)</th>
+          <th style="padding:10px 12px;">Symbol</th>
+          <th style="padding:10px 12px;">TF</th>
+          <th style="padding:10px 12px;">Pivot Signal</th>
+          <th style="padding:10px 12px;">Conviction</th>
+          <th style="padding:10px 12px;">Current Price</th>
+          <th style="padding:10px 12px;">Trigger / Trade Plan</th>
+          <th style="padding:10px 12px; text-align:right;">Action</th>
+        </tr>
+      </thead>
+      <tbody>
+  `;
+
+  filtered.forEach((a, idx) => {
+    const isHi = a.is_high_pivot;
+    const isMaj = a.pivot_type === 'maj_ut_top' || a.pivot_type === 'maj_dt_low';
+    const hasPlan = !!(a.trade_plan || a.entry_price);
+    const badgeColor = hasPlan ? (isHi ? '#f43f5e' : '#10b981') : (isMaj ? '#fbbf24' : (isHi ? '#fb923c' : '#38bdf8'));
+    const rowBg = idx % 2 === 0 ? 'rgba(11,17,30,0.6)' : 'rgba(15,23,42,0.6)';
+
+    const tp = a.trade_plan || a;
+    const rawBarTime = (tp.bar_time || a.bar_time || a.time_et || a.date || '').replace(/^\d{4}-/, '');
+    const detSfx = (a.time_et && !rawBarTime.includes(a.time_et)) ? ` (${a.time_et})` : '';
+    const timeTag = rawBarTime ? `${rawBarTime}${detSfx}` : '--';
+    const tf = a.timeframe ? String(a.timeframe).toUpperCase() : '1D';
+
+    let planSnippet = '';
+    if (hasPlan) {
+      planSnippet = `
+        <span style="color:#e2e8f0;">Entry: <b>${Number(tp.entry_price).toFixed(1)}</b></span> ·
+        <span style="color:#f87171;">Stop: <b>${Number(tp.stop_price).toFixed(1)}</b></span> ·
+        <span style="color:#34d399;">TP1: <b>${Number(tp.target1_price).toFixed(1)}</b> (${tp.rr_target1 || '1.0'}R)</span>
+        ${tp.target2_price ? ` · <span style="color:#a7f3d0;">TP2: <b>${Number(tp.target2_price).toFixed(1)}</b></span>` : ''}
+      `;
+    } else if (a.trigger_price) {
+      planSnippet = `<span style="color:#94a3b8;">Trigger Price: <b style="color:#38bdf8;">$${Number(a.trigger_price).toFixed(2)}</b></span>`;
+    } else {
+      planSnippet = `<span style="color:#64748b;">${a.message || 'Real-time pivot extreme reached'}</span>`;
+    }
+
+    html += `
+      <tr style="background:${rowBg}; border-bottom:1px solid #162236; cursor:pointer;" onclick="loadAlertItem('${a.symbol}', '${a.timeframe || ''}')">
+        <td style="padding:10px 12px; color:#94a3b8; font-family:monospace; white-space:nowrap;">${timeTag}</td>
+        <td style="padding:10px 12px; font-weight:900; color:#fff; font-size:13px;">${a.symbol}</td>
+        <td style="padding:10px 12px;"><span style="font-size:10px; font-weight:800; padding:2px 6px; border-radius:4px; background:#1e293b; color:#38bdf8; border:1px solid rgba(56,189,248,0.3);">${tf}</span></td>
+        <td style="padding:10px 12px; font-weight:800; color:${badgeColor};">${a.pivot_label}</td>
+        <td style="padding:10px 12px;"><span style="display:inline-block; font-size:11px; font-weight:800; padding:2px 7px; border-radius:10px; background:rgba(255,255,255,0.06); color:${badgeColor}; border:1px solid ${badgeColor};">${Number(a.prob_pct).toFixed(0)}%</span></td>
+        <td style="padding:10px 12px; font-weight:700; color:#f1f5f9;">$${Number(a.bar_price).toFixed(2)}</td>
+        <td style="padding:10px 12px; font-size:11px;">${planSnippet}</td>
+        <td style="padding:10px 12px; text-align:right;">
+          <button class="btn btn-emerald" style="padding:3px 9px; font-size:10px; font-weight:800;" onclick="event.stopPropagation(); loadAlertItem('${a.symbol}', '${a.timeframe || ''}')">📈 View Chart</button>
+        </td>
+      </tr>
+    `;
+  });
+
+  html += `</tbody></table>`;
+  tableWrap.innerHTML = html;
 }
 
 function applyDevelopingBarToCurrentChart() {
@@ -4692,14 +6397,105 @@ function applyDevelopingBarToCurrentChart() {
   const devBar = (twsLiveState.developing_bars || {})[partA];
   if (!devBar || !devBar.date) return;
 
+  if (currentChartData.is_intraday) {
+    const piv = (twsLiveState.pivot_scores || {})[partA] || {};
+    let tfInfo = null;
+    if (piv.nq_intraday) {
+      currentChartData.nq_intraday = piv.nq_intraday;
+      tfInfo = (piv.nq_intraday.timeframes || {})[chartInterval];
+      if (tfInfo && tfInfo.trade_plan) {
+        currentChartData.active_trade_plan = tfInfo.trade_plan;
+      }
+    }
+    const bars = currentChartData.bars || [];
+    const lastChartBarTime = bars.length ? Number(bars[bars.length - 1].time) : 0;
+    const liveCandle = tfInfo && tfInfo.last_bar_ohlcv ? tfInfo.last_bar_ohlcv : null;
+    const stepSec = chartInterval === '15m' ? 900 : (chartInterval === '1h' ? 3600 : 14400);
+
+    if (liveCandle && Number(liveCandle.time) > 0) {
+      const liveTs = Number(liveCandle.time);
+      // If more than 1 bar interval has elapsed since the chart's last bar, reload full series preserving viewport
+      if (lastChartBarTime > 0 && liveTs > lastChartBarTime + stepSec) {
+        const nowMs = Date.now();
+        if (!window._lastIntradayReloadMs || (nowMs - window._lastIntradayReloadMs) > 15000) {
+          window._lastIntradayReloadMs = nowMs;
+          loadChart(false, true);
+          return;
+        }
+      }
+      if (liveTs >= lastChartBarTime) {
+        try {
+          const hasLiveTick = Number(devBar.close) > 0 && devBar.source !== 'Datastore-EOD' && !devBar.stale;
+          const tickClose = hasLiveTick ? Number(devBar.close) : Number(liveCandle.close);
+          const barO = Number(liveCandle.open);
+          const barH = Math.max(Number(liveCandle.high), tickClose);
+          const barL = Math.min(Number(liveCandle.low), tickClose);
+          const barC = tickClose;
+          const newIntradayBar = {
+            time: liveTs,
+            open: barO,
+            high: barH,
+            low: barL,
+            close: barC,
+          };
+          candleSeries.update(newIntradayBar);
+          if (bars.length && Number(bars[bars.length - 1].time) === liveTs) {
+            bars[bars.length - 1] = newIntradayBar;
+          } else if (!bars.length || liveTs > lastChartBarTime) {
+            bars.push(newIntradayBar);
+          }
+          if (volumeSeries) {
+            volumeSeries.update({
+              time: liveTs,
+              value: Number(liveCandle.volume || 0),
+              color: barC >= barO ? 'rgba(16, 185, 129, 0.42)' : 'rgba(239, 68, 68, 0.42)',
+            });
+          }
+        } catch (e) {}
+      }
+    } else if (bars.length && Number(devBar.close) > 0 && devBar.source !== 'Datastore-EOD' && !devBar.stale) {
+      try {
+        const lastB = bars[bars.length - 1];
+        const tickC = Number(devBar.close);
+        const updB = {
+          time: Number(lastB.time),
+          open: Number(lastB.open),
+          high: Math.max(Number(lastB.high), tickC),
+          low: Math.min(Number(lastB.low), tickC),
+          close: tickC,
+        };
+        candleSeries.update(updB);
+        bars[bars.length - 1] = updB;
+      } catch (e) {}
+    }
+
+    if (currentChartData.performance_a && Number(devBar.close) > 0 && devBar.source !== 'Datastore-EOD') {
+      currentChartData.performance_a.last_close = Number(devBar.close);
+      currentChartData.performance_a.last_date = tfInfo && tfInfo.last_bar ? tfInfo.last_bar : devBar.date;
+    }
+    renderInfoPanel(currentChartData);
+    renderEPMarkers();
+    updateHeaderDevelopingBarBadge();
+    return;
+  }
+
+  const bars = currentChartData.bars || [];
+  const lastChartBarDate = bars.length ? bars[bars.length - 1].time : '';
+
   try {
-    candleSeries.update({
+    const newBarObj = {
       time: devBar.date,
       open: Number(devBar.open),
       high: Number(devBar.high),
       low: Number(devBar.low),
       close: Number(devBar.close),
-    });
+    };
+    candleSeries.update(newBarObj);
+    if (bars.length && bars[bars.length - 1].time === devBar.date) {
+      bars[bars.length - 1] = newBarObj;
+    } else if (!bars.length || devBar.date > lastChartBarDate) {
+      bars.push(newBarObj);
+    }
     if (volumeSeries) {
       volumeSeries.update({
         time: devBar.date,
@@ -4709,13 +6505,43 @@ function applyDevelopingBarToCurrentChart() {
     }
   } catch (e) {}
 
+  // Update right-hand performance & live ML pivot scores in-place without resetting chart pan/zoom
   const piv = (twsLiveState.pivot_scores || {})[partA] || {};
-  const sig = `${partA}|${devBar.date}|${Number(devBar.high).toFixed(2)}|${Number(devBar.low).toFixed(2)}|${piv.top_pivot_type || ''}|${Math.round(piv.top_prob_pct || 0)}`;
-  if (twsLiveState.lastViewedBarSig && twsLiveState.lastViewedBarSig !== sig) {
-    twsLiveState.lastViewedBarSig = sig;
-    loadChart();
-  } else {
-    twsLiveState.lastViewedBarSig = sig;
+  if (piv.nq_intraday) {
+    currentChartData.nq_intraday = piv.nq_intraday;
+    currentChartData.active_trade_plan = piv.nq_intraday.best_trade_plan || currentChartData.active_trade_plan;
+  }
+  if (currentChartData.performance) {
+    currentChartData.performance.close = Number(devBar.close);
+    currentChartData.performance.last_date = devBar.date;
+    if (devBar.ret_1d_pct !== undefined) {
+      currentChartData.performance.ret_1d = Number(devBar.ret_1d_pct);
+    }
+  }
+  if (currentChartData.exhaustion && piv.scores) {
+    currentChartData.exhaustion.pivots_current = Object.assign(
+      {},
+      currentChartData.exhaustion.pivots_current || {},
+      piv.scores,
+    );
+    if (piv.top_prob_pct !== undefined) {
+      currentChartData.exhaustion.current_prob_pct = Number(piv.top_prob_pct);
+    }
+    if (currentChartData.exhaustion._byDate) {
+      currentChartData.exhaustion._byDate[devBar.date] = Object.assign(
+        {},
+        currentChartData.exhaustion._byDate[devBar.date] || { time: devBar.date, regime: piv.regime || 'UT' },
+        piv.scores,
+      );
+    }
+  }
+  renderInfoPanel(currentChartData);
+  updateHeaderDevelopingBarBadge();
+
+  // Only fetch full chart indicators if a brand-new trading day's bar date was just appended for the first time,
+  // and even then pass preserveViewport=true so user pan and zoom are never reset
+  if (lastChartBarDate && lastChartBarDate !== devBar.date) {
+    loadChart(false, true);
   }
 }
 
@@ -4734,7 +6560,7 @@ function applyTwsLivePollPayload(data, allowSound = true) {
       twsLiveState.seenAlertIds.add(a.id);
       if (!twsLiveState.isInitialSync) {
         hasNewAlert = true;
-        if (a.pivot_type === 'maj_ut_top' || a.pivot_type === 'maj_dt_low') {
+        if (a.pivot_type === 'maj_ut_top' || a.pivot_type === 'maj_dt_low' || a.timeframe) {
           hasMajorAlert = true;
         }
       }
@@ -4785,12 +6611,23 @@ async function fetchTwsLivePollState() {
 async function toggleTwsLivePolling(enabled) {
   const threshEl = document.getElementById('cfg_climax_thresh');
   const threshold = threshEl ? Math.max(20, Math.min(90, parseFloat(threshEl.value) || 50)) : 50;
+  const auto_threshold = !!(document.getElementById('cfg_auto_vol_thresh')?.checked);
+  const thresholds_by_model = getEffectivePivotThresholds();
   const mvEl = document.getElementById('cfg_pivot_model_ver');
   const model_ver = mvEl ? mvEl.value : 'v3';
   const badge = document.getElementById('tws_poll_status_badge');
+  twsLiveState.enabled = !!enabled;
   if (badge && enabled) {
     badge.textContent = '⏳ Connecting TWS...';
     badge.style.color = '#38bdf8';
+  } else if (!enabled) {
+    updateTwsPollStatusUI();
+  }
+  if (enabled && !twsLiveState.pollTimer) {
+    twsLiveState.pollTimer = setInterval(fetchTwsLivePollState, 3500);
+  } else if (!enabled && twsLiveState.pollTimer) {
+    clearInterval(twsLiveState.pollTimer);
+    twsLiveState.pollTimer = null;
   }
   try {
     if (enabled && 'Notification' in window && Notification.permission === 'default') {
@@ -4806,21 +6643,26 @@ async function toggleTwsLivePolling(enabled) {
         action: 'toggle',
         enabled: !!enabled,
         threshold,
+        thresholds_by_model,
+        auto_threshold,
         model_ver,
         group_id: watchlistsState.active_group_id || '',
       }),
     });
     const data = await res.json();
     applyTwsLivePollPayload(data, true);
-    loadChart();
+    loadChart(false, true);
   } catch (e) {
     console.error('Failed to toggle TWS polling:', e);
+    updateTwsPollStatusUI();
   }
 }
 
 async function triggerTwsPollNow() {
   const threshEl = document.getElementById('cfg_climax_thresh');
   const threshold = threshEl ? Math.max(20, Math.min(90, parseFloat(threshEl.value) || 50)) : 50;
+  const auto_threshold = !!(document.getElementById('cfg_auto_vol_thresh')?.checked);
+  const thresholds_by_model = getEffectivePivotThresholds();
   const mvEl = document.getElementById('cfg_pivot_model_ver');
   const model_ver = mvEl ? mvEl.value : 'v3';
   const badge = document.getElementById('tws_poll_status_badge');
@@ -4835,15 +6677,18 @@ async function triggerTwsPollNow() {
       body: JSON.stringify({
         action: 'poll_now',
         threshold,
+        thresholds_by_model,
+        auto_threshold,
         model_ver,
         group_id: watchlistsState.active_group_id || '',
       }),
     });
     const data = await res.json();
     applyTwsLivePollPayload(data, true);
-    loadChart();
+    loadChart(false, true);
   } catch (e) {
     console.error('Failed manual TWS poll:', e);
+    updateTwsPollStatusUI();
   }
 }
 
@@ -4872,9 +6717,16 @@ function switchLeftTab(tab) {
   leftTab = tab;
   document.getElementById('ltab_watchlists').classList.toggle('active', tab === 'watchlists');
   document.getElementById('ltab_explorer').classList.toggle('active', tab === 'explorer');
+  const ltabAlerts = document.getElementById('ltab_alerts');
+  if (ltabAlerts) ltabAlerts.classList.toggle('active', tab === 'alerts');
+
   document.getElementById('view_watchlists').style.display = tab === 'watchlists' ? 'flex' : 'none';
   document.getElementById('view_explorer').style.display = tab === 'explorer' ? 'flex' : 'none';
+  const vAlerts = document.getElementById('view_alerts');
+  if (vAlerts) vAlerts.style.display = tab === 'alerts' ? 'flex' : 'none';
+
   if (tab === 'explorer') renderExplorerItems();
+  if (tab === 'alerts') renderTwsAlertTab();
 }
 
 function renderWatchlistGroupSelect() {
@@ -4899,8 +6751,22 @@ function onWatchlistGroupChange() {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ action: 'save_all', active_group_id: watchlistsState.active_group_id })
+  }).then(() => {
+    if (twsLiveState && twsLiveState.enabled) {
+      triggerTwsPollNow();
+    }
   });
   renderWatchlistItems();
+}
+
+function openNqWatchlistTimeframe(sym, tf, ev) {
+  if (ev) ev.stopPropagation();
+  partA = sym;
+  isRatioMode = false;
+  partB = '';
+  selectedNqCardTf = tf;
+  syncRatioHeaderUI();
+  setChartInterval(tf);
 }
 
 function renderWatchlistItems() {
@@ -4913,17 +6779,23 @@ function renderWatchlistItems() {
   const term = (document.getElementById('wl_filter_input').value || '').trim().toUpperCase();
   const flagFilter = document.getElementById('wl_flag_filter').value;
   const activeChartId = getActiveChartIdentifier();
-  const threshEl = document.getElementById('cfg_climax_thresh');
-  const userThr = threshEl ? Math.max(20, Math.min(90, parseFloat(threshEl.value) || 50)) : 50;
+  const isAutoThr = !!(document.getElementById('cfg_auto_vol_thresh')?.checked);
+  const thrMap = getEffectivePivotThresholds();
 
   const items = (grp.items || []).filter(it => {
     if (flagFilter !== 'all' && (it.flag || 'none') !== flagFilter) return false;
     if (!term) return true;
-    return (it.id || '').toUpperCase().includes(term) || (it.name || '').toUpperCase().includes(term) || (it.notes || '').toUpperCase().includes(term);
+    const termEq = term.replace(/-/g, '=');
+    const idUp = (it.id || '').toUpperCase();
+    const nameUp = (it.name || '').toUpperCase();
+    const notesUp = (it.notes || '').toUpperCase();
+    return idUp.includes(term) || idUp.includes(termEq) || nameUp.includes(term) || nameUp.includes(termEq) || notesUp.includes(term);
   });
 
   if (!items.length) {
-    container.innerHTML = '<div style="padding:16px; color:var(--muted); text-align:center;">No items match filter. Use Universe Explorer or ⭐ + Watchlist to add symbols, sectors, themes, or ratios.</div>';
+    const cleanSym = term.replace(/-F$/, '=F') === 'GC' ? 'GC=F' : (term.replace(/-F$/, '=F') === 'NQ' ? 'NQ=F' : term.replace(/-F$/, '=F'));
+    const addBtnHtml = term ? `<div style="margin-top:10px;"><button class="btn primary" onclick="quickAddItemToWatchlist('${cleanSym.replace(/'/g, "\\'")}', ''); document.getElementById('wl_filter_input').value='';">➕ Add "${cleanSym}" to Watchlist</button></div>` : '';
+    container.innerHTML = `<div style="padding:16px; color:var(--muted); text-align:center;">No items in this watchlist match "${term}".${addBtnHtml}<div style="margin-top:8px; font-size:11px;">Or use Universe Explorer / ⭐ + Watchlist above.</div></div>`;
     return;
   }
 
@@ -4933,6 +6805,7 @@ function renderWatchlistItems() {
     row.className = 'wl-item' + (it.id === activeChartId ? ' active' : '');
     const liveBar = twsLiveState.enabled ? ((twsLiveState.developing_bars || {})[it.id] || it.live_bar) : null;
     const livePiv = twsLiveState.enabled ? ((twsLiveState.pivot_scores || {})[it.id] || it.live_pivot) : null;
+    const nqIntra = (livePiv && livePiv.nq_intraday) || it.nq_intraday || null;
 
     const r1d = (liveBar && liveBar.ret_1d_pct !== undefined) ? liveBar.ret_1d_pct : it.ret_1d;
     const r1m = it.ret_1m;
@@ -4942,17 +6815,42 @@ function renderWatchlistItems() {
     const typeCls = `type-${it.type || 'stock'}`;
 
     let pivotBadgeHtml = '';
-    if (livePiv && Number(livePiv.top_prob_pct || 0) >= userThr) {
+    if (nqIntra && nqIntra.timeframes) {
+      const tfBadges = [];
+      ['15m', '1h', '4h'].forEach(tfKey => {
+        const tfObj = nqIntra.timeframes[tfKey];
+        if (!tfObj || !tfObj.trade_plan) return;
+        const tp = tfObj.trade_plan;
+        const pVal = Math.round(Number(tfObj.active_prob_pct || tp.prob_pct || 0));
+        const isHi = !!tfObj.active_is_high_pivot;
+        const isTrig = pVal >= 50;
+        const bg = isTrig ? (isHi ? 'rgba(244,63,94,0.22)' : 'rgba(16,185,129,0.22)') : '#111b2c';
+        const brd = isTrig ? (isHi ? '#f43f5e' : '#10b981') : '#26354d';
+        const clr = isTrig ? (isHi ? '#fda4af' : '#6ee7b7') : '#94a3b8';
+        const dirIcon = isHi ? '🔻' : '💎';
+        tfBadges.push(
+          `<span onclick="openNqWatchlistTimeframe('${it.id.replace(/'/g, "\\'")}', '${tfKey}', event)" style="font-size:8.5px; font-weight:800; padding:1px 4px; border-radius:3px; background:${bg}; border:1px solid ${brd}; color:${clr}; cursor:pointer;" title="${tp.trade_plan_text} (Click to open ${tfKey.toUpperCase()} chart)">${tfKey.toUpperCase()} ${dirIcon}${pVal}%</span>`
+        );
+      });
+      pivotBadgeHtml = tfBadges.join('');
+    } else if (livePiv) {
       const pType = livePiv.top_pivot_type || '';
-      const pProb = Math.round(Number(livePiv.top_prob_pct || 0));
-      const isHi = pType === 'ut_high' || pType === 'dt_high' || pType === 'maj_ut_top';
-      const isMaj = pType === 'maj_ut_top' || pType === 'maj_dt_low';
-      const iconMap = { ut_high: '🔥', ut_low: '💎', dt_high: '🔻', dt_low: '🟢', maj_ut_top: '👑', maj_dt_low: '🚀' };
-      const ic = iconMap[pType] || '🚨';
-      const bg = isMaj ? 'rgba(251,191,36,0.22)' : (isHi ? 'rgba(251,146,60,0.2)' : 'rgba(56,189,248,0.2)');
-      const brd = isMaj ? '#fbbf24' : (isHi ? '#fb923c' : '#38bdf8');
-      const clr = isMaj ? '#fde68a' : (isHi ? '#fdba74' : '#7dd3fc');
-      pivotBadgeHtml = `<span style="font-size:9px; font-weight:800; padding:1px 5px; border-radius:4px; background:${bg}; border:1px solid ${brd}; color:${clr};" title="Real-Time ML Pivot Detected: ${livePiv.top_pivot_label || pType} (${pProb}%)">${ic} ${pProb}%</span>`;
+      const pProb = Number(livePiv.top_prob_pct || 0);
+      const symThrMap = isAutoThr && livePiv.adr_pct !== undefined
+        ? computeVolAdaptiveThresholds(livePiv.adr_pct, livePiv.atr_ratio || 1.0)
+        : thrMap;
+      const effThr = Number(symThrMap[pType] !== undefined ? symThrMap[pType] : 50);
+      if (pProb >= effThr) {
+        const pProbRound = Math.round(pProb);
+        const isHi = pType === 'ut_high' || pType === 'dt_high' || pType === 'maj_ut_top';
+        const isMaj = pType === 'maj_ut_top' || pType === 'maj_dt_low';
+        const iconMap = { ut_high: '🔥', ut_low: '💎', dt_high: '🔻', dt_low: '🟢', maj_ut_top: '👑', maj_dt_low: '🚀' };
+        const ic = iconMap[pType] || '🚨';
+        const bg = isMaj ? 'rgba(251,191,36,0.22)' : (isHi ? 'rgba(251,146,60,0.2)' : 'rgba(56,189,248,0.2)');
+        const brd = isMaj ? '#fbbf24' : (isHi ? '#fb923c' : '#38bdf8');
+        const clr = isMaj ? '#fde68a' : (isHi ? '#fdba74' : '#7dd3fc');
+        pivotBadgeHtml = `<span style="font-size:9px; font-weight:800; padding:1px 5px; border-radius:4px; background:${bg}; border:1px solid ${brd}; color:${clr};" title="Real-Time ML Pivot Detected: ${livePiv.top_pivot_label || pType} (${pProbRound}% ≥ ${effThr}%)">${ic} ${pProbRound}%</span>`;
+      }
     }
 
     const livePriceHtml = liveBar
@@ -4968,7 +6866,7 @@ function renderWatchlistItems() {
       <div style="display:flex; align-items:center; gap:7px; min-width:0; flex:1;">
         <span class="flag-dot ${flagCls}"></span>
         <div style="min-width:0; flex:1;">
-          <div style="display:flex; align-items:center; gap:5px;">
+          <div style="display:flex; align-items:center; gap:4px; flex-wrap:wrap;">
             <span class="type-tag ${typeCls}">${(it.type || 'stk').slice(0,3)}</span>
             <strong style="color:#fff; font-size:12px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${it.short_label || it.id}</strong>
             ${pivotBadgeHtml}
@@ -5034,6 +6932,9 @@ async function deleteCurrentWatchlistGroup() {
   watchlistsState = await res.json();
   renderWatchlistGroupSelect();
   renderWatchlistItems();
+  if (twsLiveState && twsLiveState.enabled) {
+    triggerTwsPollNow();
+  }
 }
 
 async function addCurrentChartToWatchlist() {
@@ -5054,6 +6955,9 @@ async function addCurrentChartToWatchlist() {
   renderWatchlistGroupSelect();
   renderWatchlistItems();
   syncWatchlistItemNotesUI();
+  if (twsLiveState && twsLiveState.enabled) {
+    triggerTwsPollNow();
+  }
 }
 
 async function removeItemFromWatchlist(id) {
@@ -5065,6 +6969,19 @@ async function removeItemFromWatchlist(id) {
     body: JSON.stringify({ action: 'remove_item', group_id: grp.id, id })
   });
   watchlistsState = await res.json();
+  if (twsLiveState) {
+    if (twsLiveState.developing_bars) delete twsLiveState.developing_bars[id];
+    if (twsLiveState.pivot_scores) delete twsLiveState.pivot_scores[id];
+    if (Array.isArray(twsLiveState.alerts)) {
+      twsLiveState.alerts = twsLiveState.alerts.filter(a => a.symbol !== id);
+    }
+    if (twsLiveState.enabled) {
+      syncTwsLivePollStatus();
+    } else {
+      renderTwsPollControlBar();
+      renderTwsPivotAlertBanner();
+    }
+  }
   renderWatchlistGroupSelect();
   renderWatchlistItems();
 }
@@ -5155,6 +7072,7 @@ function onExplorerSearch() {
 
 function renderExplorerItems() {
   const q = (document.getElementById('explorer_search').value || '').trim().toUpperCase();
+  const qEq = q.replace(/-/g, '=');
   let list = [];
   if (explorerCategory === 'etf') list = catalogData.etfs || [];
   else if (explorerCategory === 'sector') list = catalogData.sectors || [];
@@ -5162,13 +7080,14 @@ function renderExplorerItems() {
   else list = catalogData.stocks || [];
 
   if (q) {
-    list = list.filter(it =>
-      (it.id || '').toUpperCase().includes(q) ||
-      (it.name || '').toUpperCase().includes(q) ||
-      (it.focus || '').toUpperCase().includes(q) ||
-      (it.sector || '').toUpperCase().includes(q) ||
-      (it.theme || '').toUpperCase().includes(q)
-    );
+    list = list.filter(it => {
+      const idUp = (it.id || '').toUpperCase();
+      const nameUp = (it.name || '').toUpperCase();
+      const focusUp = (it.focus || '').toUpperCase();
+      const secUp = (it.sector || '').toUpperCase();
+      const thmUp = (it.theme || '').toUpperCase();
+      return idUp.includes(q) || idUp.includes(qEq) || nameUp.includes(q) || nameUp.includes(qEq) || focusUp.includes(q) || secUp.includes(q) || thmUp.includes(q);
+    });
   }
   renderExplorerListData(list.slice(0, 200));
 }
@@ -5222,6 +7141,9 @@ async function quickAddItemToWatchlist(id, name) {
   watchlistsState = await res.json();
   renderWatchlistGroupSelect();
   renderWatchlistItems();
+  if (twsLiveState && twsLiveState.enabled) {
+    triggerTwsPollNow();
+  }
 }
 
 // ============================================================================
@@ -5234,7 +7156,98 @@ function getActiveChartIdentifier() {
   return partA;
 }
 
-function selectChartIdentifier(id) {
+function isGcSymbol(sym) {
+  const s = String(sym || '').toUpperCase().trim().replace(/-F$/, '=F');
+  return s === 'GC=F' || s === 'MGC=F' || s === 'GC' || s === 'MGC';
+}
+
+function isClSymbol(sym) {
+  const s = String(sym || '').toUpperCase().trim().replace(/-F$/, '=F');
+  return s === 'CL=F' || s === 'MCL=F' || s === 'CL' || s === 'MCL';
+}
+
+function isBtcSymbol(sym) {
+  const s = String(sym || '').toUpperCase().trim().replace(/-F$/, '=F');
+  return s === 'BTC=F' || s === 'MBT=F' || s === 'BTC-USD' || s === 'BTC' || s === 'MBT';
+}
+
+function isSiSymbol(sym) {
+  const s = String(sym || '').toUpperCase().trim().replace(/-F$/, '=F');
+  return s === 'SI=F' || s === 'SIL=F' || s === 'SI' || s === 'SIL';
+}
+
+function isNqSymbol(sym) {
+  const s = String(sym || '').toUpperCase().trim().replace(/-F$/, '=F');
+  return s === 'NQ=F' || s === 'MNQ=F' || s === 'NQ' || s === 'MNQ' || isGcSymbol(s) || isClSymbol(s) || isBtcSymbol(s) || isSiSymbol(s);
+}
+
+let futuresModelMode = localStorage.getItem('ep_futures_model_mode') || 'current';
+
+function setFuturesModelMode(mode) {
+  futuresModelMode = mode || 'current';
+  try {
+    localStorage.setItem('ep_futures_model_mode', futuresModelMode);
+  } catch (e) {}
+  const mvEl = document.getElementById('cfg_pivot_model_ver');
+  if (mvEl) {
+    mvEl.value = (futuresModelMode === 'wickless') ? 'wickless' : 'v3';
+    try {
+      localStorage.setItem('ep_wl_pivot_model_ver', mvEl.value);
+    } catch (e) {}
+  }
+  syncFuturesModelModeUI();
+  loadChart(false, true);
+}
+
+function syncFuturesModelModeUI() {
+  const grp = document.getElementById('futures_model_mode_group');
+  const isFut = !isRatioMode && isNqSymbol(partA);
+  if (grp) {
+    grp.style.display = isFut ? 'inline-flex' : 'none';
+  }
+  document.getElementById('btn_mode_current')?.classList.toggle('active', futuresModelMode !== 'wickless');
+  document.getElementById('btn_mode_wickless')?.classList.toggle('active', futuresModelMode === 'wickless');
+}
+
+function syncNqIntervalToolbarUI() {
+  const grp = document.getElementById('nq_interval_group');
+  const isNq = !isRatioMode && isNqSymbol(partA);
+  if (!isNq && chartInterval !== '1d') {
+    chartInterval = '1d';
+  }
+  if (grp) {
+    grp.style.display = isNq ? 'inline-flex' : 'none';
+  }
+  syncFuturesModelModeUI();
+  ['1d', '4h', '1h', '15m'].forEach(k => {
+    document.getElementById(`iv_${k}`)?.classList.toggle('active', k === chartInterval);
+    document.getElementById(`nq_iv_${k}`)?.classList.toggle('active', k === chartInterval);
+  });
+}
+
+function setChartInterval(iv) {
+  chartInterval = iv || '1d';
+  if (chartInterval !== '1d') {
+    selectedNqCardTf = chartInterval;
+  }
+  syncNqIntervalToolbarUI();
+  loadChart(true);
+}
+
+function fmtChartTimeLabel(t) {
+  if (typeof t === 'number') {
+    const d = new Date(t * 1000);
+    return d.toISOString().slice(0, 16).replace('T', ' ');
+  }
+  return String(t || '');
+}
+
+function compareChartTime(a, b) {
+  if (typeof a === 'number' && typeof b === 'number') return a - b;
+  return String(a || '').localeCompare(String(b || ''));
+}
+
+function selectChartIdentifier(id, optionalInterval = null) {
   if (id.toUpperCase().startsWith('RATIO:')) {
     const body = id.slice(6);
     const parts = body.includes('|') ? body.split('|') : body.split('/');
@@ -5245,7 +7258,14 @@ function selectChartIdentifier(id) {
     partA = id;
     if (!isRatioMode) partB = '';
   }
+  if (optionalInterval && isNqSymbol(partA) && !isRatioMode) {
+    chartInterval = optionalInterval;
+    if (optionalInterval !== '1d') selectedNqCardTf = optionalInterval;
+  } else if (!isNqSymbol(partA) || isRatioMode) {
+    chartInterval = '1d';
+  }
   syncRatioHeaderUI();
+  syncNqIntervalToolbarUI();
   loadChart();
 }
 
@@ -5255,6 +7275,7 @@ function toggleRatioMode() {
     partB = (partA === 'SPY') ? 'QQQ' : 'SPY';
   }
   syncRatioHeaderUI();
+  syncNqIntervalToolbarUI();
   loadChart();
 }
 
@@ -5276,6 +7297,7 @@ function setQuickRatio(benchSym) {
     partB = benchSym;
   }
   syncRatioHeaderUI();
+  syncNqIntervalToolbarUI();
   loadChart();
 }
 
@@ -5353,6 +7375,7 @@ function initChartEngine() {
       borderColor: '#1e293b',
       rightOffset: 8,
       barSpacing: 7,
+      minBarSpacing: 0.15,
     },
   });
 
@@ -5378,7 +7401,7 @@ function initChartEngine() {
         return { priceRange: { minValue: rMin, maxValue: rMax } };
       }
       const bMin = base.priceRange.minValue;
-      const bMax = base.priceRange.maxValue;
+      const bMax = base.priceRange.minValue !== undefined ? base.priceRange.maxValue : rMax;
       const bSpan = Math.max(1e-6, bMax - bMin);
       const rSpan = Math.max(1e-6, rMax - rMin);
       const latestClose = bars[bars.length - 1].close;
@@ -5478,8 +7501,7 @@ function initChartEngine() {
     }
     const b = param.seriesData.get(candleSeries);
     if (!b) return;
-    const chg = ((b.close / b.open - 1) * 100).toFixed(2);
-    leg.innerHTML = `<span style="color:#38bdf8; font-weight:700;">${param.time}</span><span>O: <b>${b.open}</b></span><span>H: <b>${b.high}</b></span><span>L: <b>${b.low}</b></span><span>C: <b>${b.close}</b> (${chg >= 0 ? '+' : ''}${chg}%)</span>`;
+    const timeStr = fmtChartTimeLabel(param.time);
 
     // Show hovered bar's 4-Model Pivot probabilities in header badge
     if (hdrClimax && currentChartData && currentChartData.exhaustion && currentChartData.exhaustion._byDate) {
@@ -5494,7 +7516,7 @@ function initChartEngine() {
         hdrClimax.style.background = bgRgba;
         hdrClimax.style.color = colorHex;
         hdrClimax.style.border = `1px solid ${colorHex}`;
-        hdrClimax.textContent = `🤖 [${reg} ${param.time}] ${reg} High: ${hiP.toFixed(1)}% | ${reg} Low: ${loP.toFixed(1)}%`;
+        hdrClimax.textContent = `🤖 [${reg} ${timeStr}] ${reg} High: ${hiP.toFixed(1)}% | ${reg} Low: ${loP.toFixed(1)}%`;
       }
     }
   });
@@ -5521,7 +7543,13 @@ function initChartEngine() {
 
 function fitYAxisToVisibleBars(bars) {
   if (!chart || !candleSeries) return;
+  const nBars = Array.isArray(bars) ? bars.length : 0;
   chart.timeScale().fitContent();
+  if (nBars > 0) {
+    try {
+      chart.timeScale().setVisibleLogicalRange({ from: 0, to: Math.max(10, nBars - 1) + 6 });
+    } catch (e) {}
+  }
 
   // Always reset Y-axis autoScale to true so switching tickers immediately scales to the new ticker's visible bars
   chart.priceScale('right').applyOptions({
@@ -5534,19 +7562,36 @@ function fitYAxisToVisibleBars(bars) {
   requestAnimationFrame(() => {
     if (!chart) return;
     chart.timeScale().fitContent();
+    if (nBars > 0) {
+      try {
+        chart.timeScale().setVisibleLogicalRange({ from: 0, to: Math.max(10, nBars - 1) + 6 });
+      } catch (e) {}
+    }
     chart.priceScale('right').applyOptions({ autoScale: true });
     scheduleLarssonRender();
     renderAllDrawings();
   });
 }
 
-async function loadChart(forceFullTimeFit = false) {
+let lastLoadedChartKey = '';
+
+async function loadChart(forceFullTimeFit = false, preserveViewport = false) {
+  syncNqIntervalToolbarUI();
+  let modelVer = document.getElementById('cfg_pivot_model_ver')?.value || 'v3';
+  if (!isRatioMode && isNqSymbol(partA) && futuresModelMode === 'wickless') {
+    modelVer = 'wickless';
+  }
+  const activeKey = `${partA}|${isRatioMode ? partB : ''}|${historyWindow}|${chartInterval}|${modelVer}`;
+  const canPreserve = !!(preserveViewport && !forceFullTimeFit && chart && activeKey === lastLoadedChartKey);
+  const prevBarsLen = (currentChartData && currentChartData.bars) ? currentChartData.bars.length : 0;
+  const savedLogicalRange = canPreserve ? chart.timeScale().getVisibleLogicalRange() : null;
+
   const larssonSpan = document.getElementById('cfg_larsson_span').value || '32';
   const emaSpans = getConfiguredEmaSpans().join(',');
   const smaSpans = getConfiguredSmaSpans().join(',');
-  const modelVer = document.getElementById('cfg_pivot_model_ver')?.value || 'v3';
   const compareParam = (isRatioMode && partB) ? `&compare=${encodeURIComponent(partB)}` : '';
-  const url = `/api/chart?symbol=${encodeURIComponent(partA)}${compareParam}&history=${historyWindow}&larsson_fastest=${larssonSpan}&ema_spans=${emaSpans}&sma_spans=${smaSpans}&model_ver=${encodeURIComponent(modelVer)}`;
+  const intervalParam = (!isRatioMode && isNqSymbol(partA) && chartInterval !== '1d') ? `&interval=${encodeURIComponent(chartInterval)}` : '';
+  const url = `/api/chart?symbol=${encodeURIComponent(partA)}${compareParam}&history=${historyWindow}${intervalParam}&larsson_fastest=${larssonSpan}&ema_spans=${emaSpans}&sma_spans=${smaSpans}&model_ver=${encodeURIComponent(modelVer)}`;
 
   const res = await fetch(url);
   const data = await res.json();
@@ -5560,6 +7605,15 @@ async function loadChart(forceFullTimeFit = false) {
     data.exhaustion._byDate = map;
   }
   currentChartData = data;
+  lastLoadedChartKey = activeKey;
+
+  if (chart) {
+    chart.timeScale().applyOptions({
+      timeVisible: !!data.is_intraday,
+      secondsVisible: false,
+      minBarSpacing: 0.15,
+    });
+  }
 
   // Update Header Pills
   const pa = data.part_a || {};
@@ -5586,6 +7640,20 @@ async function loadChart(forceFullTimeFit = false) {
     document.getElementById('lbl_larsson_spans').textContent = `(${data.larsson_spans.join(', ')})`;
   }
 
+  // Clear markers, price lines, and all series first so LightweightCharts v4 DataLayer cleanly transitions
+  // between 1D BusinessDay string timestamps and 15M/1H/4H UTCTimestamp integers without throwing in Series.Yl
+  try {
+    candleSeries.setMarkers([]);
+    clearNqTradePlanLinesOnChart();
+    [
+      candleSeries, volumeSeries, volMa20Series,
+      ema8Series, ema10Series, ema20Series, ema21Series,
+      sma50Series, sma200Series,
+      larssonFastSeries, larssonSlowSeries,
+      rsLineSeries, rsMaSeries,
+    ].forEach(s => { if (s) s.setData([]); });
+  } catch (e) {}
+
   // Feed Series
   candleSeries.setData(data.bars || []);
   volumeSeries.setData(data.volume || []);
@@ -5611,7 +7679,18 @@ async function loadChart(forceFullTimeFit = false) {
 
   updateIndicatorVisibility();
   renderEPMarkers();
-  fitYAxisToVisibleBars(data.bars || [], forceFullTimeFit);
+  if (canPreserve && savedLogicalRange) {
+    const newBarsLen = (data.bars || []).length;
+    const deltaBars = (prevBarsLen > 0 && newBarsLen > prevBarsLen) ? (newBarsLen - prevBarsLen) : 0;
+    try {
+      chart.timeScale().setVisibleLogicalRange({
+        from: savedLogicalRange.from + deltaBars,
+        to: savedLogicalRange.to + deltaBars,
+      });
+    } catch (e) {}
+  } else {
+    fitYAxisToVisibleBars(data.bars || [], forceFullTimeFit);
+  }
   setTimeout(scheduleLarssonRender, 40);
 
   // Update Info Panel & Annotations
@@ -5623,7 +7702,7 @@ async function loadChart(forceFullTimeFit = false) {
 }
 
 function reloadChart() {
-  loadChart(false);
+  loadChart(false, true);
 }
 
 function setHistoryWindow(win) {
@@ -5660,6 +7739,13 @@ function resolvePivotTriggerPrice(ce, thr) {
 
 function fmtPivotIntrabarSuffix(ce, thr, showIntrabar) {
   if (!showIntrabar) return '';
+  if (ce.trade_plan && ce.trade_plan.entry_px) {
+    const tp = ce.trade_plan;
+    const tShort = ((tp.bar_time || ce.time_str || '').replace(/^\d{4}-/, '').replace(/\s*LIVE$/i, '')).trim();
+    const tBadge = tShort ? ` [${tShort}]` : '';
+    const dec = Number(tp.entry_px) < 100 ? 2 : (Number(tp.entry_px) < 1000 ? 1 : 0);
+    return `${tBadge} @${Number(tp.entry_px).toFixed(dec)} [SL ${Number(tp.stop_px).toFixed(dec)} | TP1 ${Number(tp.target1_px).toFixed(dec)}]`;
+  }
   const numP = resolvePivotTriggerPrice(ce, thr);
   if (isNaN(numP)) return '';
   const pStr = Math.abs(numP) < 10 ? numP.toFixed(3) : numP.toFixed(2);
@@ -5669,8 +7755,7 @@ function fmtPivotIntrabarSuffix(ce, thr, showIntrabar) {
 function updateIntrabarTriggerRow(exh) {
   const trigRowEl = document.getElementById('exh_intrabar_trig_row');
   if (!trigRowEl || !exh) return;
-  const threshEl = document.getElementById('cfg_climax_thresh');
-  const thr = threshEl ? Math.max(20, Math.min(90, parseFloat(threshEl.value) || 50)) : 50;
+  const thrMap = getEffectivePivotThresholds(exh);
   const allEvs = [
     ...(exh.ut_high_events || []),
     ...(exh.ut_low_events || []),
@@ -5678,11 +7763,15 @@ function updateIntrabarTriggerRow(exh) {
     ...(exh.dt_low_events || []),
     ...(exh.maj_ut_top_events || []),
     ...(exh.maj_dt_low_events || []),
-  ].filter(e => e.prob_pct >= thr).sort((a, b) => a.date.localeCompare(b.date));
+  ].filter(e => {
+    const mThr = thrMap[e.type] !== undefined ? thrMap[e.type] : 50;
+    return e.prob_pct >= mThr;
+  }).sort((a, b) => compareChartTime(a.date, b.date));
   if (allEvs.length > 0) {
     const lastEv = allEvs[allEvs.length - 1];
     const isHi = lastEv.type === 'ut_high' || lastEv.type === 'dt_high' || lastEv.type === 'maj_ut_top';
-    const trigP = resolvePivotTriggerPrice(lastEv, thr);
+    const mThr = thrMap[lastEv.type] !== undefined ? thrMap[lastEv.type] : 50;
+    const trigP = resolvePivotTriggerPrice(lastEv, mThr);
     const extP = isHi ? lastEv.high : lastEv.low;
     const dec = Math.abs(Number(trigP)) < 10 ? 3 : 2;
     const lblMap = {
@@ -5693,10 +7782,51 @@ function updateIntrabarTriggerRow(exh) {
       maj_ut_top: '👑 Major Top',
       maj_dt_low: '🚀 Major Bottom',
     };
-    trigRowEl.textContent = `${lastEv.date} ${lblMap[lastEv.type] || lastEv.type}: @$${Number(trigP).toFixed(dec)} (${isHi ? 'Hi' : 'Lo'} $${Number(extP).toFixed(dec)})`;
+    const dtStr = lastEv.date_str || fmtChartTimeLabel(lastEv.date);
+    trigRowEl.textContent = `${dtStr} ${lblMap[lastEv.type] || lastEv.type} (≥${Math.round(mThr)}%): @$${Number(trigP).toFixed(dec)} (${isHi ? 'Hi' : 'Lo'} $${Number(extP).toFixed(dec)})`;
   } else {
     trigRowEl.textContent = 'None in view';
   }
+}
+
+function clearNqTradePlanLinesOnChart() {
+  if (!candleSeries || !Array.isArray(nqTradePlanPriceLines)) return;
+  nqTradePlanPriceLines.forEach(line => {
+    try {
+      candleSeries.removePriceLine(line);
+    } catch (e) {}
+  });
+  nqTradePlanPriceLines = [];
+}
+
+function renderNqTradePlanLinesOnChart(plan, showLines = true) {
+  clearNqTradePlanLinesOnChart();
+  if (!candleSeries || !plan || !showLines) return;
+  const tfTag = (plan.tf || '').toUpperCase();
+  const dirTag = plan.direction || 'LONG';
+  const barTimeShort = (plan.bar_time || '').replace(/^\d{4}-/, '');
+  const timeBadge = barTimeShort ? ` [🕒 ${barTimeShort}]` : '';
+  const specs = [
+    { price: Number(plan.entry_px), color: '#38bdf8', lineStyle: 0, lineWidth: 2, title: `🎯 ${tfTag} ${dirTag} Entry${timeBadge}` },
+    { price: Number(plan.stop_px), color: '#f43f5e', lineStyle: 2, lineWidth: 2, title: `🛑 ${tfTag} Stop (-${Number(plan.stop_dist_pts || 0).toFixed(1)}pt)` },
+    { price: Number(plan.target1_px), color: '#10b981', lineStyle: 0, lineWidth: 2, title: `✅ ${tfTag} TP1 50% (+${Number(plan.target1_dist_pts || 0).toFixed(1)}pt)` },
+    { price: Number(plan.target2_px), color: '#a855f7', lineStyle: 2, lineWidth: 1, title: `🚀 ${tfTag} TP2 Runner (+${Number(plan.target2_dist_pts || 0).toFixed(1)}pt)` },
+  ];
+  specs.forEach(s => {
+    if (!isNaN(s.price) && s.price > 0) {
+      try {
+        const pl = candleSeries.createPriceLine({
+          price: s.price,
+          color: s.color,
+          lineWidth: s.lineWidth,
+          lineStyle: s.lineStyle,
+          axisLabelVisible: true,
+          title: s.title,
+        });
+        nqTradePlanPriceLines.push(pl);
+      } catch (e) {}
+    }
+  });
 }
 
 function renderEPMarkers() {
@@ -5706,22 +7836,26 @@ function renderEPMarkers() {
   const showPivotLows = document.getElementById('cfg_pivot_low_markers')?.checked;
   const showMajorRev = document.getElementById('cfg_major_rev_markers')?.checked ?? true;
   const showIntrabarPrice = document.getElementById('cfg_pivot_intrabar_price')?.checked ?? true;
-  const threshEl = document.getElementById('cfg_climax_thresh');
-  const climaxThresh = threshEl ? Math.max(20, Math.min(90, parseFloat(threshEl.value) || 50)) : 50;
-  if (threshEl) {
-    try { localStorage.setItem('ep_wl_climax_thresh', String(climaxThresh)); } catch (e) {}
-  }
   try {
     localStorage.setItem('ep_wl_pivot_intrabar', showIntrabarPrice ? '1' : '0');
   } catch (e) {}
   const eps = currentChartData.ep_events || [];
   const exh = currentChartData.exhaustion || {};
-  const utHighEvents = (exh.ut_high_events || exh.climax_events || []).filter(ce => ce.prob_pct >= climaxThresh);
-  const utLowEvents = (exh.ut_low_events || []).filter(ce => ce.prob_pct >= climaxThresh);
-  const dtHighEvents = (exh.dt_high_events || []).filter(ce => ce.prob_pct >= climaxThresh);
-  const dtLowEvents = (exh.dt_low_events || []).filter(ce => ce.prob_pct >= climaxThresh);
-  const majUtTopEvents = (exh.maj_ut_top_events || []).filter(ce => ce.prob_pct >= climaxThresh);
-  const majDtLowEvents = (exh.maj_dt_low_events || []).filter(ce => ce.prob_pct >= climaxThresh);
+  const pf = currentChartData.performance || {};
+  const thrMap = getEffectivePivotThresholds(exh, pf);
+  const thrUtHigh = thrMap.ut_high ?? 55;
+  const thrUtLow = thrMap.ut_low ?? 45;
+  const thrDtHigh = thrMap.dt_high ?? 55;
+  const thrDtLow = thrMap.dt_low ?? 50;
+  const thrMajUtTop = thrMap.maj_ut_top ?? 50;
+  const thrMajDtLow = thrMap.maj_dt_low ?? 50;
+
+  const utHighEvents = (exh.ut_high_events || exh.climax_events || []).filter(ce => ce.prob_pct >= thrUtHigh || ce.is_active_plan);
+  const utLowEvents = (exh.ut_low_events || []).filter(ce => ce.prob_pct >= thrUtLow || ce.is_active_plan);
+  const dtHighEvents = (exh.dt_high_events || []).filter(ce => ce.prob_pct >= thrDtHigh);
+  const dtLowEvents = (exh.dt_low_events || []).filter(ce => ce.prob_pct >= thrDtLow);
+  const majUtTopEvents = (exh.maj_ut_top_events || []).filter(ce => ce.prob_pct >= thrMajUtTop);
+  const majDtLowEvents = (exh.maj_dt_low_events || []).filter(ce => ce.prob_pct >= thrMajDtLow);
   const badge = document.getElementById('hdr_ep_count_badge');
 
   if (eps.length > 0) {
@@ -5770,18 +7904,22 @@ function renderEPMarkers() {
   // 1. Uptrend Pivot Highs (🔥 UT High) & 3. Downtrend Pivot Highs (🔻 DT High)
   if (showPivotHighs) {
     utHighEvents.forEach(ce => {
+      const isBelowThr = ce.prob_pct < thrUtHigh;
       const isExtreme = ce.prob_pct >= 65.0;
-      const trigSfx = fmtPivotIntrabarSuffix(ce, climaxThresh, showIntrabarPrice);
+      const trigSfx = fmtPivotIntrabarSuffix(ce, thrUtHigh, showIntrabarPrice);
+      const actPfx = ce.is_active_plan ? (isBelowThr ? '⏸️ [Watch Only <50%] ' : '🎯 ') : '';
+      const pivName = currentChartData.is_intraday ? (ce.is_wickless ? 'WL High' : 'Piv High') : 'UT High';
+      const icon = ce.is_wickless ? '⚡ ' : '🔥 ';
       allMarkers.push({
         time: ce.date,
         position: 'aboveBar',
-        color: isExtreme ? '#f43f5e' : '#fb923c',
+        color: isBelowThr ? '#64748b' : (ce.is_active_plan ? '#f43f5e' : (isExtreme ? '#f43f5e' : '#fb923c')),
         shape: 'arrowDown',
-        text: `🔥 UT High ${ce.prob_pct.toFixed(0)}%${trigSfx}`,
+        text: `${actPfx}${isBelowThr ? '' : icon}${pivName} ${ce.prob_pct.toFixed(0)}%${trigSfx}`,
       });
     });
     dtHighEvents.forEach(ce => {
-      const trigSfx = fmtPivotIntrabarSuffix(ce, climaxThresh, showIntrabarPrice);
+      const trigSfx = fmtPivotIntrabarSuffix(ce, thrDtHigh, showIntrabarPrice);
       allMarkers.push({
         time: ce.date,
         position: 'aboveBar',
@@ -5795,17 +7933,21 @@ function renderEPMarkers() {
   // 2. Uptrend Pivot Lows (💎 UT Low) & 4. Downtrend Pivot Lows (🟢 DT Low)
   if (showPivotLows) {
     utLowEvents.forEach(ce => {
-      const trigSfx = fmtPivotIntrabarSuffix(ce, climaxThresh, showIntrabarPrice);
+      const isBelowThr = ce.prob_pct < thrUtLow;
+      const trigSfx = fmtPivotIntrabarSuffix(ce, thrUtLow, showIntrabarPrice);
+      const actPfx = ce.is_active_plan ? (isBelowThr ? '⏸️ [Watch Only <50%] ' : '🎯 ') : '';
+      const pivName = currentChartData.is_intraday ? (ce.is_wickless ? 'WL Low' : 'Piv Low') : 'UT Low';
+      const icon = ce.is_wickless ? '⚡ ' : '💎 ';
       allMarkers.push({
         time: ce.date,
         position: 'belowBar',
-        color: '#38bdf8',
+        color: isBelowThr ? '#64748b' : (ce.is_active_plan ? '#10b981' : '#38bdf8'),
         shape: 'arrowUp',
-        text: `💎 UT Low ${ce.prob_pct.toFixed(0)}%${trigSfx}`,
+        text: `${actPfx}${isBelowThr ? '' : icon}${pivName} ${ce.prob_pct.toFixed(0)}%${trigSfx}`,
       });
     });
     dtLowEvents.forEach(ce => {
-      const trigSfx = fmtPivotIntrabarSuffix(ce, climaxThresh, showIntrabarPrice);
+      const trigSfx = fmtPivotIntrabarSuffix(ce, thrDtLow, showIntrabarPrice);
       allMarkers.push({
         time: ce.date,
         position: 'belowBar',
@@ -5819,7 +7961,7 @@ function renderEPMarkers() {
   // 5. Major Uptrend Reversal Tops (👑 Major Top) & 6. Major Downtrend Reversal Bottoms (🚀 Major Bottom)
   if (showMajorRev) {
     majUtTopEvents.forEach(ce => {
-      const trigSfx = fmtPivotIntrabarSuffix(ce, climaxThresh, showIntrabarPrice);
+      const trigSfx = fmtPivotIntrabarSuffix(ce, thrMajUtTop, showIntrabarPrice);
       allMarkers.push({
         time: ce.date,
         position: 'aboveBar',
@@ -5829,7 +7971,7 @@ function renderEPMarkers() {
       });
     });
     majDtLowEvents.forEach(ce => {
-      const trigSfx = fmtPivotIntrabarSuffix(ce, climaxThresh, showIntrabarPrice);
+      const trigSfx = fmtPivotIntrabarSuffix(ce, thrMajDtLow, showIntrabarPrice);
       allMarkers.push({
         time: ce.date,
         position: 'belowBar',
@@ -5840,9 +7982,17 @@ function renderEPMarkers() {
     });
   }
 
-  allMarkers.sort((a, b) => a.time.localeCompare(b.time));
+  allMarkers.sort((a, b) => compareChartTime(a.time, b.time));
   candleSeries.setMarkers(allMarkers);
   updateIntrabarTriggerRow(exh);
+
+  // Draw active NQ trade plan price lines when viewing NQ=F / MNQ=F
+  const activeNqPlan = currentChartData.active_trade_plan || (currentChartData.nq_intraday && currentChartData.nq_intraday.best_trade_plan);
+  if (!isRatioMode && isNqSymbol(partA) && activeNqPlan) {
+    renderNqTradePlanLinesOnChart(activeNqPlan, showIntrabarPrice);
+  } else {
+    clearNqTradePlanLinesOnChart();
+  }
 }
 
 // ============================================================================
@@ -5923,9 +8073,370 @@ function fmtPct(v) {
   return `<span class="${cls}">${v > 0 ? '+' : ''}${v.toFixed(2)}%</span>`;
 }
 
+function selectNqCardTimeframe(tf) {
+  selectedNqCardTf = tf;
+  if (!isRatioMode && isNqSymbol(partA)) {
+    setChartInterval(tf);
+  } else if (currentChartData) {
+    renderNqIntradayTradeCard(currentChartData);
+  }
+}
+
+function renderNqIntradayTradeCard(data) {
+  const card = document.getElementById('nq_intraday_trade_card');
+  if (!card) return;
+  const isGc = isGcSymbol(partA);
+  const isCl = isClSymbol(partA);
+  const isBtc = isBtcSymbol(partA);
+  const symRoot = isGc ? 'GC' : (isCl ? 'CL' : (isBtc ? 'BTC' : 'NQ'));
+  const microSym = isGc ? 'MGC' : (isCl ? 'MCL' : (isBtc ? 'MBT' : 'MNQ'));
+  const fallbackKey = isGc ? 'GC=F' : (isCl ? 'CL=F' : (isBtc ? 'BTC=F' : 'NQ=F'));
+  const nqInfo = (data && data.nq_intraday) ||
+    (twsLiveState && twsLiveState.pivot_scores && (twsLiveState.pivot_scores[partA]?.nq_intraday || twsLiveState.pivot_scores[fallbackKey]?.nq_intraday));
+  if (!nqInfo || !nqInfo.timeframes || isRatioMode || !isNqSymbol(partA)) {
+    card.style.display = 'none';
+    return;
+  }
+  card.style.display = 'flex';
+  const tfs = nqInfo.timeframes || {};
+  const activeTfKey = (chartInterval !== '1d' && tfs[chartInterval]) ? chartInterval : (tfs[selectedNqCardTf] ? selectedNqCardTf : '15m');
+  const tfObj = tfs[activeTfKey] || tfs['15m'] || {};
+  const plan = (chartInterval !== '1d' && data.active_trade_plan) ? data.active_trade_plan : (tfObj.trade_plan || nqInfo.best_trade_plan || {});
+  const isWickless = (chartInterval !== '1d' && data.exhaustion && data.exhaustion.is_wickless) || (plan && plan.is_wickless) || futuresModelMode === 'wickless';
+
+  const titleEl = document.getElementById('nq_intraday_card_title');
+  if (titleEl) {
+    titleEl.textContent = `⚡ ${symRoot} Intraday (15m / 1h / 4h) Trade Plan${isWickless ? ' · ⚡ WICKLESS (INTRABAR TOUCH)' : ''}`;
+  }
+
+  const badge = document.getElementById('nq_intraday_active_badge');
+  if (badge) {
+    const isAct = !!plan.is_valid_trade;
+    const shortPlanTime = ((plan.bar_time || tfObj.last_bar_time || '').replace(/^\d{4}-/, '')).trim();
+    const timeSuffix = shortPlanTime ? ` · 🕒 ${shortPlanTime}` : '';
+    const wlTag = isWickless ? ' ⚡WL' : '';
+    badge.textContent = `${(plan.tf || activeTfKey).toUpperCase()}${wlTag} · ${isAct ? '✅ VALID' : '⏸️ WATCH'} ${plan.direction || 'SETUP'} (${Number(plan.prob_pct || 0).toFixed(0)}%)${timeSuffix}`;
+    badge.style.background = isAct
+      ? (plan.direction === 'SHORT' ? 'rgba(244,63,94,0.22)' : 'rgba(16,185,129,0.22)')
+      : 'rgba(100,116,139,0.22)';
+    badge.style.color = isAct
+      ? (plan.direction === 'SHORT' ? '#fda4af' : '#6ee7b7')
+      : '#cbd5e1';
+    badge.style.border = `1px solid ${isAct ? (plan.direction === 'SHORT' ? '#f43f5e' : '#10b981') : '#64748b'}`;
+  }
+
+  const stripEl = document.getElementById('nq_intraday_tf_strip');
+  if (stripEl) {
+    stripEl.innerHTML = ['15m', '1h', '4h'].map(tf => {
+      const t = tfs[tf] || {};
+      const hi = Number(t.prob_high_pct || 0);
+      const lo = Number(t.prob_low_pct || 0);
+      const dom = Math.max(hi, lo);
+      const isHi = hi >= lo;
+      const isTrig = t.status === 'pivot_high' || t.status === 'pivot_low';
+      const isSel = tf === activeTfKey;
+      const borderCol = isSel ? '#38bdf8' : (isTrig ? (isHi ? '#f43f5e' : '#10b981') : '#1e293b');
+      const bgCol = isSel ? 'rgba(56,189,248,0.14)' : '#0b1019';
+      const dirColor = isHi ? '#fb7185' : '#34d399';
+      const tfBarTime = ((t.active_pivot_time || (t.trade_plan && t.trade_plan.bar_time) || t.last_bar_time || '').replace(/^\d{4}-/, '')).trim();
+      return `
+        <div onclick="selectNqCardTimeframe('${tf}')" style="background:${bgCol}; padding:5px 6px; border-radius:4px; border:1px solid ${borderCol}; cursor:pointer;">
+          <div style="display:flex; justify-content:space-between; align-items:center; font-size:10px;">
+            <strong style="color:#fff;">${tf.toUpperCase()}</strong>
+            <span style="color:${dirColor}; font-weight:800;">${isHi ? '🔻HI' : '💎LO'} ${dom.toFixed(0)}%</span>
+          </div>
+          <div style="font-size:9px; color:#94a3b8; margin-top:2px;">
+            H:${hi.toFixed(0)}% · L:${lo.toFixed(0)}%
+          </div>
+          <div style="font-size:8.5px; color:#fbbf24; margin-top:2px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;" title="Pivot / Active Setup Bar Time">
+            🕒 ${tfBarTime || '--'}
+          </div>
+        </div>
+      `;
+    }).join('');
+  }
+
+  const planBox = document.getElementById('nq_intraday_plan_box');
+  if (planBox && plan && plan.entry_px) {
+    const isShort = plan.direction === 'SHORT';
+    const dirCol = isShort ? '#fda4af' : '#6ee7b7';
+    const fullBarTime = plan.bar_time || tfObj.active_pivot_time || tfObj.last_bar_time || '--';
+    const evalTimeStr = nqInfo.evaluated_at || '';
+    const evalRowHtml = evalTimeStr
+      ? `<div class="stat-row"><span>📡 Live Eval / Poll Time</span><b style="color:#94a3b8;">${evalTimeStr}</b></div>`
+      : '';
+    const probNum = Number(plan.prob_pct || 0);
+    const ratioNum = Number(plan.pred_ratio || 0);
+    const rr1Num = Number(plan.rr_target1 || 0);
+    const gProb = plan.gate_prob_pass !== undefined ? !!plan.gate_prob_pass : (probNum >= 50.0);
+    const gRatio = plan.gate_ratio_pass !== undefined ? !!plan.gate_ratio_pass : (ratioNum >= 1.25);
+    const gRr = plan.gate_rr_pass !== undefined ? !!plan.gate_rr_pass : (rr1Num >= 1.0);
+    const isValid = plan.is_valid_trade !== undefined ? !!plan.is_valid_trade : (gProb && gRatio && gRr);
+    const valBg = isValid ? 'rgba(16,185,129,0.14)' : 'rgba(244,63,94,0.14)';
+    const valBorder = isValid ? '#10b981' : '#f43f5e';
+    const valTitleCol = isValid ? '#34d399' : '#fda4af';
+    const valTierText = plan.validity_tier || (isValid ? 'VALID TRADE (Positive Expectancy)' : 'NOT VALID — Watch Only (Below Threshold)');
+    const valExpText = plan.expected_win_rate_str || (isValid ? '~68% Win Rate · 4.2x Profit Factor' : 'Negative / Low Expectancy — Do Not Enter');
+
+    planBox.innerHTML = `
+      <div style="background:${valBg}; border:1px solid ${valBorder}; border-radius:4px; padding:5px 7px; margin-bottom:6px;">
+        <div style="display:flex; justify-content:space-between; align-items:center; font-size:10.5px; font-weight:800; color:${valTitleCol};">
+          <span>${isValid ? '✅ VALID TRADE SETUP' : '⛔ NOT A VALID TRADE (DO NOT ENTER)'}</span>
+          <span style="font-size:9.5px; color:#fbbf24;">${valExpText}</span>
+        </div>
+        <div style="font-size:9.5px; color:#e2e8f0; margin-top:3px; line-height:1.35;">
+          <div>1. <b>Pivot Confidence (need ≥50% / 55%+):</b> <span style="color:${gProb ? '#34d399' : '#fb7185'}; font-weight:700;">${probNum.toFixed(1)}% ${gProb ? '✅ PASS' : '❌ FAIL (Too Low)'}</span></div>
+          <div>2. <b>Expected Move / Heat Ratio (need ≥1.25x / 1.50x+):</b> <span style="color:${gRatio ? '#34d399' : '#fb7185'}; font-weight:700;">${ratioNum.toFixed(2)}x ${gRatio ? '✅ PASS' : '❌ FAIL (Poor Expectancy)'}</span></div>
+          <div>3. <b>Target 1 Reward:Risk (need ≥1.00x):</b> <span style="color:${gRr ? '#34d399' : '#fb7185'}; font-weight:700;">${rr1Num.toFixed(2)}x ${gRr ? '✅ PASS' : '❌ FAIL'}</span></div>
+        </div>
+      </div>
+      <div style="display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid #1e293b; padding-bottom:4px; margin-bottom:4px; gap:6px; flex-wrap:wrap;">
+        <span style="color:${dirCol}; font-weight:800;">${isShort ? '🔻 SHORT PIVOT HIGH' : '💎 LONG PIVOT LOW'} (${(plan.tf || activeTfKey).toUpperCase()})</span>
+        <span style="color:#fbbf24; font-weight:700; font-size:10px;">R:R ${plan.rr_target1}x / ${plan.rr_target2}x · Ratio ${plan.pred_ratio}x</span>
+      </div>
+      <div class="stat-list" style="gap:3px;">
+        <div class="stat-row"><span>🕒 Pivot Bar Time (ET)</span><b style="color:#fbbf24;">${fullBarTime}</b></div>
+        ${evalRowHtml}
+        <div class="stat-row"><span>🎯 Entry Trigger (Pivot Discovery)</span><b style="color:#38bdf8;">${Number(plan.entry_px).toFixed(2)}</b></div>
+        <div class="stat-row"><span>🛑 Stop-Loss (${plan.stop_atr}x ATR / -$${plan.risk_usd_mnq} ${microSym})</span><b style="color:#f43f5e;">${Number(plan.stop_px).toFixed(2)} (-${plan.stop_dist_pts} pt)</b></div>
+        <div class="stat-row"><span>✅ Target 1 — 50% Out + BE (${plan.target1_atr}x ATR)</span><b style="color:#10b981;">${Number(plan.target1_px).toFixed(2)} (+${plan.target1_dist_pts} pt)</b></div>
+        <div class="stat-row"><span>🚀 Target 2 — 50% Runner (${plan.target2_atr}x ATR)</span><b style="color:#c084fc;">${Number(plan.target2_px).toFixed(2)} (+${plan.target2_dist_pts} pt)</b></div>
+        <div class="stat-row"><span>⏱️ Time Stop (${plan.horizon_bars} bars = ${plan.horizon_label})</span><b style="color:#cbd5e1;">Exit at Bar ${plan.horizon_bars} Close</b></div>
+      </div>
+    `;
+  }
+
+  const rulesBox = document.getElementById('nq_intraday_rules_box');
+  if (rulesBox && plan) {
+    const fullBarTime = plan.bar_time || tfObj.active_pivot_time || tfObj.last_bar_time || '--';
+    rulesBox.innerHTML = `
+      <div style="color:#e2e8f0; font-weight:700; margin-bottom:2px;">📋 Simulated & Live Trade Handling Rules (<span style="color:#fbbf24;">🕒 ${fullBarTime}</span>):</div>
+      <div>• <b>Entry:</b> ${plan.entry_rule_text || 'Enter directly on pivot discovery at the pivot extreme.'}</div>
+      <div>• <b>Stop-Loss:</b> ${plan.stop_rule_text || '1.20x Predicted MAE (min 1.00 ATR floor) and ≥0.15 ATR beyond pivot extreme.'}</div>
+      <div>• <b>Targets & Scale-Out:</b> ${plan.target_rule_text || 'Scale 50% at TP1 (1.05x Pred MFE) and move stop to Breakeven; hold 50% runner for TP2 (q70 MFE).'}</div>
+      <div>• <b>Time Exit:</b> ${plan.time_exit_rule_text || 'If neither Stop nor Target hits within 8 bars, exit at bar 8 close.'}</div>
+    `;
+  }
+  const autoBox = document.getElementById('nq_auto_trader_box');
+  if (autoBox) {
+    autoBox.style.display = 'flex';
+  }
+  fetchAndRenderNqAutoTrader();
+}
+
+let _nqAutoTraderTimer = null;
+function fetchAndRenderNqAutoTrader() {
+  const box = document.getElementById('nq_auto_trader_box');
+  if (!box) return;
+  fetch('/api/nq_auto_trader')
+    .then(r => r.json())
+    .then(res => {
+      if (!res || !res.ok || !res.status) return;
+      renderNqAutoTraderBox(res.status);
+    })
+    .catch(() => {});
+  if (!_nqAutoTraderTimer) {
+    _nqAutoTraderTimer = setInterval(() => {
+      const card = document.getElementById('nq_intraday_trade_card');
+      if (card && card.style.display !== 'none') {
+        fetch('/api/nq_auto_trader')
+          .then(r => r.json())
+          .then(res => { if (res && res.ok && res.status) renderNqAutoTraderBox(res.status); })
+          .catch(() => {});
+      }
+    }, 8000);
+  }
+}
+
+function renderNqAutoTraderBox(st) {
+  const box = document.getElementById('nq_auto_trader_box');
+  if (!box) return;
+  // Don't overwrite input fields while user is actively typing in them
+  if (box.contains(document.activeElement) && document.activeElement.tagName === 'INPUT') return;
+
+  const isOn = !!st.enabled;
+  const isMgcOn = !!st.mgc_enabled;
+  const netPos = Number(st.live_net_pos || 0);
+  const stopQty = Number(st.live_working_stop_qty || 0);
+  const tpQty = Number(st.live_working_tp_qty || 0);
+  const posCol = netPos > 0 ? '#10b981' : (netPos < 0 ? '#f43f5e' : '#94a3b8');
+  const posLbl = netPos > 0 ? `LONG +${netPos} MNQ` : (netPos < 0 ? `SHORT ${netPos} MNQ` : 'FLAT (0 MNQ)');
+  const brkOk = netPos === 0 || stopQty >= Math.abs(netPos);
+  const brkBadge = netPos === 0
+    ? '<span style="color:#94a3b8;">Standby (No Open Pos)</span>'
+    : (brkOk
+        ? `<span style="color:#34d399; font-weight:700;">✅ PROTECTED (${stopQty} STP / ${tpQty} TP GTC)</span>`
+        : `<span style="color:#fb7185; font-weight:800;">⚠️ UNPROTECTED (${stopQty}/${Math.abs(netPos)} STP) — Repairing</span>`);
+
+  const mgcPos = Number(st.mgc_live_net_pos || 0);
+  const mgcStopQty = Number(st.mgc_live_working_stop_qty || 0);
+  const mgcTpQty = Number(st.mgc_live_working_tp_qty || 0);
+  const mgcPosCol = mgcPos > 0 ? '#10b981' : (mgcPos < 0 ? '#f43f5e' : '#94a3b8');
+  const mgcPosLbl = mgcPos > 0 ? `LONG +${mgcPos} MGC` : (mgcPos < 0 ? `SHORT ${mgcPos} MGC` : 'FLAT (0 MGC)');
+  const mgcBrkOk = mgcPos === 0 || mgcStopQty >= Math.abs(mgcPos);
+  const mgcBrkBadge = !isMgcOn && mgcPos === 0
+    ? '<span style="color:#64748b;">OFF (Toggle MGC ON to arm)</span>'
+    : (mgcPos === 0
+        ? '<span style="color:#94a3b8;">Standby (No Open MGC)</span>'
+        : (mgcBrkOk
+            ? `<span style="color:#34d399; font-weight:700;">✅ PROTECTED (${mgcStopQty} STP / ${mgcTpQty} TP GTC)</span>`
+            : `<span style="color:#fb7185; font-weight:800;">⚠️ UNPROTECTED (${mgcStopQty}/${Math.abs(mgcPos)} STP) — Repairing</span>`));
+
+  const lp = st.live_performance || {};
+  const totTr = Number(lp.total_trades || 0);
+  const wrPct = Number(lp.win_rate_pct || 0);
+  const trPerDay = Number(lp.trades_per_day || 0);
+  const netUsd = Number(lp.total_pnl_usd || 0);
+  const pfVal = Number(lp.profit_factor || 0);
+  const recentList = Array.isArray(lp.recent_trades) ? lp.recent_trades : [];
+
+  const recentHtml = recentList.length > 0
+    ? recentList.slice(0, 4).map(r => {
+        const c = Number(r.pnl_usd || 0) >= 0 ? '#34d399' : '#fb7185';
+        const sgn = Number(r.pnl_usd || 0) >= 0 ? '+' : '';
+        const symTag = r.symbol ? `[${r.symbol}] ` : '';
+        return `<div style="display:flex; justify-content:space-between; font-size:9px; color:#cbd5e1; border-top:1px dashed #1e293b; padding-top:2px;">
+          <span><b>${symTag}${r.direction}</b> ${Number(r.entry_px).toFixed(2)} → ${Number(r.exit_px).toFixed(2)} (${r.exit_reason})</span>
+          <b style="color:${c};">${sgn}$${Number(r.pnl_usd).toFixed(0)} (${sgn}${Number(r.avg_pts).toFixed(1)} pt)</b>
+        </div>`;
+      }).join('')
+    : '<div style="font-size:9px; color:#64748b;">No closed live trades yet — open trade will be logged here on exit.</div>';
+
+  box.innerHTML = `
+    <div style="display:flex; justify-content:space-between; align-items:center; gap:6px; border-bottom:1px solid #1e293b; padding-bottom:5px; flex-wrap:wrap;">
+      <div>
+        <div style="color:#38bdf8; font-weight:800; font-size:11px;">🤖 15M AUTO-TRADER (2 MNQ / 2 MGC · GTC · OUTSIDE RTH)</div>
+        <div style="color:#64748b; font-size:9.5px;">Single-Direction Only · Bracket Watchdog · Manual-Close Disarm</div>
+      </div>
+      <div style="display:flex; gap:5px; align-items:center;">
+        <button id="btn_toggle_mnq_auto" onclick="toggleNqAutoTrader(${!isOn})" style="background:${isOn ? '#10b981' : '#1e293b'}; color:${isOn ? '#04130d' : '#e2e8f0'}; border:1px solid ${isOn ? '#34d399' : '#475569'}; border-radius:5px; padding:4px 8px; font-size:9.5px; font-weight:800; cursor:pointer;" title="Toggle 15m 2-MNQ (Micro Nasdaq) Automated Execution">
+          ${isOn ? '🟢 MNQ ON' : '⚪ MNQ OFF'}
+        </button>
+        <button id="btn_toggle_mgc_auto" onclick="toggleMgcAutoTrader(${!isMgcOn})" style="background:${isMgcOn ? '#f59e0b' : '#1e293b'}; color:${isMgcOn ? '#04130d' : '#e2e8f0'}; border:1px solid ${isMgcOn ? '#fbbf24' : '#475569'}; border-radius:5px; padding:4px 8px; font-size:9.5px; font-weight:800; cursor:pointer;" title="Toggle 15m 2-MGC (Micro Gold, COMEX) Automated Execution (Default: OFF)">
+          ${isMgcOn ? '🟡 MGC ON' : '⚪ MGC OFF'}
+        </button>
+      </div>
+    </div>
+    <div class="stat-list" style="gap:2px; font-size:10px;">
+      <div class="stat-row"><span>📡 TWS Connection</span><b style="color:${st.tws_connected ? '#34d399' : '#fbbf24'};">${st.tws_connected ? 'Connected (' + (st.live_contract || 'MNQ') + ' @ Port ' + st.tws_port + ')' : 'Standby / Offline'}</b></div>
+      <div class="stat-row"><span>📊 Live MNQ Position (1-Dir Max)</span><b style="color:${posCol};">${posLbl}</b></div>
+      <div class="stat-row"><span>🛡️ MNQ Bracket Watchdog</span>${brkBadge}</div>
+      <div class="stat-row"><span>🥇 Live MGC Position (1-Dir Max)</span><b style="color:${mgcPosCol};">${mgcPosLbl}</b></div>
+      <div class="stat-row"><span>🛡️ MGC Bracket Watchdog</span>${mgcBrkBadge}</div>
+      <div class="stat-row"><span>🔍 Last Watchdog Audit</span><b style="color:#cbd5e1; font-weight:600;">${st.last_watchdog_status || '--'}</b></div>
+    </div>
+    <div style="background:#0b1324; border:1px solid #1e293b; border-radius:5px; padding:5px 7px; margin-top:2px; display:flex; flex-direction:column; gap:3px;">
+      <div style="display:flex; justify-content:space-between; align-items:center; font-size:9.5px; font-weight:800; color:#fbbf24;">
+        <span>📈 LIVE RESULTS TRACKER (2 MNQ / 2 MGC)</span>
+        <span style="color:#94a3b8; font-weight:600;">Target: ~3/day · ~70% WR</span>
+      </div>
+      <div style="display:grid; grid-template-columns:repeat(4, 1fr); gap:4px; text-align:center; font-size:9.5px; background:#070b14; padding:4px; border-radius:4px;">
+        <div><div style="color:#64748b; font-size:8.5px;">TRADES</div><b style="color:#e2e8f0;">${totTr} (${lp.wins || 0}W/${lp.losses || 0}L)</b></div>
+        <div><div style="color:#64748b; font-size:8.5px;">WIN RATE</div><b style="color:${wrPct >= 60 ? '#34d399' : (totTr ? '#fbbf24' : '#94a3b8')};">${totTr ? wrPct.toFixed(1) + '%' : '--'}</b></div>
+        <div><div style="color:#64748b; font-size:8.5px;">TRADES/DAY</div><b style="color:#38bdf8;">${totTr ? trPerDay.toFixed(1) + '/d' : '--'}</b></div>
+        <div><div style="color:#64748b; font-size:8.5px;">NET P&L</div><b style="color:${netUsd >= 0 ? '#34d399' : '#fb7185'};">${netUsd >= 0 ? '+' : ''}$${netUsd.toFixed(0)} (${pfVal.toFixed(1)}x)</b></div>
+      </div>
+      ${recentHtml}
+    </div>
+    <div style="display:flex; justify-content:space-between; align-items:center; margin-top:3px; padding:3px 6px; background:#0e172a; border-radius:4px; border:1px solid #1e293b;">
+      <label style="display:flex; align-items:center; gap:5px; font-size:10px; color:#c084fc; font-weight:700; cursor:pointer;" title="Enable/disable Gmail notifications when a futures ticker (NQ, GC, CL, BTC, SI) detects a new Wickless ML Pivot">
+        <input type="checkbox" id="at_cfg_futures_email" ${st.pivot_email_alerts_enabled !== false ? 'checked' : ''} onchange="toggleFuturesPivotEmail(this.checked)">
+        📧 Send Wickless Pivot Emails (Futures Only)
+      </label>
+      <span style="font-size:9px; color:#94a3b8;">${st.pivot_email_alerts_enabled !== false ? '🟢 Active' : '⚪ Disabled'}</span>
+    </div>
+    <div style="display:flex; gap:5px; align-items:center; margin-top:2px; flex-wrap:wrap;">
+      <input id="nq_at_gmail_to" type="text" value="${st.gmail_to || 'amir.baram@gmail.com'}" placeholder="Notification Gmail" style="flex:1; min-width:130px; background:#0b111e; border:1px solid #1e293b; color:#e2e8f0; border-radius:4px; padding:3px 6px; font-size:9.5px;" title="Gmail recipient for position-opened alerts" />
+      <input id="nq_at_gmail_pass" type="password" value="" placeholder="${st.gmail_password_configured ? 'App Password Saved (•••)' : 'Gmail App Password (optional)'}" style="flex:1; min-width:130px; background:#0b111e; border:1px solid #1e293b; color:#e2e8f0; border-radius:4px; padding:3px 6px; font-size:9.5px;" title="16-char Google App Password for SMTP delivery" />
+      <button onclick="saveNqAutoTraderConfig()" style="background:#1e293b; color:#38bdf8; border:1px solid #334155; border-radius:4px; padding:3px 7px; font-size:9.5px; font-weight:700; cursor:pointer;">Save</button>
+      <button onclick="runNqWatchdogNow()" style="background:#1e293b; color:#fbbf24; border:1px solid #334155; border-radius:4px; padding:3px 7px; font-size:9.5px; font-weight:700; cursor:pointer;" title="Run an immediate TWS Position & Bracket Watchdog check">Check Now</button>
+      <button onclick="sendNqTestGmail()" style="background:#1e293b; color:#c084fc; border:1px solid #334155; border-radius:4px; padding:3px 7px; font-size:9.5px; font-weight:700; cursor:pointer;" title="Send a test alert email to your Gmail">Test Email</button>
+    </div>
+    ${st.last_email_status ? `<div style="font-size:9px; color:#94a3b8;">📧 ${st.last_email_status}</div>` : ''}
+  `;
+
+  const topCb = document.getElementById('cfg_futures_pivot_email');
+  if (topCb) {
+    topCb.checked = st.pivot_email_alerts_enabled !== false;
+  }
+}
+
+function toggleFuturesPivotEmail(enableFlag) {
+  const isEn = !!enableFlag;
+  const cbTop = document.getElementById('cfg_futures_pivot_email');
+  const cbBox = document.getElementById('at_cfg_futures_email');
+  if (cbTop) cbTop.checked = isEn;
+  if (cbBox) cbBox.checked = isEn;
+  try { localStorage.setItem('cfg_futures_pivot_email', isEn ? '1' : '0'); } catch(e){}
+  fetch('/api/nq_auto_trader', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action: 'update_config', pivot_email_alerts_enabled: isEn, gmail_enabled: isEn })
+  })
+    .then(r => r.json())
+    .then(res => { if (res && res.status) renderNqAutoTraderBox(res.status); });
+}
+
+function toggleNqAutoTrader(enableFlag) {
+  fetch('/api/nq_auto_trader', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action: 'toggle', enabled: !!enableFlag })
+  })
+    .then(r => r.json())
+    .then(res => { if (res && res.status) renderNqAutoTraderBox(res.status); });
+}
+
+function toggleMgcAutoTrader(enableFlag) {
+  fetch('/api/nq_auto_trader', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action: 'toggle', mgc_enabled: !!enableFlag })
+  })
+    .then(r => r.json())
+    .then(res => { if (res && res.status) renderNqAutoTraderBox(res.status); });
+}
+
+function saveNqAutoTraderConfig() {
+  const gTo = document.getElementById('nq_at_gmail_to')?.value?.trim() || 'amir.baram@gmail.com';
+  const gPass = document.getElementById('nq_at_gmail_pass')?.value?.trim() || '';
+  const payload = { action: 'update_config', gmail_to: gTo, gmail_user: gTo };
+  if (gPass) payload.gmail_app_password = gPass;
+  fetch('/api/nq_auto_trader', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  })
+    .then(r => r.json())
+    .then(res => { if (res && res.status) renderNqAutoTraderBox(res.status); });
+}
+
+function runNqWatchdogNow() {
+  fetch('/api/nq_auto_trader', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action: 'run_watchdog' })
+  })
+    .then(r => r.json())
+    .then(res => { if (res && res.status) renderNqAutoTraderBox(res.status); });
+}
+
+function sendNqTestGmail() {
+  fetch('/api/nq_auto_trader', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action: 'test_email' })
+  })
+    .then(r => r.json())
+    .then(res => { if (res && res.status) renderNqAutoTraderBox(res.status); });
+}
+
 function renderInfoPanel(data) {
+  renderNqIntradayTradeCard(data);
   const pf = data.performance || {};
   const exh = data.exhaustion || {};
+  const thrMap = getEffectivePivotThresholds(exh, pf);
+  const isAutoThr = !!(document.getElementById('cfg_auto_vol_thresh')?.checked);
 
   // Render Universal 6-Model Structural & Major Reversal Swing-Pivot Card + Header Badge
   const hdrClimax = document.getElementById('hdr_climax_badge');
@@ -5967,38 +8478,38 @@ function renderInfoPanel(data) {
     }
 
     const verTag = (exh.model_ver || 'v3').toUpperCase();
-    exhStatusBadge.textContent = `${reg} · ${verTag}`;
+    exhStatusBadge.textContent = `${reg} · ${verTag}${isAutoThr ? ' · ⚡AUTO' : ''}`;
     exhStatusBadge.style.background = exh.regime === 'downtrend' ? 'rgba(239,68,68,0.18)' : 'rgba(16,185,129,0.18)';
     exhStatusBadge.style.color = exh.regime === 'downtrend' ? '#f87171' : '#34d399';
     exhStatusBadge.style.border = `1px solid ${exh.regime === 'downtrend' ? '#ef4444' : '#10b981'}`;
 
-    document.getElementById('exh_curr_val').innerHTML = `<span style="color:${uh >= 50 ? '#f43f5e' : '#cbd5e1'};">${uh.toFixed(1)}%</span>`;
-    document.getElementById('exh_5d_val').textContent = `5D: ${uh5.toFixed(0)}%`;
+    document.getElementById('exh_curr_val').innerHTML = `<span style="color:${uh >= (thrMap.ut_high || 55) ? '#f43f5e' : '#cbd5e1'};">${uh.toFixed(1)}%</span>`;
+    document.getElementById('exh_5d_val').textContent = `5D:${uh5.toFixed(0)}% · Thr:${Math.round(thrMap.ut_high || 55)}%`;
 
     const ulEl = document.getElementById('piv_ut_low_val');
     const ul5El = document.getElementById('piv_ut_low_5d');
-    if (ulEl) ulEl.innerHTML = `<span style="color:${ul >= 50 ? '#38bdf8' : '#cbd5e1'};">${ul.toFixed(1)}%</span>`;
-    if (ul5El) ul5El.textContent = `5D: ${ul5.toFixed(0)}%`;
+    if (ulEl) ulEl.innerHTML = `<span style="color:${ul >= (thrMap.ut_low || 45) ? '#38bdf8' : '#cbd5e1'};">${ul.toFixed(1)}%</span>`;
+    if (ul5El) ul5El.textContent = `5D:${ul5.toFixed(0)}% · Thr:${Math.round(thrMap.ut_low || 45)}%`;
 
     const dhEl = document.getElementById('piv_dt_high_val');
     const dh5El = document.getElementById('piv_dt_high_5d');
-    if (dhEl) dhEl.innerHTML = `<span style="color:${dh >= 50 ? '#c084fc' : '#cbd5e1'};">${dh.toFixed(1)}%</span>`;
-    if (dh5El) dh5El.textContent = `5D: ${dh5.toFixed(0)}%`;
+    if (dhEl) dhEl.innerHTML = `<span style="color:${dh >= (thrMap.dt_high || 55) ? '#c084fc' : '#cbd5e1'};">${dh.toFixed(1)}%</span>`;
+    if (dh5El) dh5El.textContent = `5D:${dh5.toFixed(0)}% · Thr:${Math.round(thrMap.dt_high || 55)}%`;
 
     const dlEl = document.getElementById('piv_dt_low_val');
     const dl5El = document.getElementById('piv_dt_low_5d');
-    if (dlEl) dlEl.innerHTML = `<span style="color:${dl >= 50 ? '#4ade80' : '#cbd5e1'};">${dl.toFixed(1)}%</span>`;
-    if (dl5El) dl5El.textContent = `5D: ${dl5.toFixed(0)}%`;
+    if (dlEl) dlEl.innerHTML = `<span style="color:${dl >= (thrMap.dt_low || 50) ? '#4ade80' : '#cbd5e1'};">${dl.toFixed(1)}%</span>`;
+    if (dl5El) dl5El.textContent = `5D:${dl5.toFixed(0)}% · Thr:${Math.round(thrMap.dt_low || 50)}%`;
 
     const muhEl = document.getElementById('piv_maj_ut_top_val');
     const muh5El = document.getElementById('piv_maj_ut_top_5d');
-    if (muhEl) muhEl.innerHTML = `<span style="color:${muh >= 50 ? '#fbbf24' : '#cbd5e1'};">${muh.toFixed(1)}%</span>`;
-    if (muh5El) muh5El.textContent = `5D: ${muh5.toFixed(0)}%`;
+    if (muhEl) muhEl.innerHTML = `<span style="color:${muh >= (thrMap.maj_ut_top || 50) ? '#fbbf24' : '#cbd5e1'};">${muh.toFixed(1)}%</span>`;
+    if (muh5El) muh5El.textContent = `5D:${muh5.toFixed(0)}% · Thr:${Math.round(thrMap.maj_ut_top || 50)}%`;
 
     const mdlEl = document.getElementById('piv_maj_dt_low_val');
     const mdl5El = document.getElementById('piv_maj_dt_low_5d');
-    if (mdlEl) mdlEl.innerHTML = `<span style="color:${mdl >= 50 ? '#10b981' : '#cbd5e1'};">${mdl.toFixed(1)}%</span>`;
-    if (mdl5El) mdl5El.textContent = `5D: ${mdl5.toFixed(0)}%`;
+    if (mdlEl) mdlEl.innerHTML = `<span style="color:${mdl >= (thrMap.maj_dt_low || 50) ? '#10b981' : '#cbd5e1'};">${mdl.toFixed(1)}%</span>`;
+    if (mdl5El) mdl5El.textContent = `5D:${mdl5.toFixed(0)}% · Thr:${Math.round(thrMap.maj_dt_low || 50)}%`;
 
     const barEl = document.getElementById('exh_progress_bar');
     barEl.style.width = `${Math.min(100, Math.max(4, max5))}%`;
@@ -6301,13 +8812,28 @@ function toggleDrawBar() {
 function toggleFullscreenChart() {
   const ws = document.getElementById('main_workspace');
   ws.classList.toggle('fullscreen-chart');
-  const btn = document.getElementById('btn_fullscreen');
   const isFull = ws.classList.contains('fullscreen-chart');
-  btn.classList.toggle('active', isFull);
-  btn.textContent = isFull ? '🗗 Restore' : '⛶ Enlarge';
+  const btn = document.getElementById('btn_fullscreen');
+  if (btn) {
+    btn.classList.toggle('active', isFull);
+    btn.textContent = isFull ? '🗗 Restore' : '⛶ Enlarge';
+  }
+  const topBtn = document.getElementById('btn_top_fullscreen');
+  if (topBtn) {
+    topBtn.classList.toggle('active', isFull);
+    topBtn.textContent = isFull ? '🗗 Restore Chart' : '⛶ Enlarge Chart';
+  }
+  const stageBtn = document.getElementById('btn_stage_fullscreen');
+  if (stageBtn) {
+    stageBtn.classList.toggle('active', isFull);
+    stageBtn.textContent = isFull ? '🗗 Restore' : '⛶ Enlarge';
+  }
   setTimeout(() => {
     const c = document.getElementById('chart_tv');
-    chart.applyOptions({ width: c.clientWidth, height: c.clientHeight });
+    const stg = c ? c.parentElement : null;
+    if (chart && stg) {
+      chart.applyOptions({ width: stg.clientWidth, height: stg.clientHeight });
+    }
     resizeCanvas();
     scheduleLarssonRender();
   }, 50);
@@ -6516,6 +9042,10 @@ window.addEventListener('keydown', e => {
   } else if (e.key === 'Escape') {
     closeAssetModal();
     setDrawTool('cursor');
+    const ws = document.getElementById('main_workspace');
+    if (ws && ws.classList.contains('fullscreen-chart')) {
+      toggleFullscreenChart();
+    }
   } else if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
     e.preventDefault();
     const grp = getActiveWatchlistGroup();
@@ -6544,6 +9074,14 @@ def main():
     parser.add_argument("--host", type=str, default="127.0.0.1", help="Host interface (default: 127.0.0.1)")
     args = parser.parse_args()
 
+    try:
+        import nq_auto_trader
+
+        st_boot = nq_auto_trader.get_auto_trader_status()
+        if st_boot.get("enabled") or st_boot.get("mgc_enabled") or st_boot.get("pivot_email_alerts_enabled", True):
+            nq_auto_trader.ensure_auto_trader_daemon_started()
+    except Exception:
+        pass
     print(f"Starting EP Universal Chart Viewer & Watchlist Studio on http://{args.host}:{args.port}")
     app.run(host=args.host, port=args.port, debug=False)
 

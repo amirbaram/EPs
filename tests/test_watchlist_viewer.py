@@ -606,6 +606,177 @@ class TestWatchlistViewer(unittest.TestCase):
                 serve_watchlist._TWS_ALERTS.clear()
                 serve_watchlist._TWS_ALERTED_KEYS.clear()
 
+    def test_si_intraday_models_and_watchlist_chart_wiring(self):
+        import nq_ml_engine
+
+        # 1. Verify dedicated SI model bundle and 15m/1h/4h scored parquets exist on disk
+        self.assertTrue(nq_ml_engine.SI_MODELS_PATH.exists(), "Missing data/models/si_intraday_models.pkl")
+        for tf in ("15m", "1h", "4h"):
+            df_si = nq_ml_engine.get_cached_nq_scored_df(tf, symbol="SI=F")
+            self.assertIsNotNone(df_si, f"Missing SI {tf} scored dataframe")
+            self.assertGreater(len(df_si), 1000)
+
+        # 2. Verify /api/chart?symbol=SI=F&interval=15m serves SI 15m intraday bars, pivot markers, and $0.005-tick trade plan
+        resp_15m = self.client.get("/api/chart?symbol=SI%3DF&interval=15m&history=3m")
+        self.assertEqual(resp_15m.status_code, 200)
+        data_15m = resp_15m.get_json()
+        self.assertTrue(data_15m["is_intraday"])
+        self.assertEqual(data_15m["interval"], "15m")
+        self.assertEqual(data_15m["exhaustion"]["model_ver"], "si_15m")
+        self.assertIn("SI 15M", data_15m["exhaustion"]["anchor_mode"])
+        self.assertGreater(len(data_15m["bars"]), 50)
+        plan = data_15m.get("active_trade_plan") or {}
+        self.assertEqual(plan.get("symbol"), "SI=F")
+        self.assertIn("SI [15M]", plan.get("action_title", ""))
+
+        # 3. Verify /api/chart?symbol=SI=F&interval=1d includes nq_intraday multi-TF summary for SI=F
+        resp_1d = self.client.get("/api/chart?symbol=SI%3DF&interval=1d&history=6m")
+        self.assertEqual(resp_1d.status_code, 200)
+        data_1d = resp_1d.get_json()
+        self.assertIsNotNone(data_1d.get("nq_intraday"))
+        self.assertEqual(data_1d["nq_intraday"].get("symbol"), "SI=F")
+        self.assertIn("15m", data_1d["nq_intraday"].get("timeframes", {}))
+        self.assertIn("1h", data_1d["nq_intraday"].get("timeframes", {}))
+        self.assertIn("4h", data_1d["nq_intraday"].get("timeframes", {}))
+
+        # 4. Verify SI-F / SI / SIL-F / SIL / MSI normalization in parse_asset_id and /api/catalog
+        self.assertEqual(serve_watchlist.parse_asset_id("SI-F")["id"], "SI=F")
+        self.assertEqual(serve_watchlist.parse_asset_id("SI")["id"], "SI=F")
+        self.assertEqual(serve_watchlist.parse_asset_id("SIL-F")["id"], "SIL=F")
+        self.assertEqual(serve_watchlist.parse_asset_id("SIL")["id"], "SIL=F")
+        self.assertEqual(serve_watchlist.parse_asset_id("MSI")["id"], "SIL=F")
+        r_cat = self.client.get("/api/catalog?q=SI-F&type=stock")
+        self.assertEqual(r_cat.status_code, 200)
+        stocks = r_cat.get_json().get("stocks", [])
+        self.assertTrue(any(it.get("id") == "SI=F" for it in stocks))
+
+    def test_nq_wickless_model_toggle_and_at_extreme_trade_plans(self):
+        # 1. Query Current (with wick & rejection) model on NQ 15m
+        resp_curr = self.client.get("/api/chart?symbol=NQ%3DF&interval=15m&history=3m&model_ver=current")
+        self.assertEqual(resp_curr.status_code, 200)
+        d_curr = resp_curr.get_json()
+        exh_curr = d_curr.get("exhaustion", {})
+        self.assertEqual(exh_curr.get("model_mode"), "current")
+        self.assertFalse(exh_curr.get("is_wickless", True))
+        plan_curr = d_curr.get("active_trade_plan") or {}
+        self.assertFalse(plan_curr.get("is_wickless", True))
+
+        # 2. Query ⚡ Wickless (intrabar extreme touch / 0 wick lag) model on NQ 15m
+        resp_wl = self.client.get("/api/chart?symbol=NQ%3DF&interval=15m&history=3m&model_ver=wickless")
+        self.assertEqual(resp_wl.status_code, 200)
+        d_wl = resp_wl.get_json()
+        exh_wl = d_wl.get("exhaustion", {})
+        self.assertEqual(exh_wl.get("model_mode"), "wickless")
+        self.assertTrue(exh_wl.get("is_wickless", False))
+        self.assertIn("wickless", exh_wl.get("model_ver", ""))
+        plan_wl = d_wl.get("active_trade_plan") or {}
+        self.assertTrue(plan_wl.get("is_wickless", False))
+        self.assertIn("Wickless", plan_wl.get("action_title", "") + plan_wl.get("entry_rule_text", ""))
+
+        # Verify events have is_wickless flag
+        for ev in exh_wl.get("ut_high_events", []):
+            self.assertTrue(ev.get("is_wickless", False))
+        for ev in exh_wl.get("ut_low_events", []):
+            self.assertTrue(ev.get("is_wickless", False))
+
+        # 3. Verify index HTML contains the toggle button group and option
+        resp_idx = self.client.get("/")
+        self.assertEqual(resp_idx.status_code, 200)
+        html = resp_idx.get_data(as_text=True)
+        self.assertIn('id="futures_model_mode_group"', html)
+        self.assertIn('id="btn_mode_current"', html)
+        self.assertIn('id="btn_mode_wickless"', html)
+        self.assertIn('value="wickless"', html)
+
+    def test_futures_wickless_models_and_email_alert_settings_rules(self):
+        import nq_ml_engine
+        import nq_auto_trader
+
+        # 1. Verify all 5 futures tickers have their wickless models loaded cleanly
+        for sym in ("NQ=F", "GC=F", "CL=F", "BTC=F", "SI=F"):
+            m = nq_ml_engine.get_cached_nq_models(symbol=sym, use_wickless=True)
+            self.assertIn("15m", m)
+            self.assertIn("1h", m)
+            self.assertIn("4h", m)
+            self.assertIn("pivot_high", m["15m"])
+            self.assertIn("pivot_low", m["15m"])
+
+        # 2. Verify strict Rule 1: Non-futures symbols NEVER trigger pivot emails
+        stock_alert = {
+            "symbol": "AAPL",
+            "timeframe": "15m",
+            "direction": "LONG",
+            "prob_pct": 75.0,
+            "is_wickless": True,
+            "trade_plan": {
+                "symbol": "AAPL",
+                "timeframe": "15m",
+                "direction": "LONG",
+                "prob_pct": 75.0,
+                "is_wickless": True,
+            },
+        }
+        res_stock = nq_auto_trader.notify_new_realtime_pivot_alert(stock_alert, force_test=True)
+        self.assertIsNone(res_stock, "Non-futures symbols (stocks/ETFs) must NEVER send pivot emails")
+
+        # 3. Verify strict Rule 2: With-wick (non-wickless) signals NEVER trigger pivot emails even for futures
+        fut_wick_alert = {
+            "symbol": "NQ=F",
+            "timeframe": "15m",
+            "direction": "LONG",
+            "prob_pct": 72.0,
+            "is_wickless": False,
+            "trade_plan": {
+                "symbol": "NQ=F",
+                "timeframe": "15m",
+                "direction": "LONG",
+                "prob_pct": 72.0,
+                "is_wickless": False,
+            },
+        }
+        res_with_wick = nq_auto_trader.notify_new_realtime_pivot_alert(fut_wick_alert, force_test=False)
+        self.assertIsNone(res_with_wick, "With-wick (non-wickless) pivots must NEVER trigger pivot email alerts")
+
+        # 4. Verify App Setting Toggle: Turning pivot email alerts OFF suppresses emails
+        nq_auto_trader.save_auto_trader_config({"pivot_email_alerts_enabled": False})
+        fut_wl_alert = {
+            "symbol": "GC=F",
+            "timeframe": "15m",
+            "direction": "SHORT",
+            "prob_pct": 68.0,
+            "is_wickless": True,
+            "bar_time": "2026-10-16 14:00",
+            "trade_plan": {
+                "symbol": "GC=F",
+                "timeframe": "15m",
+                "direction": "SHORT",
+                "prob_pct": 68.0,
+                "is_wickless": True,
+                "pred_mfe_atr": 2.5,
+                "pred_mae_atr": 1.2,
+                "pred_ratio": 2.08,
+                "entry_px": 2700.5,
+                "stop_px": 2708.0,
+                "target1_px": 2685.0,
+                "target2_px": 2670.0,
+                "time_exit_label": "8 bars (2h)",
+            },
+        }
+        res_disabled = nq_auto_trader.notify_new_realtime_pivot_alert(fut_wl_alert, force_test=True)
+        self.assertIsNone(res_disabled, "Emails must be suppressed when pivot_email_alerts_enabled is False")
+
+        # 5. Turning pivot email alerts back ON allows sending for valid future wickless signal
+        nq_auto_trader.save_auto_trader_config({"pivot_email_alerts_enabled": True, "gmail_enabled": True})
+        cfg_now = nq_auto_trader.load_auto_trader_config()
+        self.assertTrue(cfg_now["pivot_email_alerts_enabled"])
+
+        # 6. Verify HTML contains the email toggle in settings_bar and auto trader box
+        resp_idx = self.client.get("/")
+        html = resp_idx.get_data(as_text=True)
+        self.assertIn("cfg_futures_pivot_email", html)
+        self.assertIn("toggleFuturesPivotEmail", html)
+        self.assertIn("at_cfg_futures_email", html)
+
 
 if __name__ == "__main__":
     unittest.main()
