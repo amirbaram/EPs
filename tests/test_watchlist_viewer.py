@@ -692,14 +692,29 @@ class TestWatchlistViewer(unittest.TestCase):
         import nq_ml_engine
         import nq_auto_trader
 
-        # 1. Verify all 5 futures tickers have their wickless models loaded cleanly
+        # 1. Verify all 5 futures tickers have their wickless models loaded cleanly (including major reversals)
         for sym in ("NQ=F", "GC=F", "CL=F", "BTC=F", "SI=F"):
             m = nq_ml_engine.get_cached_nq_models(symbol=sym, use_wickless=True)
             self.assertIn("15m", m)
             self.assertIn("1h", m)
             self.assertIn("4h", m)
-            self.assertIn("pivot_high", m["15m"])
-            self.assertIn("pivot_low", m["15m"])
+            for tf in ("15m", "1h", "4h"):
+                self.assertIn("pivot_high", m[tf])
+                self.assertIn("pivot_low", m[tf])
+                self.assertIn("major_top", m[tf])
+                self.assertIn("major_bottom", m[tf])
+
+        # Verify futures chart payload produces maj_ut_top_events and maj_dt_low_events
+        import serve_watchlist
+        payload, code = serve_watchlist._build_nq_intraday_chart_payload(
+            "NQ=F", "15m", "3m", (8, 10, 20, 21), (50, 200), 32, horizon_k=8, model_ver="wickless"
+        )
+        self.assertEqual(code, 200)
+        exh = payload["exhaustion"]
+        self.assertIn("maj_ut_top_events", exh)
+        self.assertIn("maj_dt_low_events", exh)
+        self.assertIn("maj_ut_top", exh["pivots_current"])
+        self.assertIn("maj_dt_low", exh["pivots_current"])
 
         # 2. Verify strict Rule 1: Non-futures symbols NEVER trigger pivot emails
         stock_alert = {

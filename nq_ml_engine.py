@@ -657,6 +657,14 @@ def compute_nq_intraday_features(df_bars: pd.DataFrame, tf: str) -> pd.DataFrame
     b["ema20_vs_sma50_atr"] = ((ema20_anc - sma50_anc) / adr20).clip(-12.0, 12.0)
     b["sma50_vs_sma200_atr"] = ((sma50_anc - sma200_anc) / adr20).clip(-20.0, 20.0)
 
+    # 60-bar Macro Run & Drawdown (strictly causal t-1 anchor)
+    low_60_prev = lc.shift(1).rolling(60, min_periods=10).min().bfill()
+    high_60_prev = hc.shift(1).rolling(60, min_periods=10).max().bfill()
+    b["run_from_60b_low_adr"] = ((hc - low_60_prev) / adr20).clip(0.0, 30.0).fillna(0.0)
+    b["drop_from_60b_high_adr"] = ((high_60_prev - lc) / adr20).clip(0.0, 30.0).fillna(0.0)
+    b["dist_from_60b_high_adr"] = ((high_60_prev - hc) / adr20).clip(-5.0, 15.0).fillna(0.0)
+    b["dist_from_60b_low_adr"] = ((lc - low_60_prev) / adr20).clip(-5.0, 15.0).fillna(0.0)
+
     # Multi-bar Thrust / Velocity & Stretch Percentile
     for w in (3, 5, 10, 20):
         b[f"thrust_hi_{w}b_atr"] = ((hc - cc.shift(w).bfill()) / adr20).clip(-15.0, 20.0)
@@ -1091,6 +1099,8 @@ PIVOT_HIGH_AT_EXTREME_COLS: List[str] = [
     "daily_ext_ema20_hi_adr",
     "mtf_ob_confluence",
     "is_uptrend_regime",
+    "run_from_60b_low_adr",
+    "dist_from_60b_high_adr",
 ]
 
 PIVOT_HIGH_FULL_BAR_COLS: List[str] = PIVOT_HIGH_AT_EXTREME_COLS + [
@@ -1164,7 +1174,12 @@ PIVOT_LOW_AT_EXTREME_COLS: List[str] = [
     "daily_ext_ema20_lo_adr",
     "mtf_os_confluence",
     "is_uptrend_regime",
+    "drop_from_60b_high_adr",
+    "dist_from_60b_low_adr",
 ]
+
+MAJOR_TOP_AT_EXTREME_COLS: List[str] = list(PIVOT_HIGH_AT_EXTREME_COLS)
+MAJOR_BOTTOM_AT_EXTREME_COLS: List[str] = list(PIVOT_LOW_AT_EXTREME_COLS)
 
 PIVOT_LOW_FULL_BAR_COLS: List[str] = PIVOT_LOW_AT_EXTREME_COLS + [
     "bar_range_atr",
@@ -3504,6 +3519,22 @@ def _score_live_bar_override_on_tf(
     last_df["prob_pivot_low"] = np.nan_to_num(p_lo, nan=0.0, posinf=1.0, neginf=0.0)
     last_df["prob_pivot_low_extreme"] = np.nan_to_num(p_lo_ex, nan=0.0, posinf=1.0, neginf=0.0)
 
+    if "major_top" in tf_bundle:
+        _, p_mt_ex, _ = score_nq_pivot_bundle(last_df, tf_bundle["major_top"], "is_cand_high")
+        last_df["prob_major_top_extreme"] = np.nan_to_num(p_mt_ex, nan=0.0, posinf=1.0, neginf=0.0)
+        last_df["prob_maj_ut_top_extreme"] = last_df["prob_major_top_extreme"]
+    else:
+        last_df["prob_major_top_extreme"] = 0.0
+        last_df["prob_maj_ut_top_extreme"] = 0.0
+
+    if "major_bottom" in tf_bundle:
+        _, p_mb_ex, _ = score_nq_pivot_bundle(last_df, tf_bundle["major_bottom"], "is_cand_low")
+        last_df["prob_major_bottom_extreme"] = np.nan_to_num(p_mb_ex, nan=0.0, posinf=1.0, neginf=0.0)
+        last_df["prob_maj_dt_low_extreme"] = last_df["prob_major_bottom_extreme"]
+    else:
+        last_df["prob_major_bottom_extreme"] = 0.0
+        last_df["prob_maj_dt_low_extreme"] = 0.0
+
     if "excursion_short" in tf_bundle:
         score_excursion_models(last_df, tf_bundle["excursion_short"], "short")
     else:
@@ -3591,6 +3622,8 @@ def evaluate_nq_realtime_multi_tf(
         curr_lo_pct = round(curr_lo_pct, 1)
         curr_hi_ex_pct = round(_safe_float(curr_row.get("prob_pivot_high_extreme", 0.0), 0.0) * 100.0, 1)
         curr_lo_ex_pct = round(_safe_float(curr_row.get("prob_pivot_low_extreme", 0.0), 0.0) * 100.0, 1)
+        curr_maj_top_pct = round(_safe_float(curr_row.get("prob_major_top_extreme", curr_row.get("prob_maj_ut_top_extreme", 0.0)), 0.0) * 100.0, 1)
+        curr_maj_bot_pct = round(_safe_float(curr_row.get("prob_major_bottom_extreme", curr_row.get("prob_maj_dt_low_extreme", 0.0)), 0.0) * 100.0, 1)
 
         lb = min(max(k + 1, 4), len(df_tf))
         recent_slice = df_tf.tail(lb)
@@ -3700,6 +3733,10 @@ def evaluate_nq_realtime_multi_tf(
             "curr_prob_low_pct": curr_lo_pct,
             "curr_extreme_high_pct": curr_hi_ex_pct,
             "curr_extreme_low_pct": curr_lo_ex_pct,
+            "curr_major_top_pct": curr_maj_top_pct,
+            "curr_major_bottom_pct": curr_maj_bot_pct,
+            "prob_major_top_pct": curr_maj_top_pct,
+            "prob_major_bottom_pct": curr_maj_bot_pct,
             "active_pivot_time": active_time_str,
             "active_prob_pct": active_prob,
             "active_direction": plan["direction"],

@@ -2658,15 +2658,32 @@ def _build_nq_intraday_chart_payload(
     active_bar_ts = active_plan.get("bar_timestamp")
     active_is_hi = bool(active_plan.get("is_high_pivot", active_plan.get("direction") == "SHORT"))
 
-    # Extract snapped Pivot High and Pivot Low events across df_view with full Trade Plans
+    # Extract snapped Pivot High, Pivot Low, Major Top, and Major Bottom events across df_view with full Trade Plans
     ut_high_events: List[Dict[str, Any]] = []
     ut_low_events: List[Dict[str, Any]] = []
+    maj_ut_top_events: List[Dict[str, Any]] = []
+    maj_dt_low_events: List[Dict[str, Any]] = []
+
     if is_wickless:
         hi_arr = np.nan_to_num(df_view["prob_pivot_high_extreme"].to_numpy(dtype=np.float64), nan=0.0) * 100.0
         lo_arr = np.nan_to_num(df_view["prob_pivot_low_extreme"].to_numpy(dtype=np.float64), nan=0.0) * 100.0
     else:
         hi_arr = np.nan_to_num(df_view["prob_pivot_high"].to_numpy(dtype=np.float64), nan=0.0) * 100.0
         lo_arr = np.nan_to_num(df_view["prob_pivot_low"].to_numpy(dtype=np.float64), nan=0.0) * 100.0
+
+    maj_top_col = "prob_major_top_extreme" if "prob_major_top_extreme" in df_view.columns else "prob_maj_ut_top_extreme"
+    maj_bot_col = "prob_major_bottom_extreme" if "prob_major_bottom_extreme" in df_view.columns else "prob_maj_dt_low_extreme"
+    maj_top_arr = (
+        np.nan_to_num(df_view[maj_top_col].to_numpy(dtype=np.float64), nan=0.0) * 100.0
+        if maj_top_col in df_view.columns
+        else np.zeros(len(df_view), dtype=np.float64)
+    )
+    maj_bot_arr = (
+        np.nan_to_num(df_view[maj_bot_col].to_numpy(dtype=np.float64), nan=0.0) * 100.0
+        if maj_bot_col in df_view.columns
+        else np.zeros(len(df_view), dtype=np.float64)
+    )
+
     h_px_arr = df_view["high"].to_numpy(dtype=np.float64)
     l_px_arr = df_view["low"].to_numpy(dtype=np.float64)
     n_v = len(df_view)
@@ -2734,6 +2751,59 @@ def _build_nq_intraday_chart_payload(
                 "trade_plan": plan_i,
             })
 
+        # Major Reversals
+        if maj_top_arr[i] >= 30.0 and (i == n_v - 1 or h_px_arr[i] >= np.max(h_px_arr[w0:w1]) - 1e-6):
+            row_i = df_view.iloc[i]
+            t_str = idx_i.strftime("%Y-%m-%d %H:%M")
+            plan_i = nq_ml_engine.compute_nq_trade_plan(
+                row_i, tf=tf, is_high_pivot=True, horizon_k=horizon_k, symbol=part_a_id, use_wickless=is_wickless
+            )
+            plan_i["bar_time"] = t_str
+            plan_i["bar_timestamp"] = t_sec
+            maj_ut_top_events.append({
+                "date": t_sec,
+                "time_str": t_str,
+                "type": "maj_ut_top",
+                "timeframe": tf,
+                "is_active_plan": False,
+                "is_wickless": is_wickless,
+                "prob_pct": round(float(maj_top_arr[i]), 1),
+                "at_extreme_pct": round(float(maj_top_arr[i]), 1),
+                "full_bar_pct": round(float(maj_top_arr[i]), 1),
+                "high": round(float(row_i["high"]), 2),
+                "low": round(float(row_i["low"]), 2),
+                "close": round(float(row_i["close"]), 2),
+                "intrabar_trigger_price": plan_i["entry_price"],
+                "trigger_prices_by_thr": {str(thr_k): plan_i["entry_price"] for thr_k in range(20, 86, 5)},
+                "trade_plan": plan_i,
+            })
+
+        if maj_bot_arr[i] >= 30.0 and (i == n_v - 1 or l_px_arr[i] <= np.min(l_px_arr[w0:w1]) + 1e-6):
+            row_i = df_view.iloc[i]
+            t_str = idx_i.strftime("%Y-%m-%d %H:%M")
+            plan_i = nq_ml_engine.compute_nq_trade_plan(
+                row_i, tf=tf, is_high_pivot=False, horizon_k=horizon_k, symbol=part_a_id, use_wickless=is_wickless
+            )
+            plan_i["bar_time"] = t_str
+            plan_i["bar_timestamp"] = t_sec
+            maj_dt_low_events.append({
+                "date": t_sec,
+                "time_str": t_str,
+                "type": "maj_dt_low",
+                "timeframe": tf,
+                "is_active_plan": False,
+                "is_wickless": is_wickless,
+                "prob_pct": round(float(maj_bot_arr[i]), 1),
+                "at_extreme_pct": round(float(maj_bot_arr[i]), 1),
+                "full_bar_pct": round(float(maj_bot_arr[i]), 1),
+                "high": round(float(row_i["high"]), 2),
+                "low": round(float(row_i["low"]), 2),
+                "close": round(float(row_i["close"]), 2),
+                "intrabar_trigger_price": plan_i["entry_price"],
+                "trigger_prices_by_thr": {str(thr_k): plan_i["entry_price"] for thr_k in range(20, 86, 5)},
+                "trade_plan": plan_i,
+            })
+
     last_r = df_view.iloc[-1]
     if is_wickless:
         curr_hi = round(float(last_r.get("prob_pivot_high_extreme", 0.0)) * 100.0, 1)
@@ -2745,6 +2815,12 @@ def _build_nq_intraday_chart_payload(
         curr_lo = round(float(last_r.get("prob_pivot_low", 0.0)) * 100.0, 1)
         peak5_hi = round(float(df_view["prob_pivot_high"].tail(8).max()) * 100.0, 1)
         peak5_lo = round(float(df_view["prob_pivot_low"].tail(8).max()) * 100.0, 1)
+
+    curr_maj_top = round(float(last_r.get("prob_major_top_extreme", last_r.get("prob_maj_ut_top_extreme", 0.0))) * 100.0, 1)
+    curr_maj_bot = round(float(last_r.get("prob_major_bottom_extreme", last_r.get("prob_maj_dt_low_extreme", 0.0))) * 100.0, 1)
+    peak5_maj_top = round(float(df_view[maj_top_col].tail(8).max() if maj_top_col in df_view.columns else 0.0) * 100.0, 1)
+    peak5_maj_bot = round(float(df_view[maj_bot_col].tail(8).max() if maj_bot_col in df_view.columns else 0.0) * 100.0, 1)
+
     is_ut_now = float(last_r["close"]) >= float(last_r.get("sma50_px", last_r["close"]))
     default_atr = 0.25 if sym_root == "CL" else (120.0 if sym_root == "BTC" else (5.0 if sym_root == "GC" else (0.20 if sym_root == "SI" else 25.0)))
 
@@ -2769,16 +2845,16 @@ def _build_nq_intraday_chart_payload(
             "ut_low": curr_lo,
             "dt_high": curr_hi,
             "dt_low": curr_lo,
-            "maj_ut_top": curr_hi,
-            "maj_dt_low": curr_lo,
+            "maj_ut_top": curr_maj_top,
+            "maj_dt_low": curr_maj_bot,
         },
         "pivots_5d_peak": {
             "ut_high": peak5_hi,
             "ut_low": peak5_lo,
             "dt_high": peak5_hi,
             "dt_low": peak5_lo,
-            "maj_ut_top": peak5_hi,
-            "maj_dt_low": peak5_lo,
+            "maj_ut_top": peak5_maj_top,
+            "maj_dt_low": peak5_maj_bot,
         },
         "status": "climax" if peak5_hi >= 50.0 else ("pivot_low" if peak5_lo >= 50.0 else "healthy"),
         "action_label": active_plan.get("trade_plan_text", f"{sym_root} [{tf.upper()}] Intraday Pivot Monitor"),
@@ -2805,8 +2881,8 @@ def _build_nq_intraday_chart_payload(
         "ut_low_events": ut_low_events,
         "dt_high_events": [],
         "dt_low_events": [],
-        "maj_ut_top_events": [],
-        "maj_dt_low_events": [],
+        "maj_ut_top_events": maj_ut_top_events,
+        "maj_dt_low_events": maj_dt_low_events,
         "active_trade_plan": active_plan,
         "series": series_data,
     }

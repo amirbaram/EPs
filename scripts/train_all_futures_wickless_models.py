@@ -92,6 +92,77 @@ FUTURES_SPECS = [
 ]
 
 
+def label_futures_major_reversals_vec(df: pd.DataFrame, tf: str) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Labels Major Macro Trend Reversal Tops (is_major_top) and Bottoms (is_major_bottom)
+    using strictly causal anchor and zero-lookahead forward confirmation.
+    """
+    hc = df["high_cont"].to_numpy(dtype=np.float64)
+    lc = df["low_cont"].to_numpy(dtype=np.float64)
+    cc = df["close_cont"].to_numpy(dtype=np.float64)
+    adr = np.maximum(1e-6, df["adr20_cont"].to_numpy(dtype=np.float64))
+    n = len(df)
+
+    if tf == "15m":
+        w_macro, k_rev = 16, 24
+        run_req, rev_req, sust_req = 2.6, 3.0, 2.0
+    elif tf == "1h":
+        w_macro, k_rev = 12, 20
+        run_req, rev_req, sust_req = 2.6, 2.8, 1.8
+    else:  # 4h
+        w_macro, k_rev = 8, 16
+        run_req, rev_req, sust_req = 2.6, 2.8, 1.8
+
+    is_maj_top = np.zeros(n, dtype=int)
+    is_maj_bot = np.zeros(n, dtype=int)
+
+    valid_len = n - w_macro - k_rev
+    if valid_len <= 0:
+        return is_maj_top, is_maj_bot
+
+    from numpy.lib.stride_tricks import sliding_window_view
+    prior_hc_win = sliding_window_view(hc[:-k_rev], w_macro)[:-1]
+    prior_lc_win = sliding_window_view(lc[:-k_rev], w_macro)[:-1]
+
+    centers_h = hc[w_macro : n - k_rev]
+    centers_l = lc[w_macro : n - k_rev]
+    centers_adr = adr[w_macro : n - k_rev]
+
+    fwd_hc_win = sliding_window_view(hc[w_macro + 1 :], k_rev)[:valid_len]
+    fwd_lc_win = sliding_window_view(lc[w_macro + 1 :], k_rev)[:valid_len]
+    fwd_close = cc[w_macro + k_rev : n]
+
+    # TOP: Prior macro run up + deep subsequent reversal breakdown + not breached + sustained
+    prior_low = prior_lc_win.min(axis=1)
+    prior_max_h = prior_hc_win.max(axis=1)
+    prior_run = (centers_h - prior_low) / centers_adr
+    is_loc_hi = centers_h >= prior_max_h - 0.10 * centers_adr
+
+    fwd_min_l = fwd_lc_win.min(axis=1)
+    fwd_max_h = fwd_hc_win.max(axis=1)
+    fwd_drop = (centers_h - fwd_min_l) / centers_adr
+    top_not_breached = fwd_max_h <= centers_h + 0.20 * centers_adr
+    top_sustained = (centers_h - fwd_close) / centers_adr >= sust_req
+
+    top_cond = is_loc_hi & (prior_run >= run_req) & (fwd_drop >= rev_req) & top_not_breached & top_sustained
+    is_maj_top[w_macro : n - k_rev] = top_cond.astype(int)
+
+    # BOTTOM: Prior macro decline + deep subsequent turnaround rally + not breached + sustained
+    prior_high = prior_hc_win.max(axis=1)
+    prior_min_l = prior_lc_win.min(axis=1)
+    prior_drop = (prior_high - centers_l) / centers_adr
+    is_loc_lo = centers_l <= prior_min_l + 0.10 * centers_adr
+
+    fwd_rally = (fwd_max_h - centers_l) / centers_adr
+    bot_not_breached = fwd_min_l >= centers_l - 0.20 * centers_adr
+    bot_sustained = (fwd_close - centers_l) / centers_adr >= sust_req
+
+    bot_cond = is_loc_lo & (prior_drop >= run_req) & (fwd_rally >= rev_req) & bot_not_breached & bot_sustained
+    is_maj_bot[w_macro : n - k_rev] = bot_cond.astype(int)
+
+    return is_maj_top, is_maj_bot
+
+
 def fit_wickless_classifier(
     df_cand: pd.DataFrame,
     label_col: str,
@@ -212,6 +283,9 @@ def train_single_future(spec: Dict[str, Any]) -> Dict[str, Any]:
             labeled = nq_ml_engine._label_gc_pivots_and_excursions(
                 feats, pivot_left=cfg["left"], pivot_right=cfg["right"], rev_atr=cfg["rev_atr"]
             )
+        top_arr, bot_arr = label_futures_major_reversals_vec(feats, tf)
+        labeled["is_major_top"] = top_arr
+        labeled["is_major_bottom"] = bot_arr
         labeled = labeled.iloc[200:].copy()
 
         train_df = labeled[labeled.index < pd.Timestamp(spec["train_cutoff"])].copy()
@@ -237,11 +311,27 @@ def train_single_future(spec: Dict[str, Any]) -> Dict[str, Any]:
             spec["cal_start"], spec["train_cutoff"]
         )
 
+        print(f"    Training Wickless Major Top ({len(high_cols)} feats on {len(cand_hi_tr):,} cands)...")
+        m_maj_top = fit_wickless_classifier(
+            cand_hi_tr, "is_major_top", high_cols, f"{prefix.upper()}_{tf}_Wickless_Major_Top",
+            spec["cal_start"], spec["train_cutoff"]
+        )
+
+        print(f"    Training Wickless Major Bottom ({len(low_cols)} feats on {len(cand_lo_tr):,} cands)...")
+        m_maj_bot = fit_wickless_classifier(
+            cand_lo_tr, "is_major_bottom", low_cols, f"{prefix.upper()}_{tf}_Wickless_Major_Bottom",
+            spec["cal_start"], spec["train_cutoff"]
+        )
+
         all_models[tf] = {
             "pivot_high": m_hi,
             "pivot_low": m_lo,
+            "major_top": m_maj_top,
+            "major_bottom": m_maj_bot,
             "feature_cols_high": high_cols,
             "feature_cols_low": low_cols,
+            "feature_cols_major_top": high_cols,
+            "feature_cols_major_bottom": low_cols,
             "config": cfg,
         }
 
@@ -257,29 +347,52 @@ def train_single_future(spec: Dict[str, Any]) -> Dict[str, Any]:
         p_lo = 0.55 * m_lo["lgb"].predict_proba(X_lo)[:, 1] + 0.45 * m_lo["xgb"].predict_proba(X_lo)[:, 1]
         y_lo = oos_lo["is_pivot_low"].to_numpy(dtype=int)
 
+        p_mt = 0.55 * m_maj_top["lgb"].predict_proba(X_hi)[:, 1] + 0.45 * m_maj_top["xgb"].predict_proba(X_hi)[:, 1]
+        y_mt = oos_hi["is_major_top"].to_numpy(dtype=int)
+
+        p_mb = 0.55 * m_maj_bot["lgb"].predict_proba(X_lo)[:, 1] + 0.45 * m_maj_bot["xgb"].predict_proba(X_lo)[:, 1]
+        y_mb = oos_lo["is_major_bottom"].to_numpy(dtype=int)
+
         auc_hi = float(roc_auc_score(y_hi, p_hi)) if len(np.unique(y_hi)) > 1 else 0.5
         pr_hi = float(average_precision_score(y_hi, p_hi)) if len(np.unique(y_hi)) > 1 else 0.0
         auc_lo = float(roc_auc_score(y_lo, p_lo)) if len(np.unique(y_lo)) > 1 else 0.5
         pr_lo = float(average_precision_score(y_lo, p_lo)) if len(np.unique(y_lo)) > 1 else 0.0
 
-        print(f"    [{sym} {tf}] OOS High AUC: {auc_hi:.4f} | Low AUC: {auc_lo:.4f} in {time.time()-t0:.1f}s")
+        auc_mt = float(roc_auc_score(y_mt, p_mt)) if len(np.unique(y_mt)) > 1 else 0.5
+        pr_mt = float(average_precision_score(y_mt, p_mt)) if len(np.unique(y_mt)) > 1 else 0.0
+        auc_mb = float(roc_auc_score(y_mb, p_mb)) if len(np.unique(y_mb)) > 1 else 0.5
+        pr_mb = float(average_precision_score(y_mb, p_mb)) if len(np.unique(y_mb)) > 1 else 0.0
+
+        print(f"    [{sym} {tf}] OOS High AUC: {auc_hi:.4f} | Low AUC: {auc_lo:.4f} | MajTop AUC: {auc_mt:.4f} | MajBot AUC: {auc_mb:.4f} in {time.time()-t0:.1f}s")
         report["timeframes"][tf] = {
             "high": {"auc": auc_hi, "pr_auc": pr_hi, "top_features": m_hi["top_features"][:6]},
             "low": {"auc": auc_lo, "pr_auc": pr_lo, "top_features": m_lo["top_features"][:6]},
+            "major_top": {"auc": auc_mt, "pr_auc": pr_mt, "top_features": m_maj_top["top_features"][:6]},
+            "major_bottom": {"auc": auc_mb, "pr_auc": pr_mb, "top_features": m_maj_bot["top_features"][:6]},
         }
 
         # Score full labeled dataset with the new models to update scored cache
         X_all_hi = labeled[high_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
         X_all_lo = labeled[low_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
         p_all_hi_raw = 0.55 * m_hi["lgb"].predict_proba(X_all_hi)[:, 1] + 0.45 * m_hi["xgb"].predict_proba(X_all_hi)[:, 1]
         p_all_lo_raw = 0.55 * m_lo["lgb"].predict_proba(X_all_lo)[:, 1] + 0.45 * m_lo["xgb"].predict_proba(X_all_lo)[:, 1]
         p_all_hi = np.clip(0.70 * p_all_hi_raw + 0.30 * m_hi["iso"].predict(p_all_hi_raw), 0.0, 0.98)
         p_all_lo = np.clip(0.70 * p_all_lo_raw + 0.30 * m_lo["iso"].predict(p_all_lo_raw), 0.0, 0.98)
 
+        p_all_mt_raw = 0.55 * m_maj_top["lgb"].predict_proba(X_all_hi)[:, 1] + 0.45 * m_maj_top["xgb"].predict_proba(X_all_hi)[:, 1]
+        p_all_mb_raw = 0.55 * m_maj_bot["lgb"].predict_proba(X_all_lo)[:, 1] + 0.45 * m_maj_bot["xgb"].predict_proba(X_all_lo)[:, 1]
+        p_all_mt = np.clip(0.70 * p_all_mt_raw + 0.30 * m_maj_top["iso"].predict(p_all_mt_raw), 0.0, 0.98)
+        p_all_mb = np.clip(0.70 * p_all_mb_raw + 0.30 * m_maj_bot["iso"].predict(p_all_mb_raw), 0.0, 0.98)
+
         mask_hi = labeled["is_cand_high"].to_numpy(dtype=bool)
         mask_lo = labeled["is_cand_low"].to_numpy(dtype=bool)
         labeled["prob_pivot_high_extreme"] = np.where(mask_hi, p_all_hi, 0.0)
         labeled["prob_pivot_low_extreme"] = np.where(mask_lo, p_all_lo, 0.0)
+        labeled["prob_major_top_extreme"] = np.where(mask_hi, p_all_mt, 0.0)
+        labeled["prob_major_bottom_extreme"] = np.where(mask_lo, p_all_mb, 0.0)
+        labeled["prob_maj_ut_top_extreme"] = labeled["prob_major_top_extreme"]
+        labeled["prob_maj_dt_low_extreme"] = labeled["prob_major_bottom_extreme"]
 
         # Update the stored scored cache parquet
         cached_p = nq_ml_engine.SCORED_CACHE_DIR / f"{prefix}_{tf}_scored.parquet"
@@ -289,8 +402,12 @@ def train_single_future(spec: Dict[str, Any]) -> Dict[str, Any]:
                 idx_common = cur_df.index.intersection(labeled.index)
                 cur_df.loc[idx_common, "prob_pivot_high_extreme"] = labeled.loc[idx_common, "prob_pivot_high_extreme"].astype("float32")
                 cur_df.loc[idx_common, "prob_pivot_low_extreme"] = labeled.loc[idx_common, "prob_pivot_low_extreme"].astype("float32")
+                cur_df.loc[idx_common, "prob_major_top_extreme"] = labeled.loc[idx_common, "prob_major_top_extreme"].astype("float32")
+                cur_df.loc[idx_common, "prob_major_bottom_extreme"] = labeled.loc[idx_common, "prob_major_bottom_extreme"].astype("float32")
+                cur_df.loc[idx_common, "prob_maj_ut_top_extreme"] = labeled.loc[idx_common, "prob_maj_ut_top_extreme"].astype("float32")
+                cur_df.loc[idx_common, "prob_maj_dt_low_extreme"] = labeled.loc[idx_common, "prob_maj_dt_low_extreme"].astype("float32")
                 nq_ml_engine._atomic_to_parquet(cur_df, cached_p)
-                print(f"    Updated prob_pivot_..._extreme in {cached_p.name}")
+                print(f"    Updated prob_pivot_... and prob_major_... extreme in {cached_p.name}")
             except Exception as e:
                 print(f"    Notice: could not update existing cache {cached_p.name}: {e}")
 
@@ -320,7 +437,10 @@ def main() -> None:
     print(f"✅ COMPLETE RETRAINING FINISHED FOR ALL 5 FUTURES IN {time.time() - t_global:.1f}s")
     for sym, res in summary.items():
         tfs = res.get("timeframes", {})
-        line = " | ".join(f"{tf}: H-AUC={v['high']['auc']:.3f} L-AUC={v['low']['auc']:.3f}" for tf, v in tfs.items())
+        line = " | ".join(
+            f"{tf}: H={v['high']['auc']:.3f} L={v['low']['auc']:.3f} MajT={v.get('major_top', {}).get('auc', 0.0):.3f} MajB={v.get('major_bottom', {}).get('auc', 0.0):.3f}"
+            for tf, v in tfs.items()
+        )
         print(f"  • {sym:6s} -> {line}")
     print("=" * 80)
 
